@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [ "cli","server", "shared"]
+default-members = ["server"]
+
+package.edition = "2021"
+package.version = "0.1.0"
+package.author = "Liran Piade"
+package.repository = "https://github.com/lirannl/webshooter"

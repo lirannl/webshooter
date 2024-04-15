@@ -1,0 +1,9 @@
+[package]
+name = "webshooter-shared"
+edition.workspace = true
+version = "0.1.0"
+author.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
