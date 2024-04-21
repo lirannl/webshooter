@@ -1,7 +1,9 @@
 #![feature(io_error_more, if_let_guard)]
 mod error;
+mod frontend;
 use anyhow::Result;
 use error::WebshooterError;
+use frontend::Assets;
 use std::{
     env,
     io::ErrorKind,
@@ -91,19 +93,15 @@ pub async fn main_result() -> Result<()> {
 
     let login = warp::path!("login").map(|| format!("Hello, name!"));
 
+    let frontend = warp_embed::embed(&Assets);
+
     #[cfg(debug_assertions)]
-    let frontend = reverse_proxy_filter(
-        "".to_string(),
-        "http://localhost:5173".to_string(),
-    );
-    #[cfg(not(debug_assertions))]
-    let frontend = reverse_proxy_filter(
-        "".to_string(),
-        "http://localhost:5173".to_string(),
-    );
-    warp::serve(login.or(frontend))
-    .run(SocketAddr::from_str(&config.http_config.addr.to_string())?)
-    .await;
+    let frontend =
+        reverse_proxy_filter("".to_string(), "http://localhost:5173".to_string()).or(frontend);
+
+        warp::serve(login.or(frontend))
+        .run(SocketAddr::from_str(&config.http_config.addr.to_string())?)
+        .await;
 
     Ok(())
 }
