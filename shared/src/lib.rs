@@ -1,9 +1,11 @@
-use std::fmt::Display;
-
+use anyhow::{anyhow, Result};
+use rustls::{Certificate, PrivateKey};
 use serde::{Deserialize, Serialize};
-
-type SslPK = String;
-type SslCert = String;
+use std::{
+    fmt::Display,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum HttpAddr {
@@ -19,12 +21,19 @@ impl Display for HttpAddr {
         }
     }
 }
+impl Default for HttpAddr {
+    fn default() -> Self {
+        HttpAddr::HostPort("127.0.0.1".to_string(), 443)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HttpConfig {
     pub addr: HttpAddr,
-    pub ssl_creds: Option<(SslPK, SslCert)>,
+    pub key: PathBuf,
+    pub certificate: PathBuf,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     version: String,
@@ -33,15 +42,23 @@ pub struct Config {
     pub http_config: HttpConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            authorised_keys: Default::default(),
-            http_config: HttpConfig {
-                addr: HttpAddr::HostPort("127.0.0.1".to_string(), 80),
-                ssl_creds: None,
-            },
+impl Config {
+    pub fn initialise_at(path: &Path) -> Result<Self> {
+        let parent = if path.is_dir() {
+            path.to_owned()
+        } else {
+            path.parent()
+                .ok_or(anyhow!("The config path must be a file"))?
+                .to_owned()
+        };
+        Ok(Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
-        }
+            http_config: HttpConfig {
+                addr: HttpAddr::default(),
+                key: parent.join("webshooter.key"),
+                certificate: parent.join("webshooter.crt"),
+            },
+            authorised_keys: Vec::default(),
+        })
     }
 }

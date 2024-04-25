@@ -1,23 +1,34 @@
-#![feature(io_error_more, if_let_guard)]
+#![feature(
+    io_error_more,
+    if_let_guard,
+    async_closure,
+    let_chains,
+    async_fn_traits
+)]
 mod error;
 mod frontend;
+mod session;
 use anyhow::Result;
+use bytes::Bytes;
 use error::WebshooterError;
-use frontend::Assets;
+use h3::{quic::BidiStream, server::RequestStream};
+use http::{Request, StatusCode};
+use rustls::{Certificate, PrivateKey};
+use session::{get_challenge, login};
+use webshooter_shared::Config;
+//use session::login;
 use std::{
     env,
     io::ErrorKind,
-    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 use tokio::{fs, sync::Mutex};
-use warp::Filter;
-use warp_reverse_proxy::reverse_proxy_filter;
-use webshooter_shared::Config;
+//use warp::Filter;
 
 lazy_static::lazy_static! {
-    pub static ref APP_CONFIG: Mutex<Config> = Mutex::new(Default::default());
+    pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 }
 
 #[tokio::main]
@@ -72,37 +83,106 @@ pub async fn main_result() -> Result<()> {
             let path = config_dir.join(&path);
             let config = fs::read_to_string(&path).await?;
             if config.trim() == "" {
-                update_config(&path, Config::default()).await?;
+                update_config(&path, Config::initialise_at(&path)?).await?;
             } else {
                 let config: Config = serde_json::from_str(&config)
                     .or_else(|_| toml::from_str(&config))
                     .map_err(|err| WebshooterError::InvalidConfig(path.clone(), err.into()))?;
-                // if config.port == 0 {
-                //     config.port = if config.ssl_creds.is_some() { 443 } else { 80 };
-                //     update_config(&path, config).await?;
-                // } else {
-                *APP_CONFIG.lock().await = config;
-                // }
+                *APP_CONFIG.lock().await = Some(config);
             }
         } else {
-            update_config(&config_dir.join("config.json"), Config::default()).await?;
+            update_config(
+                &config_dir.join("config.json"),
+                Config::initialise_at(&config_dir)?,
+            )
+            .await?;
         }
     }
 
     let config = get_config().await;
 
-    let login = warp::path!("login").map(|| format!("Hello, name!"));
+    let certificate = Certificate(std::fs::read(config.http_config.certificate)?);
+    let key = PrivateKey(std::fs::read(config.http_config.key)?);
 
-    let frontend = warp_embed::embed(&Assets);
+    let mut tls_config = rustls::ServerConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)?;
 
-    #[cfg(debug_assertions)]
-    let frontend =
-        reverse_proxy_filter("".to_string(), "http://localhost:5173".to_string()).or(frontend);
+    tls_config.max_early_data_size = u32::MAX;
+    tls_config.alpn_protocols = vec![b"h3".into()];
 
-        warp::serve(login.or(frontend))
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
+    let endpoint = quinn::Endpoint::server(
+        server_config,
+        std::net::SocketAddr::from_str(&config.http_config.addr.to_string())?,
+    )?;
+
+    while let Some(new_conn) = endpoint.accept().await {
+        tokio::spawn(async move {
+            match new_conn.await {
+                Ok(conn) => {
+                    let mut h3_conn = h3::server::builder()
+                        .enable_webtransport(true)
+                        .enable_datagram(true)
+                        .enable_connect(true)
+                        .max_webtransport_sessions(1)
+                        .send_grease(true)
+                        .build(h3_quinn::Connection::new(conn))
+                        .await
+                        .unwrap();
+
+                    tokio::spawn(async move {
+                        match h3_conn.accept().await {
+                            Ok(Some((req, stream))) => {
+                                handler(req, stream).await.unwrap_or_else(|err| {
+                                    eprintln!("Request not supported by Webshooter: {err:#?}")
+                                });
+                            }
+                            Ok(None) => eprintln!("No request"),
+                            Err(err) => eprintln!("Failed to setup http3: {err:#?}"),
+                        }
+                    });
+                }
+                Err(err) => {
+                    eprintln!("accepting connection failed: {:?}", err);
+                }
+            }
+        });
+    }
+    /*let login = login();
+
+    let frontend = setup_frontend();
+
+    warp::serve(login.or(frontend))
         .run(SocketAddr::from_str(&config.http_config.addr.to_string())?)
-        .await;
+        .await;*/
 
+    Ok(())
+}
+
+async fn handler<T>(req: Request<()>, mut stream: RequestStream<T, Bytes>) -> Result<()>
+where
+    T: BidiStream<Bytes>,
+{
+    let pubkey: Arc<[u8]> = req
+        .headers()
+        .get("pubkey")
+        .ok_or(WebshooterError::MissingPubkey)?
+        .as_bytes()
+        .into();
+
+    let response = match req.uri().path() {
+        "login/challenge" => get_challenge(pubkey.to_vec()).await,
+        "login" => login(pubkey).await,
+        _ => {
+            // Reverse proxy into dev server in development, otherwise, serve embedded
+            todo!()
+        }
+    };
     Ok(())
 }
 
@@ -119,10 +199,10 @@ async fn update_config(path: &Path, config: Config) -> Result<()> {
         serde_json::to_string_pretty(&config)?
     };
     fs::write(path, &contents).await?;
-    *APP_CONFIG.lock().await = config;
+    *APP_CONFIG.lock().await = Some(config);
     Ok(())
 }
 
 pub async fn get_config() -> Config {
-    APP_CONFIG.lock().await.clone()
+    APP_CONFIG.lock().await.clone().unwrap()
 }

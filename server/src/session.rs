@@ -1,83 +1,97 @@
-use std::{borrow::Borrow, collections::hash_map::Entry};
+use std::{borrow::Borrow, collections::HashMap, ops::Deref};
 
-use base64::{engine::general_purpose::STANDARD as BASE64ENGINE, Engine};
-use poem::{handler, http::StatusCode, Error, FromRequest, Request, Result};
+use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use lazy_static::lazy_static;
 use rand::{rngs::ThreadRng, Rng};
-use ring::{rsa::{self, KeyPairComponents, PublicKeyComponents}, signature::RSA_PKCS1_SHA256};
+use tokio::sync::Mutex;
+use warp::{
+    filters::header::header,
+    reject::{reject, Rejection},
+    reply::Reply,
+    Filter,
+};
 
-use crate::{error::WebshooterError, ACTIVE_SESSIONS};
+use crate::error::WebshooterError;
 
 pub enum Session {
     Challenged(Vec<u8>),
     Approved {
         symmetric_key: Vec<u8>,
-        challeng: Option<Vec<u8>>,
+        challenge: Option<Vec<u8>>,
     },
 }
 
-struct PubKey(Vec<u8>);
-
-impl<'a> FromRequest<'a> for PubKey {
-    async fn from_request(req: &'a Request, _: &mut poem::RequestBody) -> Result<Self> {
-        let header = req
-            .headers()
-            .iter()
-            .find_map(|(name, value)| {
-                let name = &name.as_str();
-                if name.to_lowercase() == "pubkey"
-                    || name.to_lowercase() == "publickey"
-                    || name.to_lowercase() == "pkey"
-                {
-                    Some(value)
-                } else {
-                    None
-                }
-            })
-            .and_then(|value| BASE64ENGINE.decode(value.to_str().ok()?).ok())
-            .ok_or(Error::from_string(
-                "Missing or invalid pubkey header. Please provide a base64 string",
-                StatusCode::BAD_REQUEST,
-            ))?;
-        Ok(PubKey(header))
-    }
+lazy_static! {
+    pub static ref SESSIONS: Mutex<HashMap<Vec<u8>, Session>> = Mutex::default();
 }
 
-#[handler]
-pub async fn login(pubkey: PubKey) -> Vec<u8> {
-    let pubkey = pubkey.0;
+pub async fn get_challenge(pubkey: impl Into<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut challenge = [0 as u8; 256];
+    ThreadRng::default().fill(&mut challenge);
+    let challenge = challenge.to_vec();
 
-    let mut challeng = [0 as u8; 256];
-    ThreadRng::default().fill(&mut challeng);
-    let challeng = challeng.to_vec();
-
-    let mut lock = ACTIVE_SESSIONS.lock().await;
-    let mut lock = lock.entry(pubkey);
-    lock.and_modify(|s| match s {
-        Session::Challenged(s) => *s = challeng.clone(),
-        Session::Approved { challeng: s, .. } => *s = Some(challeng.clone()),
-    })
-    .or_insert(Session::Challenged(challeng.clone()));
-
-    challeng
-}
-
-#[handler]
-pub async fn challenge(pubkey: PubKey) -> Result<(), anyhow::Error> {
-    let key = pubkey.0;
-
-    let challeng = ACTIVE_SESSIONS
-        .lock()
-        .await
-        .get_mut(&key)
-        .and_then(|session| match session {
-            Session::Approved { challeng, .. } => challeng.as_ref(),
-            Session::Challenged(challeng) => Some(challeng),
+    let mut lock = SESSIONS.lock().await;
+    let entry = lock.entry(pubkey.into());
+    entry
+        .and_modify(|s| match s {
+            Session::Challenged(s) => *s = challenge.clone(),
+            Session::Approved { challenge: s, .. } => *s = Some(challenge.clone()),
         })
-        .ok_or(WebshooterError::InvalidRequest(
-            "You have not been challenged yet, please attempt a login first".to_string(),
-        ))?;
+        .or_insert(Session::Challenged(challenge.clone()));
 
-    // let pubkey = rsa::KeyPair::from_components();
-
-    Ok(())
+    Ok(challenge.to_vec())
 }
+
+pub async fn login(pubkey: impl Borrow<[u8]>) -> Result<Vec<u8>> {
+    let mut lock = SESSIONS.lock().await;
+    let session = lock.get_mut(pubkey.borrow()).ok_or(WebshooterError::NotChallenged)?;
+    todo!()
+    // Ok()
+}
+/*pub fn login() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+    let login = {
+        let pubkey_extractor = header::<String>("pubkey")
+            .and_then(|pubkey| async { STANDARD.decode(pubkey).map_err(|_err| reject()) });
+        let login = warp::path("login")
+            .and(pubkey_extractor.clone())
+            .and_then(|pubkey| async {
+                handle(
+                    (async move || {
+                        let mut challenge = [0 as u8; 256];
+                        ThreadRng::default().fill(&mut challenge);
+                        let challenge = challenge.to_vec();
+
+                        let mut lock = SESSIONS.lock().await;
+                        let entry = lock.entry(pubkey);
+                        entry
+                            .and_modify(|s| match s {
+                                Session::Challenged(s) => *s = challenge.clone(),
+                                Session::Approved { challenge: s, .. } => {
+                                    *s = Some(challenge.clone())
+                                }
+                            })
+                            .or_insert(Session::Challenged(challenge.clone()));
+
+                        Ok(Box::new(challenge.to_vec()))
+                    })()
+                    .await,
+                )
+            });
+        let challenge = warp::path("login/challenge")
+            .and(pubkey_extractor)
+            .and_then(|pubkey| async {
+                handle(
+                    (async move || {
+                        let mut lock = SESSIONS.lock().await;
+                        let session = lock.get_mut(&pubkey).ok_or(WebshooterError::NotChallenged)?;
+                        sessio
+                        Ok()
+                    })()
+                    .await,
+                )
+            });
+        login.or(challenge)
+    };
+    login
+}*/
