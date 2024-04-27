@@ -3,17 +3,21 @@
     if_let_guard,
     async_closure,
     let_chains,
-    async_fn_traits
+    async_fn_traits,
+    extend_one
 )]
 mod error;
 mod frontend;
+mod ipc;
 mod session;
 use anyhow::{anyhow, Result};
 use bytes::{Buf, Bytes};
 use error::WebshooterError;
 use frontend::serve_frontend;
 use h3::{quic::BidiStream, server::RequestStream};
-use http::{Request, StatusCode};
+use http::{response, Request, StatusCode};
+use http_bytes::{parse_request_header_easy, response_header_to_vec};
+use ipc::setup_ipc;
 use quinn::crypto::KeyPair;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::{Certificate, PrivateKey};
@@ -21,13 +25,20 @@ use session::{get_challenge, login};
 use webshooter_shared::Config;
 //use session::login;
 use std::{
+    borrow::Borrow,
     env,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
 };
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    spawn,
+    sync::Mutex,
+};
 //use warp::Filter;
 
 lazy_static::lazy_static! {
@@ -103,11 +114,15 @@ pub async fn main_result() -> Result<()> {
     }
 
     let config = get_config().await;
+    let config_clone = config.clone();
+    spawn(async move { http3_upgrade(config_clone).await });
+    let config_clone = config.clone();
+    spawn(async move { setup_ipc(config_clone) });
 
-    let alt_names = vec!["localhost".to_string()];
     if !config.http_config.certificate.exists() || !config.http_config.key.exists() {
         eprintln!("HTTPS certificate/key not found. Generating self-signed certificate...");
-        let CertifiedKey { cert, key_pair } = generate_simple_self_signed(alt_names)?;
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()])?;
         tokio::fs::write(&config.http_config.certificate, cert.pem()).await?;
         tokio::fs::write(&config.http_config.key, key_pair.serialize_pem()).await?;
     }
@@ -224,4 +239,47 @@ async fn update_config(path: &Path, config: Config) -> Result<()> {
 
 pub async fn get_config() -> Config {
     APP_CONFIG.lock().await.clone().unwrap()
+}
+
+/* Given an http 1.1  */
+async fn http3_upgrade(config: Config) -> Result<()> {
+    let listener = TcpListener::bind(config.http_config.addr.to_string()).await?;
+    loop {
+        let conn = listener.accept().await;
+        if let Ok((mut conn, _)) = conn {
+            let config = config.clone();
+            spawn(async move {
+                let (mut rx, mut tx) = conn.split();
+                let mut buf = Vec::new();
+                rx.read(&mut buf).await?;
+                parse_request_header_easy(&buf)?;
+                let response = http_bytes::Response::builder()
+                    .header(
+                        "Alt-Svc",
+                        format!(
+                            "h3-25=\":{}\"; ma=3600",
+                            config
+                                .http_config
+                                .addr
+                                .to_string()
+                                .split(":")
+                                .last()
+                                .unwrap()
+                        ),
+                    )
+                    .status(StatusCode::SWITCHING_PROTOCOLS.as_u16())
+                    .body(())?;
+                let response = [
+                    response_header_to_vec(&response),
+                    "Webshooter only works over http/3."
+                        .bytes()
+                        .collect::<Vec<_>>(),
+                ]
+                .concat();
+                tx.write_all(&response).await?;
+                Ok::<_, anyhow::Error>(())
+            });
+        } else {
+        }
+    }
 }

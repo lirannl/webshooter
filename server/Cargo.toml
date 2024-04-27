@@ -14,10 +14,17 @@ h3 = "0.0.4"
 h3-quinn = "0.0.5"
 h3-webtransport = "0.1.0"
 http = "1.1"
+http-bytes = { version = "0.1.0", default-features = false, features = [
+    "base64",
+] }
 lazy_static = "1.4"
 mime_guess = "2.0.4"
 pem = "3.0.4"
-quinn = { version = "0.10", default-features = false, features = ["runtime-tokio", "tls-rustls", "ring"] }
+quinn = { version = "0.10", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "ring",
+] }
 rand = "0.8"
 rcgen = "0.13"
 regex = "1.10"

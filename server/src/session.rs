@@ -6,14 +6,19 @@ use http::Response;
 use lazy_static::lazy_static;
 use rand::{rngs::ThreadRng, Rng};
 use tokio::sync::Mutex;
+use webshooter_shared::BytesLowercase;
 
 use crate::error::WebshooterError;
 
 pub enum Session {
     Challenged(Vec<u8>),
-    Authorised {
+    PendingAuth {
         symmetric_key: Vec<u8>,
-        challenge: Option<Vec<u8>>,
+        challenge: Vec<u8>,
+    },
+    Active {
+        symmetric_key: Vec<u8>,
+        challenge: Vec<u8>,
     },
 }
 
@@ -30,8 +35,9 @@ pub async fn get_challenge(pubkey: impl Into<Vec<u8>>) -> Result<(Response<()>, 
     let entry = lock.entry(pubkey.into());
     entry
         .and_modify(|s| match s {
-            Session::Challenged(s) => *s = challenge.clone(),
-            Session::Authorised { challenge: s, .. } => *s = Some(challenge.clone()),
+            Session::Challenged(chl) => *chl = challenge.clone(),
+            Session::Active { challenge: chl, .. } => *chl = challenge.clone(),
+            Session::PendingAuth { .. } => *s = Session::Challenged(challenge.clone()),
         })
         .or_insert(Session::Challenged(challenge.clone()));
 
