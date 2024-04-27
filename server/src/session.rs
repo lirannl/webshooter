@@ -1,22 +1,17 @@
-use std::{borrow::Borrow, collections::HashMap, ops::Deref};
+use std::{borrow::Borrow, collections::HashMap};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use http::Response;
 use lazy_static::lazy_static;
 use rand::{rngs::ThreadRng, Rng};
 use tokio::sync::Mutex;
-use warp::{
-    filters::header::header,
-    reject::{reject, Rejection},
-    reply::Reply,
-    Filter,
-};
 
 use crate::error::WebshooterError;
 
 pub enum Session {
     Challenged(Vec<u8>),
-    Approved {
+    Authorised {
         symmetric_key: Vec<u8>,
         challenge: Option<Vec<u8>>,
     },
@@ -26,7 +21,7 @@ lazy_static! {
     pub static ref SESSIONS: Mutex<HashMap<Vec<u8>, Session>> = Mutex::default();
 }
 
-pub async fn get_challenge(pubkey: impl Into<Vec<u8>>) -> Result<Vec<u8>> {
+pub async fn get_challenge(pubkey: impl Into<Vec<u8>>) -> Result<(Response<()>, Vec<u8>)> {
     let mut challenge = [0 as u8; 256];
     ThreadRng::default().fill(&mut challenge);
     let challenge = challenge.to_vec();
@@ -36,16 +31,18 @@ pub async fn get_challenge(pubkey: impl Into<Vec<u8>>) -> Result<Vec<u8>> {
     entry
         .and_modify(|s| match s {
             Session::Challenged(s) => *s = challenge.clone(),
-            Session::Approved { challenge: s, .. } => *s = Some(challenge.clone()),
+            Session::Authorised { challenge: s, .. } => *s = Some(challenge.clone()),
         })
         .or_insert(Session::Challenged(challenge.clone()));
 
-    Ok(challenge.to_vec())
+    Ok((Response::builder().body(())?, challenge))
 }
 
-pub async fn login(pubkey: impl Borrow<[u8]>) -> Result<Vec<u8>> {
+pub async fn login(pubkey: impl Borrow<[u8]>) -> Result<(Response<()>, Vec<u8>)> {
     let mut lock = SESSIONS.lock().await;
-    let session = lock.get_mut(pubkey.borrow()).ok_or(WebshooterError::NotChallenged)?;
+    let session = lock
+        .get_mut(pubkey.borrow())
+        .ok_or(WebshooterError::NotChallenged)?;
     todo!()
     // Ok()
 }

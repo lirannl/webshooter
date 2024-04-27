@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Result};
-use rustls::{Certificate, PrivateKey};
+use bytes::Bytes;
+use http::{HeaderMap, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Borrow,
     fmt::Display,
     fs,
+    ops::Deref,
     path::{Path, PathBuf},
 };
 

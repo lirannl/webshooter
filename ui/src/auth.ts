@@ -7,7 +7,7 @@ const rsaParams = {
 
 const hmac = {
     name: "HMAC",
-    hash: {name: "SHA-512"}
+    hash: { name: "SHA-512" }
 };
 
 const aesParams: AesKeyGenParams = { name: "AES", length: 512 };
@@ -39,6 +39,7 @@ const sessionSetup = async () => {
     let keyPair = localStorage.getItem("keypair")?.split(sep) as ([string, string] | undefined);
     if (!keyPair) {
         const pair = await window.crypto.subtle.generateKey(hmac, true, ["sign"]);
+        const a: string = pair;
         keyPair = [atob64(await window.crypto.subtle.exportKey("raw", pair.publicKey)), atob64(await window.crypto.subtle.exportKey("raw", pair.privateKey))]
         localStorage.setItem("keypair", keyPair.join(sep));
     }
@@ -53,14 +54,14 @@ const sessionSetup = async () => {
     });
     if (!res.ok) throw new Error(await res.text());
     const challenge = await res.arrayBuffer();
-    const challenge_signed = await crypto.subtle.sign(hmac, )
+    /*const challenge_signed = await crypto.subtle.sign(hmac, )
 
     res = await fetch("login/challenge", {
         headers: {
             pubkey: keyPair[0],
         }, method: "POST",
         body: challenge_signed
-    });
+    });*/
 
     return sessionKey;
 }

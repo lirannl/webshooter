@@ -8,11 +8,14 @@
 mod error;
 mod frontend;
 mod session;
-use anyhow::Result;
-use bytes::Bytes;
+use anyhow::{anyhow, Result};
+use bytes::{Buf, Bytes};
 use error::WebshooterError;
+use frontend::serve_frontend;
 use h3::{quic::BidiStream, server::RequestStream};
 use http::{Request, StatusCode};
+use quinn::crypto::KeyPair;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::{Certificate, PrivateKey};
 use session::{get_challenge, login};
 use webshooter_shared::Config;
@@ -101,8 +104,16 @@ pub async fn main_result() -> Result<()> {
 
     let config = get_config().await;
 
+    let alt_names = vec!["localhost".to_string()];
+    if !config.http_config.certificate.exists() || !config.http_config.key.exists() {
+        eprintln!("HTTPS certificate/key not found. Generating self-signed certificate...");
+        let CertifiedKey { cert, key_pair } = generate_simple_self_signed(alt_names)?;
+        tokio::fs::write(&config.http_config.certificate, cert.pem()).await?;
+        tokio::fs::write(&config.http_config.key, key_pair.serialize_pem()).await?;
+    }
     let certificate = Certificate(std::fs::read(config.http_config.certificate)?);
-    let key = PrivateKey(std::fs::read(config.http_config.key)?);
+    let key = pem::parse(&std::fs::read(config.http_config.key)?)?;
+    let key = PrivateKey(key.contents().to_vec());
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_safe_default_cipher_suites()
@@ -175,15 +186,23 @@ where
         .as_bytes()
         .into();
 
-    let response = match req.uri().path() {
+    let (response, data) = match req.uri().path() {
         "login/challenge" => get_challenge(pubkey.to_vec()).await,
         "login" => login(pubkey).await,
         _ => {
-            // Reverse proxy into dev server in development, otherwise, serve embedded
-            todo!()
+            serve_frontend(
+                &req,
+                stream
+                    .recv_data()
+                    .await?
+                    .map(|stream| stream.chunk().to_vec()),
+            )
+            .await
         }
-    };
-    Ok(())
+    }?;
+    stream.send_response(response).await?;
+    stream.send_data(data.into()).await?;
+    Ok(stream.finish().await?)
 }
 
 async fn update_config(path: &Path, config: Config) -> Result<()> {
