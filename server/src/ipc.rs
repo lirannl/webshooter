@@ -1,27 +1,23 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::{env, path::PathBuf, str::FromStr};
 
 use anyhow::Result;
 use webshooter_shared::Config;
 
 // IPC will be implemented for each platform separately
 #[cfg(target_os = "linux")]
-pub async fn setup_ipc(config: Config) -> Result<()> {
+pub async fn setup_ipc(_config: Config) -> Result<()> {
     let target = env::var("XDG_RUNTIME_DIR")?;
     let target = PathBuf::from_str(&target)?.join(format!(
         "webshooter_{}.sock",
         include_str!("../../ipc_id.txt")
     ));
-    use std::{collections::HashMap, env::args, io::ErrorKind, process::exit};
+    use std::{collections::HashMap, io::ErrorKind, process::exit};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixSocket,
-        spawn,
     };
+    use webshooter_shared::BytesLowercase;
 
     use crate::{
         session::{Session, SESSIONS},
@@ -29,6 +25,7 @@ pub async fn setup_ipc(config: Config) -> Result<()> {
     };
     let socket = UnixSocket::new_stream()?;
     let bind = socket.bind(&target);
+    eprintln!("Bound to {target:?}");
     if let Err(err) = &bind
         && err.kind() == ErrorKind::AddrInUse
     {
@@ -60,7 +57,7 @@ pub async fn setup_ipc(config: Config) -> Result<()> {
                 let message = message.trim();
                 match message {
                     "exit" => exit(0),
-                    "authorise" => {
+                    _ if message.starts_with("authorise") => {
                         let mut sessions = SESSIONS.lock().await;
                         if let [(pubkey, session)] =
                             sessions.iter_mut().collect::<Vec<_>>().as_slice()
@@ -85,8 +82,14 @@ pub async fn setup_ipc(config: Config) -> Result<()> {
                                 .authorised_keys
                                 .extend_one((*pubkey).clone().into());
                         } else if sessions.len() == 0 {
-                            conn.write_all("No unauthorised sessions".as_bytes())
+                            conn.write_all("No unauthorised sessions to approve".as_bytes())
                                 .await?;
+                        }
+                        else {
+                            let ids = sessions.keys().enumerate()
+                                .map(|(n, k)| (n,BytesLowercase::from(k.to_vec())))
+                                .collect::<HashMap<_, _>>();
+                            conn.write_all(format!("Please type all of part of the beginning/end of the identifier to be authorised:\n{:#?}", ids).as_bytes()).await?;
                         }
                     }
                     _ => (),

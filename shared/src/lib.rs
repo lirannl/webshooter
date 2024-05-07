@@ -1,12 +1,8 @@
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
-use http::{HeaderMap, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::{
-    borrow::Borrow,
     fmt::Display,
-    fs,
     ops::Deref,
     path::{Path, PathBuf},
 };
@@ -35,13 +31,13 @@ impl Default for HttpAddr {
 pub struct HttpConfig {
     pub addr: HttpAddr,
     pub key: PathBuf,
+    pub pubkey: PathBuf,
     pub certificate: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     version: String,
-    #[serde(flatten)]
     pub authorised_keys: Vec<BytesLowercase>,
     #[serde(flatten)]
     pub http_config: HttpConfig,
@@ -60,8 +56,9 @@ impl Config {
             version: env!("CARGO_PKG_VERSION").to_string(),
             http_config: HttpConfig {
                 addr: HttpAddr::default(),
-                key: parent.join("webshooter.key"),
-                certificate: parent.join("webshooter.crt"),
+                key: parent.join("key.der"),
+                pubkey: parent.join("key.pub.der"),
+                certificate: parent.join("cert.der"),
             },
             authorised_keys: Vec::default(),
         })
@@ -89,5 +86,11 @@ impl Into<Vec<u8>> for BytesLowercase {
 impl From<Vec<u8>> for BytesLowercase {
     fn from(value: Vec<u8>) -> Self {
         BytesLowercase(value)
+    }
+}
+
+impl AsRef<[u8]> for BytesLowercase {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
