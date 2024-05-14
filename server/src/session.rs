@@ -1,8 +1,13 @@
-use std::{borrow::Borrow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+    str::FromStr,
+    sync::Arc,
+};
 
 use aes::Aes256;
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use http::{response::Parts, Response};
 use lazy_static::lazy_static;
@@ -18,13 +23,13 @@ use warp::{
     reply::{self, reply, Reply},
     Filter,
 };
-use webshooter_shared::BytesLowercase;
+use webshooter_shared::Bytes64;
 
 use crate::{error::WebshooterError, get_config};
 
 pub enum Session {
-    New,
-    Approved(aes::cipher::Key<Aes256>),
+    Challenged(Vec<u8>),
+    Approved,
 }
 
 lazy_static! {
@@ -33,20 +38,10 @@ lazy_static! {
 
 pub async fn login() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     let config = get_config().await;
-    if let Some(oidc) = config.oidc {
-        todo!()
-    } else {
-        path("login")
-            .and(header::<String>("Authorize"))
-            .and_then(|token| async {
-                // if let Some(session) = SESSIONS.lock().await.get(token).clone() {
-                //     session
-                // } else {
-                // }
-
-                Ok::<_, Rejection>(reply())
-            })
-    }
+    let challenge = path("challenge")
+        .and(header::<Bytes64>("id"))
+        .and_then(|id| async { Ok() });
+    challenge
 }
 
 // pub async fn login(pubkey: impl Borrow<[u8]>) -> Result<(Response<()>, Vec<u8>)> {

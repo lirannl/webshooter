@@ -8,19 +8,14 @@ repository.workspace = true
 [dependencies]
 aes = "0.8.4"
 anyhow = "1.0"
-base64 = "0.22.0"
 bytes = { version = "1.6", features = ["serde"] }
 futures-util = "0.3.30"
-h3 = "0.0.4"
-h3-quinn = "0.0.5"
-h3-webtransport = "0.1.0"
 http = "1.1"
 http-bytes = { version = "0.1.0", default-features = false, features = [
     "base64",
 ] }
 lazy_static = "1.4"
 mime_guess = "2.0.4"
-openidconnect = "3.5.0"
 rand = "0.8"
 rcgen = "0.13.1"
 regex = "1.10"

@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
+use data_encoding::{BASE32, BASE64};
 use openidconnect::{AuthUrl, ClientId, TokenUrl};
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     net::{IpAddr, Ipv4Addr},
     ops::Deref,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,7 +33,7 @@ pub struct OidcData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     version: String,
-    pub authorised_keys: Vec<BytesLowercase>,
+    pub authorised_keys: Vec<Bytes64>,
     #[serde(flatten)]
     pub http_config: HttpConfig,
     pub oidc: Option<OidcData>,
@@ -63,17 +64,17 @@ impl Config {
     }
 }
 
-#[serde_as]
-#[derive(Clone, Debug, Deserialize, Serialize, Eq)]
-pub struct BytesLowercase(#[serde_as(as = "serde_with::base64::Base64")] Vec<u8>);
+/// Bytes in base32
+#[derive(Clone, Debug, Eq)]
+pub struct Bytes64(Vec<u8>);
 
-impl PartialEq<BytesLowercase> for BytesLowercase {
-    fn eq(&self, other: &BytesLowercase) -> bool {
+impl PartialEq<Bytes64> for Bytes64 {
+    fn eq(&self, other: &Bytes64) -> bool {
         self.0 == other.0
     }
 }
 
-impl Deref for BytesLowercase {
+impl Deref for Bytes64 {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -81,20 +82,79 @@ impl Deref for BytesLowercase {
     }
 }
 
-impl Into<Vec<u8>> for BytesLowercase {
+impl Into<Vec<u8>> for Bytes64 {
     fn into(self) -> Vec<u8> {
         self.0
     }
 }
 
-impl From<Vec<u8>> for BytesLowercase {
+impl From<Vec<u8>> for Bytes64 {
     fn from(value: Vec<u8>) -> Self {
-        BytesLowercase(value)
+        Bytes64(value)
     }
 }
 
-impl AsRef<[u8]> for BytesLowercase {
+impl AsRef<[u8]> for Bytes64 {
     fn as_ref(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl FromStr for Bytes64 {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(serde_json::from_str(s)?)
+    }
+}
+
+impl Serialize for Bytes64 {
+    fn serialize<S>(&self, serialiser: S) -> std::prelude::v1::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let str = BASE32.encode(self);
+        serialiser.serialize_str(&str)
+    }
+}
+
+struct StringVisitor;
+impl<'de> Visitor<'de> for StringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v.to_string())
+    }
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v)
+    }
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes64 {
+    fn deserialize<D>(deserialiser: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let str = deserialiser.deserialize_string(StringVisitor {})?;
+        let bytes = BASE64
+            .decode(str.as_bytes())
+            .map_err(|err| serde::de::Error::custom(err.to_string()))?;
+        Ok(bytes.into())
     }
 }

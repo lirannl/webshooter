@@ -17,7 +17,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
         io::{AsyncReadExt, AsyncWriteExt},
         net::UnixSocket,
     };
-    use webshooter_shared::BytesLowercase;
+    use webshooter_shared::Bytes64;
 
     use crate::{
         session::{Session, SESSIONS},
