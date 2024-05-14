@@ -6,6 +6,7 @@ author.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes = "0.8.4"
 anyhow = "1.0"
 base64 = "0.22.0"
 bytes = { version = "1.6", features = ["serde"] }
@@ -19,15 +20,14 @@ http-bytes = { version = "0.1.0", default-features = false, features = [
 ] }
 lazy_static = "1.4"
 mime_guess = "2.0.4"
-quinn = "0.10.2"
-quinn-proto = { version = "0.10.2", default-features = false }
-quinn-udp = "0.4"
+openidconnect = "3.5.0"
 rand = "0.8"
-rcgen = "0.10"
+rcgen = "0.13.1"
 regex = "1.10"
 reqwest = "0.12"
+ring = "0.17.8"
+ring-compat = "0.8.0"
 rust-embed = { version = "8.3", features = ["warp", "mime-guess"] }
-rustls = { version = "0.21", default-features = false, features = ["quic"] }
 rustls-native-certs = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -36,6 +36,7 @@ thiserror = "1.0"
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros"] }
 tokio-tungstenite = "0.21"
 toml = "0.8"
-warp = { version = "0.3" }
+warp = { version = "0.3", features = ["tls"] }
 warp-embed = "0.5"
+warp-reverse-proxy = "1.0.0"
 webshooter-shared = { path = "../shared", version = "0" }

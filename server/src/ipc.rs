@@ -57,41 +57,41 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                 let message = message.trim();
                 match message {
                     "exit" => exit(0),
-                    _ if message.starts_with("authorise") => {
-                        let mut sessions = SESSIONS.lock().await;
-                        if let [(pubkey, session)] =
-                            sessions.iter_mut().collect::<Vec<_>>().as_slice()
-                            && let Session::Challenged(challenge) = session
-                        {
-                            conn.write_all(
-                                format!(
-                                    "Authorising {}",
-                                    challenge
-                                        .iter()
-                                        .map(|c| format!("{c:02x}"))
-                                        .collect::<String>()
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            APP_CONFIG
-                                .lock()
-                                .await
-                                .as_mut()
-                                .unwrap()
-                                .authorised_keys
-                                .extend_one((*pubkey).clone().into());
-                        } else if sessions.len() == 0 {
-                            conn.write_all("No unauthorised sessions to approve".as_bytes())
-                                .await?;
-                        }
-                        else {
-                            let ids = sessions.keys().enumerate()
-                                .map(|(n, k)| (n,BytesLowercase::from(k.to_vec())))
-                                .collect::<HashMap<_, _>>();
-                            conn.write_all(format!("Please type all of part of the beginning/end of the identifier to be authorised:\n{:#?}", ids).as_bytes()).await?;
-                        }
-                    }
+                    // _ if message.starts_with("authorise") => {
+                    //     let mut sessions = SESSIONS.lock().await;
+                    //     if let [(pubkey, session)] =
+                    //         sessions.iter_mut().collect::<Vec<_>>().as_slice()
+                    //         && let Session::Challenged(challenge) = session
+                    //     {
+                    //         conn.write_all(
+                    //             format!(
+                    //                 "Authorising {}",
+                    //                 challenge
+                    //                     .iter()
+                    //                     .map(|c| format!("{c:02x}"))
+                    //                     .collect::<String>()
+                    //             )
+                    //             .as_bytes(),
+                    //         )
+                    //         .await?;
+                    //         APP_CONFIG
+                    //             .lock()
+                    //             .await
+                    //             .as_mut()
+                    //             .unwrap()
+                    //             .authorised_keys
+                    //             .extend_one((*pubkey).clone().into());
+                    //     } else if sessions.len() == 0 {
+                    //         conn.write_all("No unauthorised sessions to approve".as_bytes())
+                    //             .await?;
+                    //     }
+                    //     else {
+                    //         let ids = sessions.keys().enumerate()
+                    //             .map(|(n, k)| (n,BytesLowercase::from(k.to_vec())))
+                    //             .collect::<HashMap<_, _>>();
+                    //         conn.write_all(format!("Please type all of part of the beginning/end of the identifier to be authorised:\n{:#?}", ids).as_bytes()).await?;
+                    //     }
+                    // }
                     _ => (),
                 };
                 conn.shutdown().await?;

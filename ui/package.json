@@ -9,8 +9,10 @@
     "preview": "vite preview"
   },
   "devDependencies": {
-    
     "typescript": "^5.2.2",
     "vite": "^5.2.0"
+  },
+  "dependencies": {
+    "oidc-client-ts": "^3.0.1"
   }
 }

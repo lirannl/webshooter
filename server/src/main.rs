@@ -11,26 +11,11 @@ mod frontend;
 mod ipc;
 mod session;
 use anyhow::Result;
-use bytes::{Buf, Bytes};
 use error::WebshooterError;
-use frontend::serve_frontend;
-use futures_util::TryFutureExt;
-use h3::{quic::BidiStream, server::RequestStream};
-use http::Request;
+use frontend::setup_frontend;
 use ipc::setup_ipc;
-use rcgen::generate_simple_self_signed;
-use rustls::{Certificate, PrivateKey};
-use session::{get_challenge, login};
-use warp::{
-    filters::{
-        any::any,
-        host::Authority,
-        path::{self, FullPath},
-    },
-    reject::reject,
-    reply::{reply, with_header, with_status},
-    Filter,
-};
+// use session::login;
+use warp::{filters::path::path, reply::json, Filter};
 use webshooter_shared::Config;
 //use session::login;
 use std::{
@@ -39,13 +24,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
 };
-use tokio::{
-    fs::{self, read_to_string},
-    spawn,
-    sync::Mutex,
-};
+use tokio::{fs, spawn, sync::Mutex};
+
+use crate::session::login;
 //use warp::Filter;
 
 lazy_static::lazy_static! {
@@ -122,120 +104,48 @@ pub async fn main_result() -> Result<()> {
 
     let config = get_config().await;
     let config_clone = config.clone();
-    spawn(async move { http3_upgrade(config_clone).await });
-    let config_clone = config.clone();
     spawn(async move { setup_ipc(config_clone) });
 
-    if !config.http_config.certificate.exists()
-        || !config.http_config.key.exists()
-        || !config.http_config.pubkey.exists()
+    if !config.http_config.ssl_conf.key.exists()
+        || !config.http_config.ssl_conf.certificate.exists()
     {
-        eprintln!("HTTPS certificate/key/pubkey not found. Generating self-signed certificate...");
-
-        let subject_alt_names = vec!["localhost".to_string()];
-
-        #[cfg(target_os = "linux")]
-        let subject_alt_names = [
-            vec![format!("{}.local", read_to_string("/etc/hostname").await?)],
-            subject_alt_names,
-        ]
-        .concat();
-        let cert = generate_simple_self_signed(subject_alt_names)?;
-        tokio::fs::write(&config.http_config.certificate, cert.serialize_pem()?).await?;
-        tokio::fs::write(
-            &config.http_config.pubkey,
-            cert.get_key_pair().public_key_der(),
-        )
-        .await?;
-        tokio::fs::write(&config.http_config.key, cert.serialize_private_key_der()).await?;
+        println!("Ssl certificate not found. Generating...");
+        let gen = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            config.http_config.host.to_string(),
+        ])?;
+        let ssl_conf = &config.http_config.ssl_conf;
+        tokio::fs::write(&ssl_conf.certificate, gen.cert.pem()).await?;
+        println!(
+            "New ssl certificate PEM generated at {:?}",
+            ssl_conf.certificate
+        );
+        tokio::fs::write(&ssl_conf.key, gen.key_pair.serialize_pem()).await?;
+        println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
     }
-    let certificate = rustls::Certificate(tokio::fs::read(config.http_config.certificate).await?);
-    let key = PrivateKey(tokio::fs::read(config.http_config.key).await?);
 
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(vec![certificate], key)?;
-    server_crypto.alpn_protocols = vec![b"hq-29".to_vec()];
-
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-
-    let endpoint = quinn::Endpoint::server(
-        server_config,
-        SocketAddr::from_str(&config.http_config.addr.to_string())?,
-    )?;
-
-    while let Some(new_conn) = endpoint.accept().await {
-        tokio::spawn(async move {
-            match new_conn.await {
-                Ok(conn) => {
-                    let mut h3_conn = h3::server::builder()
-                        .enable_webtransport(true)
-                        .enable_datagram(true)
-                        .enable_connect(true)
-                        .max_webtransport_sessions(1)
-                        .send_grease(true)
-                        .build(h3_quinn::Connection::new(conn))
-                        .await
-                        .unwrap();
-
-                    tokio::spawn(async move {
-                        match h3_conn.accept().await {
-                            Ok(Some((req, stream))) => {
-                                handler(req, stream).await.unwrap_or_else(|err| {
-                                    eprintln!("Request not supported by Webshooter: {err:#?}")
-                                });
-                            }
-                            Ok(None) => eprintln!("No request"),
-                            Err(err) => eprintln!("Failed to setup http3: {err:#?}"),
-                        }
-                    });
-                }
-                Err(err) => {
-                    eprintln!("accepting connection failed: {:?}", err);
-                }
-            }
-        });
-    }
-    /*let login = login();
+    // let login = login();
+    // let login = path("oidc_data")
+    //     .map(move || json(&config.oidc))
+    //     .or(login);
 
     let frontend = setup_frontend();
 
-    warp::serve(login.or(frontend))
-        .run(SocketAddr::from_str(&config.http_config.addr.to_string())?)
-        .await;*/
+    println!(
+        "Listening for connections on {}:{}",
+        config.http_config.host, config.http_config.port
+    );
+    warp::serve(frontend)
+        .tls()
+        .key_path(config.http_config.ssl_conf.key)
+        .cert_path(config.http_config.ssl_conf.certificate)
+        .run(SocketAddr::new(
+            config.http_config.host,
+            config.http_config.port,
+        ))
+        .await;
 
     Ok(())
-}
-
-async fn handler<T>(req: Request<()>, mut stream: RequestStream<T, Bytes>) -> Result<()>
-where
-    T: BidiStream<Bytes>,
-{
-    let pubkey: Arc<[u8]> = req
-        .headers()
-        .get("pubkey")
-        .ok_or(WebshooterError::MissingPubkey)?
-        .as_bytes()
-        .into();
-
-    let (response, data) = match req.uri().path() {
-        "login/challenge" => get_challenge(pubkey.to_vec()).await,
-        "login" => login(pubkey).await,
-        _ => {
-            serve_frontend(
-                &req,
-                stream
-                    .recv_data()
-                    .await?
-                    .map(|stream| stream.chunk().to_vec()),
-            )
-            .await
-        }
-    }?;
-    stream.send_response(response).await?;
-    stream.send_data(data.into()).await?;
-    Ok(stream.finish().await?)
 }
 
 async fn update_config(path: &Path, config: Config) -> Result<()> {
@@ -257,34 +167,4 @@ async fn update_config(path: &Path, config: Config) -> Result<()> {
 
 pub async fn get_config() -> Config {
     APP_CONFIG.lock().await.clone().unwrap()
-}
-
-/* Given http (no tls) - redirect to https */
-async fn http3_upgrade(config: Config) -> Result<()> {
-    let server = warp::serve(
-        any()
-            .and(
-                warp::filters::host::optional()
-                    .and_then(|auth: Option<Authority>| async { auth.ok_or(reject()) }),
-            )
-            .and(path::full())
-            .and_then(|auth: Authority, path: FullPath| async move {
-                (async move || {
-                    let response = reply();
-                    let response =
-                        with_status(response, warp::http::StatusCode::TEMPORARY_REDIRECT);
-                    let response = with_header(
-                        response,
-                        "Location",
-                        format!("https://{auth}{}", path.as_str()),
-                    );
-
-                    Ok(response)
-                })()
-                .map_err(|_: anyhow::Error| warp::reject())
-                .await
-            }),
-    );
-    spawn(server.bind(SocketAddr::from_str(&config.http_config.addr.to_string())?));
-    Ok(())
 }

@@ -1,7 +1,6 @@
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use futures_util::{future::join, SinkExt, StreamExt, TryStreamExt};
-use http::{response, Request, Response, StatusCode};
 use lazy_static::lazy_static;
 use regex::Regex;
 use reqwest::Method;
@@ -131,62 +130,4 @@ pub fn setup_frontend() -> impl Filter<Extract = impl Reply, Error = Rejection> 
             ))
         .or(frontend);
     frontend
-}
-
-static DEVSERVER: &'static str = "http://localhost:5173";
-
-pub async fn serve_frontend(
-    request: &Request<()>,
-    body: Option<Vec<u8>>,
-) -> Result<(Response<()>, Vec<u8>)> {
-    #[cfg(debug_assertions)]
-    {
-        let httpclient = reqwest::Client::new();
-        let health_check = httpclient
-            .get(DEVSERVER.to_string())
-            .send()
-            .await
-            .and_then(|res| Ok(res.error_for_status()));
-        if health_check.is_ok() {
-            let mut proxy_request = httpclient.request(
-                request.method().clone(),
-                DEVSERVER.to_string()
-                    + request
-                        .uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or_default(),
-            );
-            proxy_request = proxy_request.headers(request.headers().clone());
-            if let Some(body) = body {
-                proxy_request = proxy_request.body(body);
-            }
-            let proxy_response = proxy_request.send().await?;
-
-            let mut response = Response::builder();
-            for (key, value) in proxy_response.headers() {
-                response = response.header(key, value);
-            }
-            return Ok((response.body(())?, proxy_response.bytes().await?.to_vec()));
-        }
-    }
-    if request.method() != Method::GET {
-        return Ok((
-            Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(())?,
-            vec![],
-        ));
-    } else if let Some(asset) = Assets::get(request.uri().path()) {
-        let response = response::Builder::new()
-            .header("Content-Type", asset.metadata.mimetype())
-            .body(())?;
-        return Ok((response, asset.data.to_vec()));
-    }
-    Ok((
-        response::Builder::new()
-            .status(StatusCode::NOT_FOUND)
-            .body(())?,
-        vec![],
-    ))
 }
