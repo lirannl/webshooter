@@ -37,6 +37,7 @@ pub struct Config {
     #[serde(flatten)]
     pub http_config: HttpConfig,
     pub oidc: Option<OidcData>,
+    pub auth_timeout: Option<u64>,
 }
 
 impl Config {
@@ -58,13 +59,14 @@ impl Config {
                     certificate: parent.join("server.crt"),
                 },
             },
-            authorised_keys: Vec::default(),
-            oidc: None,
+            authorised_keys: Default::default(),
+            auth_timeout: Default::default(),
+            oidc: Default::default(),
         })
     }
 }
 
-/// Bytes in base32
+/// Bytes in base64
 #[derive(Clone, Debug, Eq)]
 pub struct Bytes64(Vec<u8>);
 
@@ -94,12 +96,6 @@ impl From<Vec<u8>> for Bytes64 {
     }
 }
 
-impl AsRef<[u8]> for Bytes64 {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 impl FromStr for Bytes64 {
     type Err = anyhow::Error;
 
@@ -109,7 +105,7 @@ impl FromStr for Bytes64 {
 }
 
 impl Serialize for Bytes64 {
-    fn serialize<S>(&self, serialiser: S) -> std::prelude::v1::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serialiser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {

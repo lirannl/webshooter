@@ -10,14 +10,16 @@ mod error;
 mod frontend;
 mod ipc;
 mod session;
+mod warp_ex;
 use anyhow::Result;
 use error::WebshooterError;
 use frontend::setup_frontend;
+use futures_util::{join, Future};
 use ipc::setup_ipc;
 // use session::login;
-use warp::{filters::path::path, reply::json, Filter};
 use webshooter_shared::Config;
 //use session::login;
+use crate::session::login;
 use std::{
     env,
     io::ErrorKind,
@@ -26,8 +28,6 @@ use std::{
     str::FromStr,
 };
 use tokio::{fs, spawn, sync::Mutex};
-
-use crate::session::login;
 //use warp::Filter;
 
 lazy_static::lazy_static! {
@@ -103,8 +103,7 @@ pub async fn main_result() -> Result<()> {
     }
 
     let config = get_config().await;
-    let config_clone = config.clone();
-    spawn(async move { setup_ipc(config_clone) });
+    setup_ipc(config.clone()).await?;
 
     if !config.http_config.ssl_conf.key.exists()
         || !config.http_config.ssl_conf.certificate.exists()
@@ -144,7 +143,6 @@ pub async fn main_result() -> Result<()> {
             config.http_config.port,
         ))
         .await;
-
     Ok(())
 }
 

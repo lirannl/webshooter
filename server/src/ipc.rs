@@ -1,7 +1,50 @@
-use std::{env, path::PathBuf, str::FromStr};
-
-use anyhow::Result;
+use crate::session::SESSIONS;
+use anyhow::{bail, Result};
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, str::FromStr};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::watch,
+};
 use webshooter_shared::Config;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum IPCMessage {
+    Exit,
+    Authorise,
+    AuthoriseN(u32),
+}
+
+impl IPCMessage {
+    pub fn parse_args(args: impl Iterator<Item = impl Display>) -> Result<IPCMessage> {
+        let args = args
+            .map(|arg| arg.to_string().to_lowercase())
+            .collect::<Vec<_>>();
+        match args.iter().map(|arg| &**arg).collect::<Vec<&str>>()[..] {
+            ["exit"] => Ok(IPCMessage::Exit),
+            ["authorise"] => Ok(IPCMessage::Authorise),
+            ["authorise", n] if let Ok(n) = n.parse::<u32>() => Ok(IPCMessage::AuthoriseN(n)),
+            _ => bail!(
+                "Webshooter supports the following commands while running:
+    authorise
+    exit"
+            ),
+        }
+    }
+}
+
+lazy_static! {
+    static ref _IPC: (watch::Sender<IPCMessage>, watch::Receiver<IPCMessage>,) =
+        watch::channel(IPCMessage::Exit);
+}
+pub fn ipc_receiver() -> watch::Receiver<IPCMessage> {
+    _IPC.1.clone()
+}
+
+pub fn send_ipc(msg: IPCMessage) {
+    let _ = _IPC.0.send(msg);
+}
 
 // IPC will be implemented for each platform separately
 #[cfg(target_os = "linux")]
@@ -11,97 +54,102 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
         "webshooter_{}.sock",
         include_str!("../../ipc_id.txt")
     ));
-    use std::{collections::HashMap, io::ErrorKind, process::exit};
-
+    use futures_util::FutureExt;
+    use std::{process::exit, str::from_utf8};
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::UnixSocket,
+        fs::remove_file,
+        net::{UnixListener, UnixStream},
+        spawn,
     };
-    use webshooter_shared::Bytes64;
 
-    use crate::{
-        session::{Session, SESSIONS},
-        APP_CONFIG,
-    };
-    let socket = UnixSocket::new_stream()?;
-    let bind = socket.bind(&target);
-    eprintln!("Bound to {target:?}");
-    if let Err(err) = &bind
-        && err.kind() == ErrorKind::AddrInUse
-    {
-        let mut socket = socket.connect(&target).await?;
-        socket
-            .write_all(env::args().collect::<Vec<_>>().join(" ").as_bytes())
-            .await?;
-        let mut str = String::new();
-        socket.read_to_string(&mut str).await?;
-        println!("{str}");
-        exit(0)
-    } else {
-        let socket = socket.listen(2)?;
-        loop {
-            let (mut conn, _) = socket.accept().await?;
-            let handling = async {
-                let mut buf = Vec::new();
-                conn.read(&mut buf).await?;
-                let mut message = String::from_utf8(buf)?;
-                let aliases = {
-                    let mut aliases = HashMap::new();
-                    aliases.insert("quit", "exit");
-                    aliases.insert("authorize", "authorise");
-                    aliases
-                };
-                for (source, replacement) in aliases {
-                    message = message.replace(source, &replacement);
-                }
-                let message = message.trim();
-                match message {
-                    "exit" => exit(0),
-                    // _ if message.starts_with("authorise") => {
-                    //     let mut sessions = SESSIONS.lock().await;
-                    //     if let [(pubkey, session)] =
-                    //         sessions.iter_mut().collect::<Vec<_>>().as_slice()
-                    //         && let Session::Challenged(challenge) = session
-                    //     {
-                    //         conn.write_all(
-                    //             format!(
-                    //                 "Authorising {}",
-                    //                 challenge
-                    //                     .iter()
-                    //                     .map(|c| format!("{c:02x}"))
-                    //                     .collect::<String>()
-                    //             )
-                    //             .as_bytes(),
-                    //         )
-                    //         .await?;
-                    //         APP_CONFIG
-                    //             .lock()
-                    //             .await
-                    //             .as_mut()
-                    //             .unwrap()
-                    //             .authorised_keys
-                    //             .extend_one((*pubkey).clone().into());
-                    //     } else if sessions.len() == 0 {
-                    //         conn.write_all("No unauthorised sessions to approve".as_bytes())
-                    //             .await?;
-                    //     }
-                    //     else {
-                    //         let ids = sessions.keys().enumerate()
-                    //             .map(|(n, k)| (n,BytesLowercase::from(k.to_vec())))
-                    //             .collect::<HashMap<_, _>>();
-                    //         conn.write_all(format!("Please type all of part of the beginning/end of the identifier to be authorised:\n{:#?}", ids).as_bytes()).await?;
-                    //     }
-                    // }
-                    _ => (),
-                };
-                conn.shutdown().await?;
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(err) = handling {
-                let _ = conn.write_all(err.to_string().as_bytes()).await;
-                let _ = conn.shutdown().await;
+    use crate::session::Session;
+    let listener = match UnixListener::bind(&target) {
+        Err(err) if err.kind() == ErrorKind::AddrInUse => {
+            let connection = UnixStream::connect(&target).await;
+            if let Err(err) = &connection
+                && err.kind() == ErrorKind::ConnectionRefused
+            {
+                remove_file(&target).await?;
+                UnixListener::bind(&target)
+            } else {
+                let mut connection = connection?;
+                let ipcmessage =
+                    IPCMessage::parse_args(env::args().skip(1)).unwrap_or_else(|err| {
+                        eprintln!("{err:?}");
+                        exit(1)
+                    });
+                connection
+                    .write_all(&serde_json::to_vec(&ipcmessage)?)
+                    .await?;
+                connection.flush().await?;
+                let mut str = String::new();
+                connection.read_to_string(&mut str).await?;
+                println!("{str}");
+                exit(0)
             }
         }
-    }
+        listener => listener,
+    }?;
+    spawn(async move {
+        async move {
+            loop {
+                let (mut conn, _) = listener.accept().await?;
+                let handling = async {
+                    let mut buf = Vec::new();
+                    if conn.read_buf(&mut buf).await? > 0 {
+                        let message: IPCMessage = serde_json::from_slice(&mut buf)?;
+
+                        match message {
+                            IPCMessage::Exit => {
+                                conn.write_all("Webshooter shutting down".as_bytes())
+                                    .await?;
+                                exit(0)
+                            }
+                            IPCMessage::Authorise => {
+                                let sessions = SESSIONS.lock().await;
+                                let sessions = sessions.len();
+                                if sessions == 1 {
+                                    send_ipc(IPCMessage::AuthoriseN(0))
+                                } else {
+                                    let sessions = &SESSIONS
+                                        .lock()
+                                        .await;
+                                    let mut sessions = sessions
+                                        .iter().filter_map(|(id,session)| match session {
+                                            Session::Challenged(_) => Some(id.clone()),
+                                            _ => None
+                                        }).collect::<Vec<_>>();
+                                    sessions.sort();
+                                    let sessions = sessions.into_iter()
+                                        .enumerate()
+                                        .map(|(idx, id)| format!("  {idx}: {id:x?}"))
+                                        .collect::<Vec<_>>();
+                                    let _ = conn.write_all((
+                                            "Multiple sessions connected, please pick the relevant session:".to_owned() + 
+                                            &sessions.join("\n")
+                                        ).as_bytes()).await;
+                                }
+                            }
+                            message => send_ipc(message),
+                        };
+                    }
+                    conn.shutdown().await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(err) = handling {
+                    let _ = conn.write_all(err.to_string().as_bytes()).await;
+                    let _ = conn.shutdown().await;
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+        .await
+        .unwrap_or_else(|err: anyhow::Error| {
+            eprintln!("{err:#?}");
+            exit(1)
+        })
+    });
+    Ok(())
 }

@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "authorised_keys": [],
+  "host": "127.0.0.1",
+  "port": 443,
+  "key": "exit/server.key",
+  "certificate": "exit/server.crt",
+  "oidc": null
+}

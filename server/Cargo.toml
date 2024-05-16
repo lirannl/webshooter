@@ -9,6 +9,7 @@ repository.workspace = true
 aes = "0.8.4"
 anyhow = "1.0"
 bytes = { version = "1.6", features = ["serde"] }
+clap = { version = "4.5.4", features = ["derive"] }
 futures-util = "0.3.30"
 http = "1.1"
 http-bytes = { version = "0.1.0", default-features = false, features = [
