@@ -28,7 +28,7 @@ lazy_static! {
             .replace(&PROXY_ADDR, "ws$1").to_string();
 }
 
-pub fn setup_frontend() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+pub fn frontend() -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     let frontend = warp_embed::embed(&Assets);
 
     #[cfg(debug_assertions)]

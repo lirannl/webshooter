@@ -13,21 +13,23 @@ mod session;
 mod warp_ex;
 use anyhow::Result;
 use error::WebshooterError;
-use frontend::setup_frontend;
-use futures_util::{join, Future};
+use frontend::frontend;
 use ipc::setup_ipc;
+use session::Unauthorized;
+use warp::{http::StatusCode, reject::Rejection, reply::Reply, Filter};
 // use session::login;
 use webshooter_shared::Config;
 //use session::login;
 use crate::session::login;
 use std::{
+    convert::Infallible,
     env,
     io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
-use tokio::{fs, spawn, sync::Mutex};
+use tokio::{fs, sync::Mutex};
 //use warp::Filter;
 
 lazy_static::lazy_static! {
@@ -123,18 +125,13 @@ pub async fn main_result() -> Result<()> {
         println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
     }
 
-    // let login = login();
-    // let login = path("oidc_data")
-    //     .map(move || json(&config.oidc))
-    //     .or(login);
-
-    let frontend = setup_frontend();
-
     println!(
         "Listening for connections on {}:{}",
         config.http_config.host, config.http_config.port
     );
-    warp::serve(frontend)
+    let frontend = frontend();
+    let other = login();
+    warp::serve(frontend.or(other).recover(error_handler))
         .tls()
         .key_path(config.http_config.ssl_conf.key)
         .cert_path(config.http_config.ssl_conf.certificate)
@@ -144,6 +141,29 @@ pub async fn main_result() -> Result<()> {
         ))
         .await;
     Ok(())
+}
+
+async fn error_handler(err: Rejection) -> Result<impl Reply, Infallible> {
+    let code;
+    let message;
+
+    if err.is_not_found() {
+        message = "NOT_FOUND";
+        code = StatusCode::NOT_FOUND;
+    } else if let Some(_) = err.find::<Unauthorized>() {
+        message = "Unauthorised";
+        code = StatusCode::UNAUTHORIZED;
+    } else if let Some(_) = err.find::<warp::filters::body::BodyDeserializeError>() {
+        // This error happens if the body could not be deserialized correctly
+        // We can use the cause to analyze the error and customize the error message
+        message = "BAD_REQUEST";
+        code = StatusCode::BAD_REQUEST;
+    } else {
+        message = "ERROR";
+        code = StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    Ok(warp::reply::with_status(warp::reply::html(message), code))
 }
 
 async fn update_config(path: &Path, config: Config) -> Result<()> {

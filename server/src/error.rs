@@ -10,6 +10,8 @@ pub enum WebshooterError {
     InvalidConfig(PathBuf, anyhow::Error),
     #[error("You have not been challenged yet. Please call /login first, to recieve a challenge")]
     NotChallenged,
-    #[error("Connections to webshooter must provide a public key for authentication")]
-    MissingPubkey,
+    #[error("Login request lacks one of the following: verification key, challenge signature")]
+    InvalidLogin,
+    #[error("Challenge failed. Cannot authenticate")]
+    ChallengeFailed,
 }

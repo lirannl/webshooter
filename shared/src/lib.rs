@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Result};
-use data_encoding::{BASE32, BASE64};
+use data_encoding::BASE64;
 use openidconnect::{AuthUrl, ClientId, TokenUrl};
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
+    fmt::Display,
     net::{IpAddr, Ipv4Addr},
     ops::Deref,
     path::{Path, PathBuf},
-    str::FromStr,
+    str::FromStr, time::Duration,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +31,14 @@ pub struct OidcData {
     pub token_url: TokenUrl,
 }
 
+fn default_session_ttl() -> Duration {
+    Duration::from_secs(86400)
+}
+
+fn is_default_session_ttl(duration: &Duration) -> bool {
+    Duration::from_secs(86400) == *duration
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     version: String,
@@ -38,6 +47,8 @@ pub struct Config {
     pub http_config: HttpConfig,
     pub oidc: Option<OidcData>,
     pub auth_timeout: Option<u64>,
+    #[serde(default = "default_session_ttl", skip_serializing_if = "is_default_session_ttl")]
+    pub session_ttl: Duration,
 }
 
 impl Config {
@@ -59,6 +70,7 @@ impl Config {
                     certificate: parent.join("server.crt"),
                 },
             },
+            session_ttl: default_session_ttl(),
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
             oidc: Default::default(),
@@ -109,8 +121,14 @@ impl Serialize for Bytes64 {
     where
         S: Serializer,
     {
-        let str = BASE32.encode(self);
+        let str = BASE64.encode(self);
         serialiser.serialize_str(&str)
+    }
+}
+
+impl Display for Bytes64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&BASE64.encode(&self.0))
     }
 }
 
