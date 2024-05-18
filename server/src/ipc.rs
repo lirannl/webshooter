@@ -54,8 +54,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
         "webshooter_{}.sock",
         include_str!("../../ipc_id.txt")
     ));
-    use futures_util::FutureExt;
-    use std::{process::exit, str::from_utf8};
+    use std::process::exit;
     use tokio::{
         fs::remove_file,
         net::{UnixListener, UnixStream},

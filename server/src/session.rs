@@ -1,32 +1,25 @@
 use anyhow::anyhow;
-use bytes::Bytes;
 use http::header::SET_COOKIE;
 use lazy_static::lazy_static;
-use rand::{random, rngs::ThreadRng, thread_rng, Rng};
-use ring::signature::{self, Ed25519KeyPair, VerificationAlgorithm, ED25519};
-use ring_compat::signature::ed25519::{self, VerifyingKey};
-use serde::{Deserialize, Serialize};
-use serde_json::from_slice;
-use serde_yaml::from_value;
+use rand::{thread_rng, Rng};
+use ring::signature::{VerificationAlgorithm, ED25519};
+use serde::Deserialize;
 use untrusted::Input;
 use std::{
-    borrow::Borrow,
     collections::HashMap,
-    ops::{Deref, DerefMut},
-    str::FromStr,
-    sync::Arc,
+    ops::Deref,
     time::Duration,
 };
 use tokio::{sync::Mutex, time::timeout};
 use warp::{
-    filters::{body, cookie::cookie, header::header, method::{self, method}, path::{end, path}, query::query},
-    reject::{self, reject, Rejection},
-    reply::{self, reply, with_header, with_status, Reply, Response},
+    filters::{body, header::header, method::{self}, path::{end, path}},
+    reject::{self, Rejection},
+    reply::{self, Reply},
     Filter,
 };
 use webshooter_shared::Bytes64;
 
-use crate::{error::WebshooterError, get_config, ipc::ipc_receiver, warp_ex::handle, APP_CONFIG};
+use crate::{error::WebshooterError, get_config, ipc::ipc_receiver, warp_ex::handle};
 
 pub enum Session {
     Challenged(Vec<u8>),
