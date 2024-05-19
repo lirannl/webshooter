@@ -12,6 +12,7 @@ pub async fn handle(
 ) -> Result<warp::http::Response<warp::hyper::Body>, Rejection> {
     let result = handler.await;
     result.or_else(|err| {
+        eprintln!("HTTP Error: {err:#?}");
         Ok::<_, Rejection>(
             reply::with_status(
                 err.to_string(),

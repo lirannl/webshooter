@@ -14,4 +14,6 @@ pub enum WebshooterError {
     InvalidLogin,
     #[error("Challenge failed. Cannot authenticate")]
     ChallengeFailed,
+    #[error("Webshooter isn't prepared to accept IPC connections yet")]
+    IPCNotAvailable,
 }

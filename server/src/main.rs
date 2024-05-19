@@ -4,23 +4,19 @@
     async_closure,
     let_chains,
     async_fn_traits,
-    extend_one
+    extend_one,
 )]
 mod error;
 mod frontend;
 mod ipc;
 mod session;
 mod warp_ex;
+use crate::session::login;
 use anyhow::Result;
 use error::WebshooterError;
 use frontend::frontend;
 use ipc::setup_ipc;
 use session::Unauthorized;
-use warp::{http::StatusCode, reject::Rejection, reply::Reply, Filter};
-// use session::login;
-use webshooter_shared::Config;
-//use session::login;
-use crate::session::login;
 use std::{
     convert::Infallible,
     env,
@@ -30,7 +26,8 @@ use std::{
     str::FromStr,
 };
 use tokio::{fs, sync::Mutex};
-//use warp::Filter;
+use warp::{http::StatusCode, reject::Rejection, reply::Reply, Filter};
+use webshooter_shared::Config;
 
 lazy_static::lazy_static! {
     pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -129,9 +126,7 @@ pub async fn main_result() -> Result<()> {
         "Listening for connections on {}:{}",
         config.http_config.host, config.http_config.port
     );
-    let frontend = frontend();
-    let other = login();
-    warp::serve(frontend.or(other).recover(error_handler))
+    warp::serve(login().or(frontend()).recover(error_handler))
         .tls()
         .key_path(config.http_config.ssl_conf.key)
         .cert_path(config.http_config.ssl_conf.certificate)

@@ -2,3 +2,4 @@ target/
 /local/
 node_modules/
 /dist
+/server/bindings/

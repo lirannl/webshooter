@@ -7,8 +7,10 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     ops::Deref,
     path::{Path, PathBuf},
-    str::FromStr, time::Duration,
+    str::FromStr,
+    time::Duration,
 };
+use ts_rs::TS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SslConfig {
@@ -47,7 +49,10 @@ pub struct Config {
     pub http_config: HttpConfig,
     pub oidc: Option<OidcData>,
     pub auth_timeout: Option<u64>,
-    #[serde(default = "default_session_ttl", skip_serializing_if = "is_default_session_ttl")]
+    #[serde(
+        default = "default_session_ttl",
+        skip_serializing_if = "is_default_session_ttl"
+    )]
     pub session_ttl: Duration,
 }
 
@@ -88,6 +93,30 @@ impl PartialEq<Bytes64> for Bytes64 {
     }
 }
 
+impl TS for Bytes64 {
+    type WithoutGenerics = Self;
+
+    fn decl() -> String {
+        String::decl()
+    }
+
+    fn decl_concrete() -> String {
+        String::decl()
+    }
+
+    fn name() -> String {
+        String::name()
+    }
+
+    fn inline() -> String {
+        String::inline()
+    }
+
+    fn inline_flattened() -> String {
+        String::inline_flattened()
+    }
+}
+
 impl Deref for Bytes64 {
     type Target = [u8];
 
@@ -112,7 +141,15 @@ impl FromStr for Bytes64 {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(serde_json::from_str(s)?)
+        let s = s
+            .chars()
+            .filter(|c| {
+                let blacklist = &['='];
+                !blacklist.contains(c)
+            })
+            .collect::<String>();
+        let vec = BASE64.decode(s.as_bytes());
+        Ok(Bytes64(vec?))
     }
 }
 
@@ -166,9 +203,8 @@ impl<'de> Deserialize<'de> for Bytes64 {
         D: Deserializer<'de>,
     {
         let str = deserialiser.deserialize_string(StringVisitor {})?;
-        let bytes = BASE64
-            .decode(str.as_bytes())
-            .map_err(|err| serde::de::Error::custom(err.to_string()))?;
+        let bytes =
+            Bytes64::from_str(&str).map_err(|err| serde::de::Error::custom(err.to_string()))?;
         Ok(bytes.into())
     }
 }

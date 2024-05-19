@@ -1,14 +1,29 @@
-import { OidcClient } from "oidc-client-ts";
+import { genKeyPair, getCookie } from "./auth";
+import "./style.css";
 
-// const authData: OidcClient | null = await (await fetch("/oidc_data")).json();
+const root = document.createElement("div");
+root.style.width = "100vw";
+root.style.textAlign = "center";
+root.innerText = "Hello from Webshooter";
+const clearLocalStorage = document.createElement("button");
+clearLocalStorage.innerText = "Clear local storage";
+clearLocalStorage.addEventListener("click", ev => {
+    ev.preventDefault();
+    localStorage.clear()
+})
 
-// const sessionId = crypto.randomUUID();
+document.body.appendChild(root);
+root.appendChild(clearLocalStorage)
 
-// if (!authData) {
-//     const response = await fetch("/login", { headers: { "Authorize": `Bearer ${sessionId}` } });
-//     if (!response.ok) document.body.innerText = "Unauthorized. Refresh to try again.";
-// }
+const keyPair = await genKeyPair();
 
-document.body.innerText = "Hello from Webshooter"
-
-export { }
+const button = document.createElement("button");
+button.innerText = "Login";
+button.addEventListener("click", async ev => {
+    ev.preventDefault();
+    try { await getCookie(keyPair); }
+    catch (err) {
+        console.log(err);
+    }
+})
+root.appendChild(button)
