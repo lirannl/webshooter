@@ -28,6 +28,19 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+.secondary {
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #1a1a1a;
+}
+
+.failure {
+  background-color: #921e1e;
+}
+
+.success {
+  background-color: #1e921e;
+}
+
 h1 {
   font-size: 3.2em;
   line-height: 1.1;
@@ -84,6 +97,10 @@ button:focus-visible {
   body {
     color: #213547;
     background-color: #ffffff;
+  }
+  .secondary {
+    color: #213547;
+    background-color: #b5caddcc;
   }
   a:hover {
     color: #747bff;

@@ -37,20 +37,32 @@ export const genKeyPair = async (): Promise<CryptoKeyPair> => {
         publicKey: verificationKey
     };
 }
+export const checkIdentity = async (veriKey: CryptoKey) => {
+    const pubKey = await subtle.exportKey("spki", veriKey);
+    const id = await toRawBase64(pubKey);
+    const response = await fetch("check_identity", {
+        headers: {
+            id
+        }
+    });
+    return response.ok;
+}
+
+export const checkAuth = async (veriKey: CryptoKey) => {
+    const pubKey = await subtle.exportKey("spki", veriKey);
+    const id = await toRawBase64(pubKey);
+
+    const challenge = await fetch("check_auth", {
+        headers: { id }
+    });
+    return challenge.ok;
+}
 
 const toRawBase64 = async (buf: ArrayBuffer) => (await bytesToBase64DataUrl(buf)).split("base64,")[1]
 
 export const getCookie = async (keypair: CryptoKeyPair) => {
     const pubKey = await subtle.exportKey("spki", keypair.publicKey);
     const id = await toRawBase64(pubKey);
-    let idField = document.getElementById("signerId");
-    if (!idField) {
-        idField = document.createElement("div");
-        idField.id = "signerId";
-        document.body.appendChild(idField);
-    }
-    const idBytes = new Uint8Array(pubKey);
-    idField.innerText = `Id summary: ${idBytes.slice(0, 4)}...${idBytes.slice(-4)}`;
     const challenge = await fetch("challenge", {
         headers: { id }
     });
@@ -58,14 +70,27 @@ export const getCookie = async (keypair: CryptoKeyPair) => {
     const signature = await subtle.sign(ecdsaAlgo, keypair.privateKey, challengeBlob);
     await subtle.verify(ecdsaAlgo, keypair.publicKey, signature, challengeBlob);
 
-    fetch("/login", {
+    const div = document.createElement("div");
+    div.className = "secondary";
+    const authWait = "Awaiting authorisation. Please enter \"authorise\"";
+    div.innerText = authWait;
+    document.body.appendChild(div)
+    let wait = 1;
+    const loading = setInterval(() => {
+        div.innerText = `${authWait}\n${wait} seconds`;
+        wait += 1;
+    }, 1000);
+    await fetch("/login", {
         method: "POST", headers: {
-            credentials: "same-origin"
+            credentials: "same-origin",
+            "content-type": "application/json"
         }, body: JSON.stringify({
             Signature: {
                 signature: await toRawBase64(signature),
                 id,
             }
         } as LoginParams)
-    })
+    });
+    clearInterval(loading);
+    div.remove();
 }

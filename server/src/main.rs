@@ -4,47 +4,140 @@
     async_closure,
     let_chains,
     async_fn_traits,
-    extend_one,
+    extend_one
 )]
+
+mod auth;
+mod config_watch;
 mod error;
 mod frontend;
 mod ipc;
-mod session;
-mod warp_ex;
-use crate::session::login;
+mod video_serve;
 use anyhow::Result;
 use error::WebshooterError;
-use frontend::frontend;
 use ipc::setup_ipc;
-use session::Unauthorized;
+use poem::{
+    get, handler,
+    listener::{Listener, RustlsCertificate, TcpListener},
+    post, IntoResponse, Response, Route, Server,
+};
 use std::{
-    convert::Infallible,
     env,
     io::ErrorKind,
-    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
 };
 use tokio::{fs, sync::Mutex};
-use warp::{http::StatusCode, reject::Rejection, reply::Reply, Filter};
 use webshooter_shared::Config;
+
+use crate::{
+    auth::{check_identity, get_challenge, login, Authenticated},
+    config_watch::watch_config,
+    video_serve::setup_video,
+};
 
 lazy_static::lazy_static! {
     pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
 }
 
 #[tokio::main]
-pub async fn main() {
-    main_result()
-        .await
-        .unwrap_or_else(|err| eprintln!("{err:#?}"));
+pub async fn main() -> Result<()> {
+    let config_dir = setup_config_dir().await?;
+
+    setup_config(&config_dir).await?;
+
+    let config = get_config().await;
+
+    setup_ipc(config.clone()).await?;
+
+    setup_ssl_certificates(&config).await?;
+
+    println!(
+        "Listening for connections on {}:{}",
+        config.http_config.host, config.http_config.port
+    );
+
+    let listener = TcpListener::bind(format!(
+        "{}:{}",
+        config.http_config.host, config.http_config.port
+    ))
+    .rustls(
+        poem::listener::RustlsConfig::new().fallback(
+            RustlsCertificate::new()
+                .cert(fs::read(config.http_config.ssl_conf.certificate).await?)
+                .key(fs::read(config.http_config.ssl_conf.key).await?),
+        ),
+    );
+
+    watch_config(&config.path).await;
+
+    let app = Route::new()
+        .at("/check_identity", get(check_identity))
+        .at("/check_auth", get(check_auth))
+        .at("/challenge", get(get_challenge))
+        .at("/login", post(login))
+        .at("/*", frontend::frontend);
+
+    setup_video();
+    Server::new(listener).run(app).await?;
+    Ok(())
 }
 
-pub async fn main_result() -> Result<()> {
+async fn setup_ssl_certificates(config: &Config) -> Result<()> {
+    if !config.http_config.ssl_conf.key.exists()
+        || !config.http_config.ssl_conf.certificate.exists()
+    {
+        println!("Ssl certificate not found. Generating...");
+        let gen = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            config.http_config.host.to_string(),
+        ])?;
+        let ssl_conf = &config.http_config.ssl_conf;
+        tokio::fs::write(&ssl_conf.certificate, gen.cert.pem()).await?;
+        println!(
+            "New ssl certificate PEM generated at {:?}",
+            ssl_conf.certificate
+        );
+        tokio::fs::write(&ssl_conf.key, gen.key_pair.serialize_pem()).await?;
+        println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
+    }
+    Ok(())
+}
+
+async fn setup_config(config_dir: &Path) -> Result<()> {
+    let config_file_name = std::fs::read_dir(&config_dir)?.find_map(|p| {
+        let name = p.ok()?.file_name().to_str()?.to_string();
+        if name.starts_with("config") {
+            Some(name)
+        } else {
+            None
+        }
+    });
+    if let Some(config_path) = config_file_name {
+        let config_path = config_dir.join(&config_path);
+        let config = fs::read_to_string(&config_path).await?;
+        if config.trim() == "" {
+            update_config(Config::initialise_at(&config_path)?).await?;
+        } else {
+            let config: Config = serde_json::from_str(&config)
+                .or_else(|_| {
+                    let mut config: Config = toml::from_str(&config)?;
+                    config.path = config_path.to_owned();
+                    Ok(config)
+                })
+                .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err))?;
+            *APP_CONFIG.lock().await = Some(config);
+        }
+    } else {
+        update_config(Config::initialise_at(&config_dir.join("config.json"))?).await?;
+    }
+    Ok(())
+}
+
+pub async fn setup_config_dir() -> Result<PathBuf> {
     let args = std::env::args().collect::<Vec<_>>();
     let args = args.iter().map(|x| x.as_str()).collect::<Vec<_>>();
     let config_dir = match args.as_slice() {
-        [_, path] => PathBuf::from_str(path),
         [_, "-c", path] => PathBuf::from_str(path),
         [_, "--config", path] => PathBuf::from_str(path),
         [_, "--config-path", path] => PathBuf::from_str(path),
@@ -71,97 +164,11 @@ pub async fn main_result() -> Result<()> {
             .to_path_buf()),
         Err(err) => Err(err),
     }?;
-
-    {
-        let config_file_name = std::fs::read_dir(&config_dir)?.find_map(|p| {
-            let name = p.ok()?.file_name().to_str()?.to_string();
-            if name.starts_with("config") {
-                Some(name)
-            } else {
-                None
-            }
-        });
-        if let Some(path) = config_file_name {
-            let path = config_dir.join(&path);
-            let config = fs::read_to_string(&path).await?;
-            if config.trim() == "" {
-                update_config(&path, Config::initialise_at(&path)?).await?;
-            } else {
-                let config: Config = serde_json::from_str(&config)
-                    .or_else(|_| toml::from_str(&config))
-                    .map_err(|err| WebshooterError::InvalidConfig(path.clone(), err.into()))?;
-                *APP_CONFIG.lock().await = Some(config);
-            }
-        } else {
-            update_config(
-                &config_dir.join("config.json"),
-                Config::initialise_at(&config_dir)?,
-            )
-            .await?;
-        }
-    }
-
-    let config = get_config().await;
-    setup_ipc(config.clone()).await?;
-
-    if !config.http_config.ssl_conf.key.exists()
-        || !config.http_config.ssl_conf.certificate.exists()
-    {
-        println!("Ssl certificate not found. Generating...");
-        let gen = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            config.http_config.host.to_string(),
-        ])?;
-        let ssl_conf = &config.http_config.ssl_conf;
-        tokio::fs::write(&ssl_conf.certificate, gen.cert.pem()).await?;
-        println!(
-            "New ssl certificate PEM generated at {:?}",
-            ssl_conf.certificate
-        );
-        tokio::fs::write(&ssl_conf.key, gen.key_pair.serialize_pem()).await?;
-        println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
-    }
-
-    println!(
-        "Listening for connections on {}:{}",
-        config.http_config.host, config.http_config.port
-    );
-    warp::serve(login().or(frontend()).recover(error_handler))
-        .tls()
-        .key_path(config.http_config.ssl_conf.key)
-        .cert_path(config.http_config.ssl_conf.certificate)
-        .run(SocketAddr::new(
-            config.http_config.host,
-            config.http_config.port,
-        ))
-        .await;
-    Ok(())
+    Ok(config_dir)
 }
 
-async fn error_handler(err: Rejection) -> Result<impl Reply, Infallible> {
-    let code;
-    let message;
-
-    if err.is_not_found() {
-        message = "NOT_FOUND";
-        code = StatusCode::NOT_FOUND;
-    } else if let Some(_) = err.find::<Unauthorized>() {
-        message = "Unauthorised";
-        code = StatusCode::UNAUTHORIZED;
-    } else if let Some(_) = err.find::<warp::filters::body::BodyDeserializeError>() {
-        // This error happens if the body could not be deserialized correctly
-        // We can use the cause to analyze the error and customize the error message
-        message = "BAD_REQUEST";
-        code = StatusCode::BAD_REQUEST;
-    } else {
-        message = "ERROR";
-        code = StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    Ok(warp::reply::with_status(warp::reply::html(message), code))
-}
-
-async fn update_config(path: &Path, config: Config) -> Result<()> {
+pub async fn update_config(config: Config) -> Result<()> {
+    let path = &config.path;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -174,10 +181,15 @@ async fn update_config(path: &Path, config: Config) -> Result<()> {
         serde_json::to_string_pretty(&config)?
     };
     fs::write(path, &contents).await?;
-    *APP_CONFIG.lock().await = Some(config);
+    // *APP_CONFIG.lock().await = Some(config);
     Ok(())
 }
 
 pub async fn get_config() -> Config {
     APP_CONFIG.lock().await.clone().unwrap()
+}
+
+#[handler]
+fn check_auth(Authenticated { id }: Authenticated) -> impl IntoResponse {
+    Response::builder().body(format!("Authenticated as: {id}"))
 }

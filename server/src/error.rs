@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use http::StatusCode;
+use poem::error::ResponseError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,6 +16,23 @@ pub enum WebshooterError {
     InvalidLogin,
     #[error("Challenge failed. Cannot authenticate")]
     ChallengeFailed,
+    #[error("Cookie not permitted")]
+    NotAuthorized,
     #[error("Webshooter isn't prepared to accept IPC connections yet")]
     IPCNotAvailable,
+    #[error("Missing authentication")]
+    NoAuthentication,
+}
+
+impl ResponseError for WebshooterError {
+    fn status(&self) -> StatusCode {
+        match &self {
+            Self::NotChallenged => StatusCode::FORBIDDEN,
+            Self::InvalidLogin => StatusCode::BAD_REQUEST,
+            Self::ChallengeFailed => StatusCode::FORBIDDEN,
+            Self::NotAuthorized => StatusCode::FORBIDDEN,
+            Self::NoAuthentication => StatusCode::UNAUTHORIZED,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }

@@ -15,19 +15,26 @@ async-channel = "2.3.1"
 bytes = { version = "1.6", features = ["serde"] }
 ecdsa = { version = "0.16.9", features = ["spki", "verifying"] }
 futures-util = "0.3.30"
+data-encoding = "2.6.0"
 http = "1.1"
 http-bytes = { version = "0.1.0", default-features = false, features = [
     "base64",
 ] }
 lazy_static = "1.4"
 mime_guess = "2.0.4"
+notify = "6.1.1"
 p384 = "0.13.0"
+poem = { version = "3.0.1", features = [
+    "rustls",
+    "tokio-rustls",
+    "static-files",
+] }
 rand = "0.8"
 rcgen = "0.13.1"
 regex = "1.10"
 reqwest = "0.12"
-rust-embed = { version = "8.3", features = ["warp", "mime-guess"] }
-rustls-native-certs = "0.7"
+rust-embed = { version = "8.3", features = ["poem", "mime-guess"] }
+rustls = "0.23.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -36,12 +43,10 @@ tokio = { version = "1.37", features = [
     "rt-multi-thread",
     "macros",
     "io-util",
+    "fs",
 ] }
-tokio-tungstenite = "0.21"
 toml = "0.8"
 ts-rs = "8.1.0"
 untrusted = "0.9.0"
-warp = { version = "0.3", features = ["tls"] }
-warp-embed = "0.5"
-warp-reverse-proxy = "1.0.0"
 webshooter-shared = { path = "../shared", version = "0" }
+webrtc = { version = "0.11.0", features = ["openssl"] }
