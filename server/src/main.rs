@@ -13,14 +13,17 @@ mod error;
 mod frontend;
 mod ipc;
 mod video_serve;
+pub mod config;
 use anyhow::Result;
 use error::WebshooterError;
+use futures_util::join;
 use ipc::setup_ipc;
 use poem::{
     get, handler,
     listener::{Listener, RustlsCertificate, TcpListener},
     post, IntoResponse, Response, Route, Server,
 };
+use video_serve::setup_wt;
 use std::{
     env,
     io::ErrorKind,
@@ -28,12 +31,11 @@ use std::{
     str::FromStr,
 };
 use tokio::{fs, sync::Mutex};
-use webshooter_shared::Config;
+use config::Config;
 
 use crate::{
     auth::{check_identity, get_challenge, login, Authenticated},
     config_watch::watch_config,
-    video_serve::setup_video,
 };
 
 lazy_static::lazy_static! {
@@ -53,7 +55,7 @@ pub async fn main() -> Result<()> {
     setup_ssl_certificates(&config).await?;
 
     println!(
-        "Listening for connections on {}:{}",
+        "Listening for connections on https://{}:{}",
         config.http_config.host, config.http_config.port
     );
 
@@ -64,8 +66,8 @@ pub async fn main() -> Result<()> {
     .rustls(
         poem::listener::RustlsConfig::new().fallback(
             RustlsCertificate::new()
-                .cert(fs::read(config.http_config.ssl_conf.certificate).await?)
-                .key(fs::read(config.http_config.ssl_conf.key).await?),
+                .cert(fs::read(&config.http_config.ssl_conf.certificate).await?)
+                .key(fs::read(&config.http_config.ssl_conf.key).await?),
         ),
     );
 
@@ -78,8 +80,10 @@ pub async fn main() -> Result<()> {
         .at("/login", post(login))
         .at("/*", frontend::frontend);
 
-    setup_video();
-    Server::new(listener).run(app).await?;
+    let servers = join!(Server::new(listener).run(app), setup_wt(config.clone()));
+    servers.0?;
+    servers.1?;
+
     Ok(())
 }
 

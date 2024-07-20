@@ -6,7 +6,6 @@ root.style.width = "100vw";
 root.style.textAlign = "center";
 document.body.appendChild(root);
 
-
 const keyPair = await genKeyPair();
 
 const authenticated = await checkAuth(keyPair.publicKey);

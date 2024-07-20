@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use tokio::{spawn, sync::Mutex, task::JoinHandle, time::sleep};
-use webshooter_shared::Config;
+use crate::config::Config;
 
 use crate::APP_CONFIG;
 

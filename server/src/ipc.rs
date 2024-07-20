@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr};
 use tokio::io::{stdin, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use webshooter_shared::Config;
+use crate::config::Config;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum IPCMessage {

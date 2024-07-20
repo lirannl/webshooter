@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 use ts_rs::TS;
-use webshooter_shared::Bytes64;
+use crate::config::Bytes64;
 
 use crate::error::WebshooterError;
 use crate::ipc::{ipc_recv, ipc_send, IPCMessage};
@@ -73,11 +73,19 @@ pub enum Session {
 }
 
 #[derive(Deserialize, TS)]
-#[cfg_attr(debug, derive(Debug))]
+#[cfg_attr(feature = "debug", derive(Debug))]
 #[ts(export)]
 enum LoginParams {
-    IdOnly { id: Bytes64 },
-    Signature { id: Bytes64, signature: Bytes64 },
+    IdOnly {
+        #[ts(type = "string")]
+        id: Bytes64,
+    },
+    Signature {
+        #[ts(type = "string")]
+        id: Bytes64,
+        #[ts(type = "string")]
+        signature: Bytes64,
+    },
 }
 
 impl LoginParams {

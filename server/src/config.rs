@@ -1,15 +1,36 @@
 use anyhow::{anyhow, Result};
+#[cfg(target_os = "linux")]
+use ashpd::desktop::screencast::SourceType;
 use data_encoding::BASE64;
+use ring::rand::SecureRandom;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::HashSet,
     fmt::Display,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,
     path::{Path, PathBuf},
-    str::FromStr,
+    str::{from_utf8, FromStr},
 };
-use ts_rs::TS;
+
+use crate::error::WebshooterError;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub enum CaptureType {
+    Virtual,
+    #[default]
+    Monitor,
+}
+
+#[cfg(target_os = "linux")]
+impl Into<SourceType> for CaptureType {
+    fn into(self) -> SourceType {
+        match self {
+            CaptureType::Monitor => SourceType::Monitor,
+            CaptureType::Virtual => SourceType::Virtual,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SslConfig {
@@ -25,15 +46,33 @@ pub struct HttpConfig {
     pub ssl_conf: SslConfig,
 }
 
+impl Into<SocketAddr> for &HttpConfig {
+    fn into(self) -> SocketAddr {
+        SocketAddr::new(self.host, self.port)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip)]
     pub path: PathBuf,
+    #[serde(default = "default_version")]
     version: String,
+    #[serde(default)]
     pub authorised_keys: HashSet<Bytes64>,
+    #[serde(default)]
+    pub capture_type: CaptureType,
+    #[cfg(target_os = "linux")]
+    #[serde(default)]
+    pub pipewire_key: Option<String>,
     #[serde(flatten)]
     pub http_config: HttpConfig,
+    #[serde(default)]
     pub auth_timeout: Option<u64>,
+}
+
+fn default_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 impl Config {
@@ -43,7 +82,7 @@ impl Config {
             .ok_or(anyhow!("The config path must be a file"))?;
         Ok(Self {
             path: path.to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: default_version(),
             http_config: HttpConfig {
                 host: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 port: 443,
@@ -52,7 +91,10 @@ impl Config {
                     certificate: parent.join("server.crt"),
                 },
             },
+            #[cfg(target_os = "linux")]
+            pipewire_key: Default::default(),
             authorised_keys: Default::default(),
+            capture_type: Default::default(),
             auth_timeout: Default::default(),
         })
     }
@@ -71,30 +113,6 @@ impl<B: Deref<Target = [u8]>> Bytes64<B> {
 impl<B: Deref<Target = [u8]>, B2: Deref<Target = [u8]>> PartialEq<Bytes64<B2>> for Bytes64<B> {
     fn eq(&self, other: &Bytes64<B2>) -> bool {
         self.0.iter().zip(other.0.iter()).all(|(b1, b2)| *b1 == *b2)
-    }
-}
-
-impl<B: Deref<Target = [u8]>> TS for Bytes64<B> {
-    type WithoutGenerics = Self;
-
-    fn decl() -> String {
-        String::decl()
-    }
-
-    fn decl_concrete() -> String {
-        String::decl()
-    }
-
-    fn name() -> String {
-        String::name()
-    }
-
-    fn inline() -> String {
-        String::inline()
-    }
-
-    fn inline_flattened() -> String {
-        String::inline_flattened()
     }
 }
 

@@ -22,6 +22,8 @@ pub enum WebshooterError {
     IPCNotAvailable,
     #[error("Missing authentication")]
     NoAuthentication,
+    #[error("System cryptography is not functioning correctly")]
+    SystemCrypto,
 }
 
 impl ResponseError for WebshooterError {

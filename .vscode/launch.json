@@ -5,30 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "lldb-dap",
+            "request": "launch",
+            "name": "Launch",
+            "program": "${workspaceRoot}/target/debug/webshooter",
+            "args": [],
+            "env": [],
+            "cwd": "${workspaceRoot}"
+        },
+        {
             "type": "firefox",
             "request": "launch",
             "reAttach": true,
             "name": "Debug frontend",
             "url": "https://localhost:8443/",
             "webRoot": "${workspaceFolder}/ui",
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug executable 'webshooter'",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin=webshooter",
-                    "--package=webshooter"
-                ],
-                "filter": {
-                    "name": "webshooter",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
-            "cwd": "${workspaceFolder}"
         },
     ]
 }
