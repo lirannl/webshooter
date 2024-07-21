@@ -24,6 +24,8 @@ pub enum WebshooterError {
     NoAuthentication,
     #[error("System cryptography is not functioning correctly")]
     SystemCrypto,
+    #[error("Desktop capture failed")]
+    CaptureFailed,
 }
 
 impl ResponseError for WebshooterError {

@@ -13,6 +13,7 @@ in
       rustup
       pkg-config
       openssl
+      ffmpeg
       nodejs
       corepack
     ];

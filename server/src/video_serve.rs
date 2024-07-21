@@ -6,20 +6,12 @@ use crate::{
     error::WebshooterError,
 };
 use anyhow::Result;
-#[cfg(target_os = "linux")]
-use ashpd::{
-    desktop::{
-        remote_desktop::RemoteDesktop,
-        screencast::{CursorMode, Screencast, SourceType, Stream},
-    },
-    enumflags2::BitFlags,
-};
-use futures_util::FutureExt;
+use futures_util::{future::join, FutureExt};
 use tokio::fs;
 use wtransport::{
     endpoint::SessionRequest,
     tls::{Certificate, CertificateChain, PrivateKey},
-    Endpoint, Identity, ServerConfig,
+    Connection, Endpoint, Identity, ServerConfig,
 };
 
 pub async fn setup_wt(config: Config) -> Result<()> {
@@ -44,7 +36,8 @@ pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> R
     let cookie = session
         .headers()
         .get("Cookie")
-        .map(|c| c.to_string()).unwrap_or("".to_string());
+        .map(|c| c.to_string())
+        .unwrap_or("".to_string());
     let token = cookie
         .split(";")
         .filter_map(|cookie| cookie.trim().split_once("="))
@@ -67,18 +60,31 @@ pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> R
             .get(token)
             .ok_or(WebshooterError::NotAuthorized)
     }) {
-        Ok(_) => Ok(capture(&config, session).await?),
+        Ok(_) => Ok({
+            let session = session.accept().await?;
+            let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
+            fut.0?;
+            fut.1?;
+        }),
         Err(WebshooterError::NotAuthorized) => Ok(session.forbidden().await),
         Err(WebshooterError::NoAuthentication) => Ok(session.forbidden().await),
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            session.too_many_requests().await;
+            Err(error.into())
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub async fn capture(config: &Config, session: SessionRequest) -> Result<()> {
-    use ashpd::desktop::Request;
-    use futures_util::stream;
-    use wtransport::endpoint::SessionRequest;
+pub async fn capture(config: &Config, session: &Connection) -> Result<()> {
+    use ashpd::{
+        desktop::{
+            screencast::{CursorMode, Screencast, SourceType, Stream},
+            Request,
+        },
+        enumflags2::BitFlags,
+    };
+    use ffmpeg_next::{format::Pixel, Dictionary, Rational};
 
     use crate::update_config;
     let cast = Screencast::new().await?;
@@ -92,6 +98,7 @@ pub async fn capture(config: &Config, session: SessionRequest) -> Result<()> {
         ashpd::desktop::PersistMode::ExplicitlyRevoked,
     )
     .await?;
+
     let streams = Request::response(
         &cast
             .start(&cast_session, &ashpd::WindowIdentifier::None)
@@ -99,13 +106,32 @@ pub async fn capture(config: &Config, session: SessionRequest) -> Result<()> {
     )?;
     let mut config = config.clone();
     config.pipewire_key = streams.restore_token().map(|key| key.to_string());
-    update_config(config);
+    update_config(config).await?;
+
+    let streams = streams.streams().to_owned();
+    let stream = streams.first().ok_or(WebshooterError::CaptureFailed)?;
+    let fd = cast.open_pipe_wire_remote(&cast_session).await?;
+    let encoder = ffmpeg_next::encoder::new();
+    let mut video = encoder.video()?;
+    video.set_bit_rate(5000000);
+    let framerate = Rational::new(30, 1);
+    video.set_frame_rate(Some(framerate));
+    let (width, height) = stream.size().ok_or(WebshooterError::CaptureFailed)?;
+    video.set_aspect_ratio(Rational::new(width, height).reduce());
+    let (width, height) = (width.abs() as u32, height.abs() as u32);
+    video.set_width(width);
+    video.set_height(height);
+    video.set_format(Pixel::ABGR);
+    video.set_time_base(framerate.invert());
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-pub async fn setup_input(config: &Config) -> Result<()> {
+pub async fn setup_input(config: &Config, session: &Connection) -> Result<()> {
+    use ashpd::desktop::remote_desktop::RemoteDesktop;
+
     let remote = RemoteDesktop::new().await?;
+    
 
     Ok(())
 }
