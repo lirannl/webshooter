@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["server"]
+members = [ "server", "scap" ]
 default-members = ["server"]
 
 package.edition = "2021"

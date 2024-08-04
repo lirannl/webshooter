@@ -24,5 +24,8 @@
             "icon": "terminal-powershell"
         }
     },
-    "terminal.integrated.defaultProfile.linux": "nix"
+    "terminal.integrated.defaultProfile.linux": "nix",
+    "rust-analyzer.linkedProjects": [
+        "./server/Cargo.toml"
+    ]
 }

@@ -1,5 +1,5 @@
 {
- description = "example-node-js-flake";
+ description = "A web-targeted ";
  inputs = {
   flake-utils.url = "github:numtide/flake-utils";
  };

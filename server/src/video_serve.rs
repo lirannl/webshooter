@@ -1,17 +1,19 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error, sync::mpsc::RecvError};
 
 use crate::{
     auth::{Session, SESSIONS},
     config::{Bytes64, Config},
     error::WebshooterError,
 };
-use anyhow::Result;
-use futures_util::{future::join, FutureExt};
+use anyhow::{bail, Result};
+use ffmpeg_next::encoder::{self, Encoder};
+use futures_util::future::join;
+use scap::capturer::{self, Capturer, Options};
 use tokio::fs;
 use wtransport::{
     endpoint::SessionRequest,
     tls::{Certificate, CertificateChain, PrivateKey},
-    Connection, Endpoint, Identity, ServerConfig,
+    Connection, Endpoint, Identity, ServerConfig, VarInt,
 };
 
 pub async fn setup_wt(config: Config) -> Result<()> {
@@ -62,9 +64,11 @@ pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> R
     }) {
         Ok(_) => Ok({
             let session = session.accept().await?;
-            let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
-            fut.0?;
-            fut.1?;
+            while let Ok(()) = session.send_datagram(b"Hello world!") {}
+            session.close(VarInt::from_u32(0), b"Datagram test complete");
+            // let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
+            // fut.0?;
+            // fut.1?;
         }),
         Err(WebshooterError::NotAuthorized) => Ok(session.forbidden().await),
         Err(WebshooterError::NoAuthentication) => Ok(session.forbidden().await),
@@ -75,54 +79,45 @@ pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> R
     }
 }
 
-#[cfg(target_os = "linux")]
 pub async fn capture(config: &Config, session: &Connection) -> Result<()> {
-    use ashpd::{
-        desktop::{
-            screencast::{CursorMode, Screencast, SourceType, Stream},
-            Request,
-        },
-        enumflags2::BitFlags,
+    if !scap::has_permission() && !scap::request_permission() {
+        bail!("Couldn't obtain screen capture permission")
+    }
+
+    let targets = scap::get_all_targets();
+
+    let options = Options {
+        fps: 60,
+        target: None,
+        show_cursor: true,
+        show_highlight: true,
+        excluded_targets: Some(
+            targets
+                .into_iter()
+                .filter_map(|t| match t {
+                    scap::Target::Window(_) => Some(t),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        output_type: scap::frame::FrameType::BGRAFrame,
+        output_resolution: scap::capturer::Resolution::_720p,
+        ..Default::default()
     };
-    use ffmpeg_next::{format::Pixel, Dictionary, Rational};
 
-    use crate::update_config;
-    let cast = Screencast::new().await?;
-    let cast_session = cast.create_session().await?;
-    cast.select_sources(
-        &cast_session,
-        CursorMode::Embedded,
-        BitFlags::from_flag(config.capture_type.clone().into()),
-        false,
-        config.pipewire_key.as_deref(),
-        ashpd::desktop::PersistMode::ExplicitlyRevoked,
-    )
-    .await?;
+    let mut capturer = Capturer::new(options);
 
-    let streams = Request::response(
-        &cast
-            .start(&cast_session, &ashpd::WindowIdentifier::None)
-            .await?,
-    )?;
-    let mut config = config.clone();
-    config.pipewire_key = streams.restore_token().map(|key| key.to_string());
-    update_config(config).await?;
+    capturer.start_capture();
 
-    let streams = streams.streams().to_owned();
-    let stream = streams.first().ok_or(WebshooterError::CaptureFailed)?;
-    let fd = cast.open_pipe_wire_remote(&cast_session).await?;
-    let encoder = ffmpeg_next::encoder::new();
-    let mut video = encoder.video()?;
-    video.set_bit_rate(5000000);
-    let framerate = Rational::new(30, 1);
-    video.set_frame_rate(Some(framerate));
-    let (width, height) = stream.size().ok_or(WebshooterError::CaptureFailed)?;
-    video.set_aspect_ratio(Rational::new(width, height).reduce());
-    let (width, height) = (width.abs() as u32, height.abs() as u32);
-    video.set_width(width);
-    video.set_height(height);
-    video.set_format(Pixel::ABGR);
-    video.set_time_base(framerate.invert());
+    let encoder = encoder::new();
+
+    while let frame = capturer.get_next_frame() && let Some(frame) = match frame {
+        Ok(frame) => Ok(Some(frame)),
+        Err(err) => Err(err),
+    }? {
+
+    }
+
     Ok(())
 }
 
@@ -131,7 +126,6 @@ pub async fn setup_input(config: &Config, session: &Connection) -> Result<()> {
     use ashpd::desktop::remote_desktop::RemoteDesktop;
 
     let remote = RemoteDesktop::new().await?;
-    
 
     Ok(())
 }

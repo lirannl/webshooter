@@ -14,9 +14,8 @@
             "cwd": "${workspaceRoot}"
         },
         {
-            "type": "firefox",
+            "type": "chrome",
             "request": "launch",
-            "reAttach": true,
             "name": "Debug frontend",
             "url": "https://localhost:8443/",
             "webRoot": "${workspaceFolder}/ui",

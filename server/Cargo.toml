@@ -49,7 +49,7 @@ toml = "0.8"
 ts-rs = "9.0"
 untrusted = "0.9.0"
 wtransport = "0.1"
-ashpd = "0.9.1"
 ring = "0.17.8"
 ffmpeg-next = "7.0.2"
-
+ashpd = "0.9.1"
+scap = {path = "../scap"}
