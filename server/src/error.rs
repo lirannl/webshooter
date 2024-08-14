@@ -22,10 +22,10 @@ pub enum WebshooterError {
     IPCNotAvailable,
     #[error("Missing authentication")]
     NoAuthentication,
-    #[error("System cryptography is not functioning correctly")]
-    SystemCrypto,
-    #[error("Desktop capture failed")]
-    CaptureFailed,
+    // #[error("System cryptography is not functioning correctly")]
+    // SystemCrypto,
+    // #[error("Desktop capture failed")]
+    // CaptureFailed,
 }
 
 impl ResponseError for WebshooterError {

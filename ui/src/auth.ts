@@ -48,7 +48,7 @@ export const checkIdentity = async (veriKey: CryptoKey) => {
     return response.ok;
 }
 
-export const checkAuth = async (veriKey: CryptoKey) => {
+export const checkCookie = async (veriKey: CryptoKey) => {
     const pubKey = await subtle.exportKey("spki", veriKey);
     const id = await toRawBase64(pubKey);
 
@@ -69,10 +69,15 @@ export const getCookie = async (keypair: CryptoKeyPair) => {
     const challengeBlob = await ((await challenge.blob())).arrayBuffer();
     const signature = await subtle.sign(ecdsaAlgo, keypair.privateKey, challengeBlob);
     await subtle.verify(ecdsaAlgo, keypair.publicKey, signature, challengeBlob);
+    const indicatorId = "authorisation-wait-indicator";
+    let div = document.getElementById(indicatorId);
+    if (!div) {
+        div = document.createElement("div");
+        div.id = indicatorId;
+    }
 
-    const div = document.createElement("div");
     div.className = "secondary";
-    const authWait = "Awaiting authorisation. Please enter \"authorise\"";
+    const authWait = `Awaiting authorisation (identity: ${id.slice(32).slice(undefined, 10)}). Please enter "authorise"`;
     div.innerText = authWait;
     document.body.appendChild(div)
     let wait = 1;
@@ -80,17 +85,25 @@ export const getCookie = async (keypair: CryptoKeyPair) => {
         div.innerText = `${authWait}\n${wait} seconds`;
         wait += 1;
     }, 1000);
-    await fetch("/login", {
-        method: "POST", headers: {
-            credentials: "same-origin",
-            "content-type": "application/json"
-        }, body: JSON.stringify({
-            Signature: {
-                signature: await toRawBase64(signature),
-                id,
-            }
-        } as LoginParams)
-    });
+    try {
+        await fetch("/login", {
+            method: "POST", headers: {
+                credentials: "same-origin",
+                "content-type": "application/json"
+            }, body: JSON.stringify({
+                Signature: {
+                    signature: await toRawBase64(signature),
+                    id,
+                }
+            } as LoginParams)
+        });
+    } catch (err) {
+        if (err instanceof Object && "message" in err) {
+            console.log(err.message);
+            div.innerText = `${err.message}`;
+        }
+
+    }
     clearInterval(loading);
     div.remove();
 }

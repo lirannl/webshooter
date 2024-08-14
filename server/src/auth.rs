@@ -1,3 +1,4 @@
+use crate::config::Bytes64;
 use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
 use http::StatusCode;
@@ -10,14 +11,13 @@ use poem::{Error, IntoResponse, Response, Result};
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::error::Elapsed;
 use tokio::time::timeout;
 use ts_rs::TS;
-use crate::config::Bytes64;
 
 use crate::error::WebshooterError;
 use crate::ipc::{ipc_recv, ipc_send, IPCMessage};
@@ -91,8 +91,8 @@ enum LoginParams {
 impl LoginParams {
     pub fn id(&self) -> Bytes64<&[u8]> {
         match self {
-            LoginParams::IdOnly { id } => Bytes64::from_bytes(&id[..]),
-            LoginParams::Signature { id, .. } => Bytes64::from_bytes(&id[..]),
+            LoginParams::IdOnly { id } => Bytes64(&id[..]),
+            LoginParams::Signature { id, .. } => Bytes64(&id[..]),
         }
     }
     pub fn into_id(self) -> Bytes64 {
@@ -101,6 +101,25 @@ impl LoginParams {
             LoginParams::Signature { id, .. } => id.into(),
         }
     }
+}
+
+pub async fn get_challenged_sessions() -> Vec<Vec<u8>> {
+    let sessions_lock = SESSIONS.lock().await;
+    sessions_lock
+        .iter()
+        .filter_map(|(id, session)| match session {
+            Session::Challenged(_) => Some(id.to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+}
+// const BYTES_TO_SHOW: Range<usize> = 24..8;
+
+fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
+    Bytes64(&id[24..24 + 8])
+        .to_string()
+        .trim_matches('=')
+        .to_string()
 }
 
 #[handler]
@@ -112,27 +131,19 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
         _ => Err(WebshooterError::InvalidLogin),
     }?;
     let id = id.to_owned();
-    if !config
-        .authorised_keys
-        .contains(&Bytes64::from_bytes(id.to_vec()))
-    {
-        let sessions_lock = SESSIONS.lock().await;
-        let mut sessions = sessions_lock
-            .iter()
-            .filter_map(|(id, session)| match session {
-                Session::Challenged(_) => Some(id.to_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        drop(sessions_lock);
-        sessions.sort();
+    // for start in 0..35 {
+    //     println!("{start}: {}", Bytes64(&id[start..]));
+    // }
+    if !config.authorised_keys.contains(&Bytes64(id.to_vec())) {
         let timeout_secs = config.auth_timeout.unwrap_or(30);
         timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 let (message, mut connection) = ipc_recv().await?;
-                match (message, sessions.as_slice()) {
+                match (message, get_challenged_sessions().await.as_slice()) {
                     (IPCMessage::Authorise(None), [_]) => {
-                        connection.write(&format!("Authorised {id}")).await?;
+                        connection
+                            .write(&format!("Authorised {}", format_id(&id)))
+                            .await?;
                         break Ok::<_, anyhow::Error>(());
                     }
                     (IPCMessage::Authorise(None), sessions) => {
@@ -143,10 +154,7 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
                                     .iter()
                                     .enumerate()
                                     .map(|(n, session_id)| {
-                                        format!(
-                                            "{n}: {}",
-                                            Bytes64::from_bytes(session_id.to_owned())
-                                        )
+                                        format!("{n}: {}", format_id(session_id))
                                     })
                                     .collect::<Vec<_>>()
                                     .join("\n")
@@ -164,10 +172,7 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
                             })
                         {
                             connection
-                                .write(&format!(
-                                    "Authorised {}",
-                                    Bytes64::from_bytes(id.to_owned())
-                                ))
+                                .write(&format!("Authorised {}", format_id(id)))
                                 .await?;
                             break Ok(());
                         } else {
@@ -258,10 +263,9 @@ impl<'a> FromRequest<'a> for Authenticated {
             .await
             .iter()
             .filter_map(|(k, s)| match s {
-                Session::Approved { cookie } => Some((
-                    Bytes64::from_bytes(cookie.to_vec()).to_string(),
-                    k.to_owned(),
-                )),
+                Session::Approved { cookie } => {
+                    Some((Bytes64(cookie.to_vec()).to_string(), k.to_owned()))
+                }
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
@@ -270,7 +274,7 @@ impl<'a> FromRequest<'a> for Authenticated {
             .ok_or(WebshooterError::NotAuthorized)?;
 
         Ok(Authenticated {
-            id: Bytes64::from_bytes(id.clone()),
+            id: Bytes64(id.clone()),
         })
     }
 }

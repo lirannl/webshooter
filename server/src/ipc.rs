@@ -1,8 +1,8 @@
+use crate::config::Config;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr};
 use tokio::io::{stdin, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use crate::config::Config;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum IPCMessage {
@@ -56,9 +56,9 @@ mod ipc_funcs {
     use anyhow::Result;
     use async_channel::bounded;
     use lazy_static::lazy_static;
-    use tokio::sync::Mutex;
+    use tokio::{spawn, sync::Mutex};
 
-    use crate::{ipc::IPCMessage, WebshooterError};
+    use crate::{auth::get_challenged_sessions, ipc::IPCMessage, WebshooterError};
 
     use super::IPCConnection;
 
@@ -118,6 +118,8 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
         net::{UnixListener, UnixStream},
     };
 
+    use crate::auth::get_challenged_sessions;
+
     let listener = match UnixListener::bind(&target) {
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
             let connection = UnixStream::connect(&target).await;
@@ -156,10 +158,26 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                 conn.read_buf(&mut buf).await?;
                 let message = serde_json::from_slice(&mut buf)?;
 
-                ipc_handler(message, IPCConnection::Unix(conn)).await
+                let response = match message {
+                    IPCMessage::Authorise(_) => {
+                        if get_challenged_sessions().await.is_empty() {
+                            Some("No challenged sessions")
+                        } else {
+                            None
+                        }
+                    }
+                    IPCMessage::Exit => exit(0),
+                    _ => None
+                };
+                if let Some(message) = response {
+                    conn.write(message.as_bytes()).await?;
+                } else {
+                    ipc_handler(message, IPCConnection::Unix(conn)).await?;
+                }
+                Ok(())
             })()
             .await
-            .unwrap_or_else(|err| eprintln!("IPC failure:\n{err:#?}"));
+            .unwrap_or_else(|err: anyhow::Error| eprintln!("IPC failure:\n{err:#?}"));
         }
     });
     Ok(())

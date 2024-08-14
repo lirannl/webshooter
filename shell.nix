@@ -18,6 +18,7 @@ in
       pipewire
       dbus
       alsa-lib
+      lldb
     ];
     #RUSTC_VERSION = overrides.toolchain.channel;
     # https://github.com/rust-lang/rust-bindgen#environment-variables
@@ -26,4 +27,5 @@ in
       export PATH=$PATH:''${CARGO_HOME:-~/.cargo}/bin
       export PATH=$PATH:''${RUSTUP_HOME:-~/.rustup}/toolchains/$RUSTC_VERSION-x86_64-unknown-linux-gnu/bin/
       '';
+    
 }

@@ -87,8 +87,8 @@ impl Config {
                 host: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 port: 443,
                 ssl_conf: SslConfig {
-                    key: parent.join("server.key"),
-                    certificate: parent.join("server.crt"),
+                    key: parent.join("key.pem"),
+                    certificate: parent.join("cert.pem"),
                 },
             },
             #[cfg(target_os = "linux")]
@@ -102,13 +102,7 @@ impl Config {
 
 /// Bytes in base64
 #[derive(Clone, Debug, Hash, Eq)]
-pub struct Bytes64<B: Deref<Target = [u8]> = Vec<u8>>(B);
-
-impl<B: Deref<Target = [u8]>> Bytes64<B> {
-    pub fn from_bytes(bytes: B) -> Self {
-        Bytes64(bytes)
-    }
-}
+pub struct Bytes64<B: Deref<Target = [u8]> = Vec<u8>>(pub B);
 
 impl<B: Deref<Target = [u8]>, B2: Deref<Target = [u8]>> PartialEq<Bytes64<B2>> for Bytes64<B> {
     fn eq(&self, other: &Bytes64<B2>) -> bool {

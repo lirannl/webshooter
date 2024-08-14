@@ -27,5 +27,6 @@
     "terminal.integrated.defaultProfile.linux": "nix",
     "rust-analyzer.linkedProjects": [
         "./server/Cargo.toml"
-    ]
+    ],
+    "lldb-dap.executable-path": "lldb-vscode"
 }

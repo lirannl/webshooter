@@ -11,6 +11,7 @@ mod auth;
 mod config_watch;
 mod error;
 mod frontend;
+mod logging;
 mod ipc;
 mod video_serve;
 pub mod config;
