@@ -1,81 +1,109 @@
-use std::collections::HashMap;
+use std::time::Duration;
 
-use crate::{
-    auth::{Session, SESSIONS},
-    config::{Bytes64, Config},
-    error::WebshooterError, logging::log,
-};
-use anyhow::{bail, Result};
-use ffmpeg_next::encoder;
-use scap::capturer::{Capturer, Options};
-use wtransport::{
-    endpoint::SessionRequest,
-    tls::{CertificateChain, PrivateKey},
-    Connection, Endpoint, Identity, ServerConfig, VarInt,
-};
+use crate::{auth::OnetimeToken, config::Config, error::WebshooterError, logging::log};
+use anyhow::{anyhow, bail, Result};
+use tokio::time::sleep;
+use wtransport::{endpoint::SessionRequest, Endpoint, Identity, ServerConfig, VarInt};
 
-pub async fn setup_wt(config: Config) -> Result<()> {
-    let cert = CertificateChain::load_pemfile(&config.http_config.ssl_conf.certificate).await?;
-    let key = PrivateKey::load_pemfile(&config.http_config.ssl_conf.key).await?;
-    let identity = Identity::new(cert, key);
-
+pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
-        .with_bind_address((&config.http_config).into())
+        .with_bind_default(config.http_config.port)
         .with_identity(&identity)
+        .keep_alive_interval(Some(Duration::from_secs(10)))
         .build();
 
     let server = Endpoint::server(server_config)?;
 
-    loop {
-        let session = server.accept().await.await;
-        session
-            .map(|session| handle_wt_connection(&config, session))
-            ?.await.unwrap_or_else(log);
+    for id in 0.. {
+        let session = server.accept().await;
+        let config = config.clone();
+        tokio::spawn(async move {
+            match session.await {
+                Ok(session) => handle_wt_connection(&config, session)
+                    .await
+                    .unwrap_or_else(|err| {
+                        log(anyhow!(
+                            "Error during webtransport connection {id}: {err:#?}"
+                        ))
+                    }),
+                Err(err) => {
+                    log(err);
+                }
+            }
+        });
     }
+    Ok(())
 }
 
 pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> Result<()> {
-    let cookie = session
-        .headers()
-        .get("Cookie")
-        .map(|c| c.to_string())
-        .unwrap_or("".to_string());
-    let token = cookie
-        .split(";")
-        .filter_map(|cookie| cookie.trim().split_once("="))
-        .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
-        .ok_or(WebshooterError::NoAuthentication);
-    let current_sessions = SESSIONS
-        .lock()
-        .await
-        .iter()
-        .filter_map(|(k, s)| match s {
-            Session::Approved { cookie } => {
-                Some((Bytes64(cookie.to_vec()).to_string(), k.to_owned()))
+    let connection = session.accept().await?;
+    let onetime = {
+        let mut auth_receiver = connection.accept_uni().await?;
+        let mut buf = [0; _];
+        auth_receiver.read(&mut buf).await?;
+        OnetimeToken::from(buf)
+    };
+    if !onetime.check().await {
+        connection.close(
+            VarInt::from_u32(1),
+            b"Session not authorised. Onetime token invalid",
+        );
+        bail!(WebshooterError::NotAuthorized);
+    }
+    loop {
+        tokio::select! {
+            // stream = connection.accept_bi() => {
+            //     let mut stream = stream?;
+            //     info!("Accepted BI stream");
+
+            //     let bytes_read = match stream.1.read(&mut buffer).await? {
+            //         Some(bytes_read) => bytes_read,
+            //         None => continue,
+            //     };
+
+            //     let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
+
+            //     info!("Received (bi) '{str_data}' from client");
+
+            //     stream.0.write_all(b"ACK").await?;
+            // }
+            // stream = connection.accept_uni() => {
+            //     let mut stream = stream?;
+            //     info!("Accepted UNI stream");
+
+            //     let bytes_read = match stream.read(&mut buffer).await? {
+            //         Some(bytes_read) => bytes_read,
+            //         None => continue,
+            //     };
+
+            //     let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
+
+            //     info!("Received (uni) '{str_data}' from client");
+
+            //     let mut stream = connection.open_uni().await?.await?;
+            //     stream.write_all(b"ACK").await?;
+            // }
+            dgram = connection.receive_datagram() => {
+                let dgram = dgram?;
+                let str_data = std::str::from_utf8(&dgram)?;
+
+                eprintln!("Received (dgram) '{str_data}' from client");
+
+                connection.send_datagram(b"ACK")?;
             }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    match token.and_then(|token| {
-        current_sessions
-            .get(token)
-            .ok_or(WebshooterError::NotAuthorized)
-    }) {
-        Ok(_) => Ok({
-            let session = session.accept().await?;
-            while let Ok(()) = session.send_datagram(b"Hello world!") {}
-            session.close(VarInt::from_u32(0), b"Datagram test complete");
-            // let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
-            // fut.0?;
-            // fut.1?;
-        }),
-        Err(WebshooterError::NotAuthorized) => Ok(session.forbidden().await),
-        Err(WebshooterError::NoAuthentication) => Ok(session.forbidden().await),
-        Err(error) => {
-            session.too_many_requests().await;
-            Err(error.into())
         }
     }
+    // for _ in 0..256 {
+    //     sleep(Duration::from_secs(2)).await;
+
+    //     let _ = connection.send_datagram(b"Hello world!");
+    // }
+    // connection.close(VarInt::from_u32(0), b"Datagram test complete");
+    // let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
+    // fut.0?;
+    // fut.1?;
+
+    Ok(())
 }
 
 // pub async fn capture(config: &Config, session: &Connection) -> Result<()> {

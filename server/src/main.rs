@@ -4,27 +4,33 @@
     async_closure,
     let_chains,
     async_fn_traits,
-    extend_one
+    extend_one,
+    slice_as_chunks,
+    generic_arg_infer,
+    duration_constructors,
 )]
 
 mod auth;
+pub mod config;
 mod config_watch;
 mod error;
 mod frontend;
-mod logging;
 mod ipc;
+mod logging;
 mod video_serve;
-pub mod config;
 use anyhow::Result;
+use auth::authorise_onetime;
+use config::Config;
 use error::WebshooterError;
 use futures_util::join;
 use ipc::setup_ipc;
 use poem::{
     get, handler,
     listener::{Listener, RustlsCertificate, TcpListener},
-    post, IntoResponse, Response, Route, Server,
+    post,
+    web::Data,
+    EndpointExt, IntoResponse, Response, Route, Server,
 };
-use video_serve::setup_wt;
 use std::{
     env,
     io::ErrorKind,
@@ -32,7 +38,8 @@ use std::{
     str::FromStr,
 };
 use tokio::{fs, sync::Mutex};
-use config::Config;
+use video_serve::setup_wt;
+use wtransport::{tls::Sha256Digest, Identity};
 
 use crate::{
     auth::{check_identity, get_challenge, login, Authenticated},
@@ -41,6 +48,11 @@ use crate::{
 
 lazy_static::lazy_static! {
     pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+}
+
+#[handler]
+pub fn provide_data(identity: Data<&Sha256Digest>, Authenticated { .. }: Authenticated) -> Vec<u8> {
+    identity.as_ref().to_vec()
 }
 
 #[tokio::main]
@@ -74,14 +86,23 @@ pub async fn main() -> Result<()> {
 
     watch_config(&config.path).await;
 
+    let identity = Identity::self_signed(&config.webtransport_permitted_domains)?;
     let app = Route::new()
         .at("/check_identity", get(check_identity))
         .at("/check_auth", get(check_auth))
         .at("/challenge", get(get_challenge))
+        .at("/authorise_onetime", get(authorise_onetime))
         .at("/login", post(login))
+        .at(
+            "/webtransport_identity",
+            get(provide_data).data(identity.certificate_chain().as_slice()[0].hash()),
+        )
         .at("/*", frontend::frontend);
 
-    let servers = join!(Server::new(listener).run(app), setup_wt(config.clone()));
+    let servers = join!(
+        Server::new(listener).run(app),
+        setup_wt(config.clone(), identity)
+    );
     servers.0?;
     servers.1?;
 

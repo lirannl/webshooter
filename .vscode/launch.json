@@ -5,14 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "type": "lldb-dap",
+            "type": "lldb",
             "request": "launch",
             "name": "Launch",
-            "program": "${workspaceRoot}/target/debug/webshooter",
+            "program": "${workspaceFolder}/target/debug/webshooter",
             "args": [],
-            "env": [],
-            "cwd": "${workspaceRoot}"
+            "cwd": "${workspaceFolder}"
         },
+        
+        // {
+        //     "type": "lldb-dap",
+        //     "request": "launch",
+        //     "name": "Launch",
+        //     "program": "${workspaceRoot}/target/debug/webshooter",
+        //     "args": [],
+        //     "env": [],
+        //     "cwd": "${workspaceRoot}"
+        // },
         {
             "type": "chrome",
             "request": "launch",

@@ -69,6 +69,14 @@ pub struct Config {
     pub http_config: HttpConfig,
     #[serde(default)]
     pub auth_timeout: Option<u64>,
+    #[serde(default = "default_settings::permitted_domains")]
+    pub webtransport_permitted_domains: Vec<String>,
+}
+
+mod default_settings {
+    pub fn permitted_domains() -> Vec<String> {
+        ["localhost", "127.0.0.1"].map(str::to_string).to_vec()
+    }
 }
 
 fn default_version() -> String {
@@ -96,6 +104,7 @@ impl Config {
             authorised_keys: Default::default(),
             capture_type: Default::default(),
             auth_timeout: Default::default(),
+            webtransport_permitted_domains: default_settings::permitted_domains(),
         })
     }
 }

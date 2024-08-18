@@ -3,20 +3,17 @@ use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
 use http::StatusCode;
 use lazy_static::lazy_static;
-use p384::pkcs8::DecodePublicKey;
-use p384::NistP384;
+use p384::{pkcs8::DecodePublicKey, NistP384};
 use poem::web::Json;
-use poem::{handler, FromRequest, Request, RequestBody};
-use poem::{Error, IntoResponse, Response, Result};
+use poem::{handler, Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result};
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::ops::{Deref, Range};
+use std::ops::Deref;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::error::Elapsed;
-use tokio::time::timeout;
+use tokio::time::{error::Elapsed, timeout};
 use ts_rs::TS;
 
 use crate::error::WebshooterError;
@@ -276,5 +273,63 @@ impl<'a> FromRequest<'a> for Authenticated {
         Ok(Authenticated {
             id: Bytes64(id.clone()),
         })
+    }
+}
+
+pub use onetime::OnetimeToken;
+#[handler]
+pub async fn authorise_onetime(Authenticated { .. }: Authenticated) -> Vec<u8> {
+    OnetimeToken::new().await.to_vec()
+}
+
+mod onetime {
+    use std::{collections::HashSet, ops::Deref, time::Duration};
+
+    use lazy_static::lazy_static;
+    use rand::{thread_rng, RngCore};
+    use tokio::{spawn, sync::Mutex, time::sleep};
+
+    const ONETIME_DURATION: Duration = Duration::from_mins(5);
+    const ONETIME_LENGTH: usize = 1024;
+
+    #[derive(Hash, PartialEq, Eq, Clone, Debug)]
+    pub struct OnetimeToken([u8; ONETIME_LENGTH]);
+    lazy_static! {
+        static ref ONETIME_AUTHORISATIONS: Mutex<HashSet<OnetimeToken>> =
+            Mutex::new(HashSet::new());
+    }
+    impl OnetimeToken {
+        pub async fn new() -> Self {
+            let mut token = [0; ONETIME_LENGTH];
+            thread_rng().fill_bytes(&mut token);
+            let token = Self(token);
+            ONETIME_AUTHORISATIONS.lock().await.insert(token.clone());
+            {
+                let token = token.clone();
+                spawn(async move {
+                    sleep(ONETIME_DURATION).await;
+                    ONETIME_AUTHORISATIONS.lock().await.remove(&token);
+                });
+            }
+            token
+        }
+        pub async fn check(self) -> bool {
+            let hash_set = &mut ONETIME_AUTHORISATIONS.lock().await;
+            let token_was_present = hash_set.remove(&self);
+            token_was_present
+        }
+    }
+    impl From<[u8; ONETIME_LENGTH]> for OnetimeToken {
+        fn from(value: [u8; ONETIME_LENGTH]) -> Self {
+            Self(value)
+        }
+    }
+
+    impl Deref for OnetimeToken {
+        type Target = [u8];
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
     }
 }
