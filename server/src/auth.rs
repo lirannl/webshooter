@@ -4,7 +4,7 @@ use ecdsa::signature::Verifier;
 use http::StatusCode;
 use lazy_static::lazy_static;
 use p384::{pkcs8::DecodePublicKey, NistP384};
-use poem::web::Json;
+use poem::web::{Data, Json};
 use poem::{handler, Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result};
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{error::Elapsed, timeout};
 use ts_rs::TS;
+use wtransport::tls::Sha256Digest;
 
 use crate::error::WebshooterError;
 use crate::ipc::{ipc_recv, ipc_send, IPCMessage};
@@ -278,8 +279,15 @@ impl<'a> FromRequest<'a> for Authenticated {
 
 pub use onetime::OnetimeToken;
 #[handler]
-pub async fn authorise_onetime(Authenticated { .. }: Authenticated) -> Vec<u8> {
-    OnetimeToken::new().await.to_vec()
+pub async fn negotiate_websocket(
+    Data(cert_hash): Data<&Sha256Digest>,
+    Authenticated { .. }: Authenticated,
+) -> impl IntoResponse {
+    let token = OnetimeToken::new().await.to_vec();
+    let token = Bytes64(token).to_string();
+    poem::Response::builder()
+        .header("token", token)
+        .body(cert_hash.as_ref().to_vec())
 }
 
 mod onetime {
@@ -289,8 +297,13 @@ mod onetime {
     use rand::{thread_rng, RngCore};
     use tokio::{spawn, sync::Mutex, time::sleep};
 
+    use crate::{config::Bytes64, error::WebshooterError};
+
+    #[cfg(debug_assertions)]
     const ONETIME_DURATION: Duration = Duration::from_mins(5);
-    const ONETIME_LENGTH: usize = 1024;
+    #[cfg(not(debug_assertions))]
+    const ONETIME_DURATION: Duration = Duration::from_secs(5);
+    const ONETIME_LENGTH: usize = 256;
 
     #[derive(Hash, PartialEq, Eq, Clone, Debug)]
     pub struct OnetimeToken([u8; ONETIME_LENGTH]);
@@ -319,6 +332,16 @@ mod onetime {
             token_was_present
         }
     }
+    impl<B: Deref<Target = [u8]>> TryFrom<Bytes64<B>> for OnetimeToken {
+        type Error = anyhow::Error;
+
+        fn try_from(value: Bytes64<B>) -> Result<Self, Self::Error> {
+            Ok(Self(
+                *value.first_chunk().ok_or(WebshooterError::InvalidLogin)?,
+            ))
+        }
+    }
+
     impl From<[u8; ONETIME_LENGTH]> for OnetimeToken {
         fn from(value: [u8; ONETIME_LENGTH]) -> Self {
             Self(value)

@@ -1,3 +1,5 @@
+import { base64ToBytes } from "./base64";
+
 const authorise_webshooter_webtransport = async (wt: WebTransport) => {
     const token = await fetch("authorise_onetime");
     const tokenReceiver = (await wt.createUnidirectionalStream()).getWriter();
@@ -6,21 +8,13 @@ const authorise_webshooter_webtransport = async (wt: WebTransport) => {
 }
 
 export const start = async () => {
-    const hash = await fetch("webtransport_identity")
-    const wt = new WebTransport(location.href, { requireUnreliable: true, serverCertificateHashes: [{ algorithm: "sha-256", value: await hash.arrayBuffer() }] });
+    const negotiation = await fetch("negotiate_websocket");
+    let token = negotiation.headers.get("token");
+    const wt = new WebTransport(`${location.href}?token=${token}`, { requireUnreliable: true, serverCertificateHashes: [{ algorithm: "sha-256", value: await negotiation.arrayBuffer() }] });
     await wt.ready;
-    await authorise_webshooter_webtransport(wt);
     const reader = wt.datagrams.readable.getReader();
     const writer = wt.datagrams.writable.getWriter();
-    await writer.ready;
-    {
-        const input = document.createElement("input");
-        document.body.appendChild(input);
-        const listener = (event: Event) => {
-            writer.write(new TextEncoder().encode((event as any).target.value))
-        }
-        input.addEventListener("input", listener)
-    }
+    writer.write(new Uint8Array(1))
 
     while (true) {
         const { value, done } = await reader.read();
@@ -28,7 +22,7 @@ export const start = async () => {
             break;
         }
         // value is a Uint8Array.
-        console.log(value);
+        console.log(new TextDecoder().decode(value));
     }
 
     // let successes = 0

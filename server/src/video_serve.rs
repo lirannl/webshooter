@@ -1,15 +1,21 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
-use crate::{auth::OnetimeToken, config::Config, error::WebshooterError, logging::log};
+use crate::{
+    auth::OnetimeToken,
+    config::{Bytes64, Config},
+    error::WebshooterError,
+    logging::log,
+};
 use anyhow::{anyhow, bail, Result};
+use futures_util::TryFutureExt;
 use tokio::time::sleep;
-use wtransport::{endpoint::SessionRequest, Endpoint, Identity, ServerConfig, VarInt};
+use wtransport::{endpoint::SessionRequest, Connection, Endpoint, Identity, ServerConfig, VarInt};
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
         .with_bind_default(config.http_config.port)
         .with_identity(&identity)
-        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .keep_alive_interval(Some(Duration::from_mins(5)))
         .build();
 
     let server = Endpoint::server(server_config)?;
@@ -18,92 +24,45 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         let session = server.accept().await;
         let config = config.clone();
         tokio::spawn(async move {
-            match session.await {
-                Ok(session) => handle_wt_connection(&config, session)
-                    .await
-                    .unwrap_or_else(|err| {
-                        log(anyhow!(
-                            "Error during webtransport connection {id}: {err:#?}"
-                        ))
-                    }),
-                Err(err) => {
-                    log(err);
+            (async move || -> Result<()> {
+                let request = session.await?;
+                let token = request
+                    .path()
+                    .split_once("?")
+                    .map(|(_, params)| params.split("&"))
+                    .and_then(|params| {
+                        params
+                            .filter_map(|param| param.split_once("="))
+                            .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
+                    })
+                    .ok_or(WebshooterError::NoAuthentication)?;
+                let token = Bytes64::from_str(token)?;
+                if OnetimeToken::try_from(token)?.check().await {
+                    handle_wt_connection(&config, request.accept().await?)
+                        .await
+                        .map_err(|err| {
+                            anyhow!("Error during webtransport connection {id}: {err:#?}")
+                        })
+                } else {
+                    request.forbidden().await;
+                    Err(WebshooterError::NotAuthorized.into())
                 }
-            }
+            })()
+            .await
+            .unwrap_or_else(log)
         });
     }
     Ok(())
 }
 
-pub async fn handle_wt_connection(config: &Config, session: SessionRequest) -> Result<()> {
-    let connection = session.accept().await?;
-    let onetime = {
-        let mut auth_receiver = connection.accept_uni().await?;
-        let mut buf = [0; _];
-        auth_receiver.read(&mut buf).await?;
-        OnetimeToken::from(buf)
-    };
-    if !onetime.check().await {
-        connection.close(
-            VarInt::from_u32(1),
-            b"Session not authorised. Onetime token invalid",
-        );
-        bail!(WebshooterError::NotAuthorized);
-    }
+pub async fn handle_wt_connection(config: &Config, connection: Connection) -> Result<()> {
     loop {
-        tokio::select! {
-            // stream = connection.accept_bi() => {
-            //     let mut stream = stream?;
-            //     info!("Accepted BI stream");
-
-            //     let bytes_read = match stream.1.read(&mut buffer).await? {
-            //         Some(bytes_read) => bytes_read,
-            //         None => continue,
-            //     };
-
-            //     let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
-
-            //     info!("Received (bi) '{str_data}' from client");
-
-            //     stream.0.write_all(b"ACK").await?;
-            // }
-            // stream = connection.accept_uni() => {
-            //     let mut stream = stream?;
-            //     info!("Accepted UNI stream");
-
-            //     let bytes_read = match stream.read(&mut buffer).await? {
-            //         Some(bytes_read) => bytes_read,
-            //         None => continue,
-            //     };
-
-            //     let str_data = std::str::from_utf8(&buffer[..bytes_read])?;
-
-            //     info!("Received (uni) '{str_data}' from client");
-
-            //     let mut stream = connection.open_uni().await?.await?;
-            //     stream.write_all(b"ACK").await?;
-            // }
-            dgram = connection.receive_datagram() => {
-                let dgram = dgram?;
-                let str_data = std::str::from_utf8(&dgram)?;
-
-                eprintln!("Received (dgram) '{str_data}' from client");
-
-                connection.send_datagram(b"ACK")?;
-            }
+     if let Ok(_) = connection.receive_datagram().await {
+        for i in 1..1000 {
+            connection.send_datagram(format!("{i}").as_bytes())?;
         }
+     }
     }
-    // for _ in 0..256 {
-    //     sleep(Duration::from_secs(2)).await;
-
-    //     let _ = connection.send_datagram(b"Hello world!");
-    // }
-    // connection.close(VarInt::from_u32(0), b"Datagram test complete");
-    // let fut = join(capture(&config, &session), setup_input(&config, &session)).await;
-    // fut.0?;
-    // fut.1?;
-
-    Ok(())
 }
 
 // pub async fn capture(config: &Config, session: &Connection) -> Result<()> {

@@ -15,3 +15,13 @@ export const dataUrlToBytes = async (dataUrl: string) => {
     const res = await fetch(dataUrl);
     return await res.arrayBuffer();
 }
+
+export const base64ToBytes = (base64: string) => {
+    const binary_string = window.atob(base64);
+    const len = binary_string.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binary_string.charCodeAt(i);
+    }
+    return bytes.buffer;
+}

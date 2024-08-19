@@ -137,13 +137,13 @@ impl FromStr for Bytes64<Vec<u8>> {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s
-            .chars()
-            .filter(|c| {
-                let blacklist = &['='];
-                !blacklist.contains(c)
-            })
-            .collect::<String>();
+        // let s = s
+        //     .chars()
+        //     .filter(|c| {
+        //         let blacklist = &['='];
+        //         !blacklist.contains(c)
+        //     })
+        //     .collect::<String>();
         let vec = BASE64.decode(s.as_bytes());
         Ok(Bytes64(vec?))
     }
