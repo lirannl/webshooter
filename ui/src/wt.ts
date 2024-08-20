@@ -14,6 +14,7 @@ export const start = async () => {
     await wt.ready;
     const reader: ReadableStreamDefaultReader<Uint8Array> = wt.datagrams.readable.getReader();
     const writer: WritableStreamDefaultWriter<Uint8Array> = wt.datagrams.writable.getWriter();
+    // Needed to maintain the connection, apparently?
     const stopWriting = setInterval(() => {
         writer.write(new Uint8Array(1))
     }, 50);
