@@ -1,15 +1,35 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    io::Read,
+    os::fd::{FromRawFd, IntoRawFd},
+    str::FromStr,
+    time::Duration,
+};
 
 use crate::{
     auth::OnetimeToken,
     config::{Bytes64, Config},
     error::WebshooterError,
+    get_config,
     logging::log,
+    update_config,
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
+use ashpd::{
+    desktop::{
+        screencast::{self},
+        PersistMode,
+    },
+    enumflags2::BitFlags,
+    WindowIdentifier,
+};
+use bytes::Buf;
 use futures_util::TryFutureExt;
-use tokio::time::sleep;
-use wtransport::{endpoint::SessionRequest, Connection, Endpoint, Identity, ServerConfig, VarInt};
+use scap::capturer::{Capturer, Options};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, BufReader},
+};
+use wtransport::{endpoint::IncomingSession, Connection, Endpoint, Identity, ServerConfig};
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
@@ -22,96 +42,96 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
 
     for id in 0.. {
         let session = server.accept().await;
-        let config = config.clone();
         tokio::spawn(async move {
-            (async move || -> Result<()> {
-                let request = session.await?;
-                let token = request
-                    .path()
-                    .split_once("?")
-                    .map(|(_, params)| params.split("&"))
-                    .and_then(|params| {
-                        params
-                            .filter_map(|param| param.split_once("="))
-                            .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
-                    })
-                    .ok_or(WebshooterError::NoAuthentication)?;
-                let token = Bytes64::from_str(token)?;
-                if OnetimeToken::try_from(token)?.check().await {
-                    handle_wt_connection(&config, request.accept().await?)
-                        .await
-                        .map_err(|err| {
-                            anyhow!("Error during webtransport connection {id}: {err:#?}")
-                        })
-                } else {
-                    request.forbidden().await;
-                    Err(WebshooterError::NotAuthorized.into())
-                }
-            })()
-            .await
-            .unwrap_or_else(log)
+            webtransport_auth(session)
+                .and_then(handle_wt_connection)
+                .await
+                .map_err(|err| anyhow!("Error during webtransport connection {id}: {err:#?}"))
+                .unwrap_or_else(log)
         });
     }
     Ok(())
 }
 
-pub async fn handle_wt_connection(config: &Config, connection: Connection) -> Result<()> {
-    loop {
-     if let Ok(_) = connection.receive_datagram().await {
-        for i in 1..1000 {
-            connection.send_datagram(format!("{i}").as_bytes())?;
-        }
-     }
+async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
+    let request = session.await?;
+    let token = request
+        .path()
+        .split_once("?")
+        .map(|(_, params)| params.split("&"))
+        .and_then(|params| {
+            params
+                .filter_map(|param| param.split_once("="))
+                .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
+        })
+        .ok_or(WebshooterError::NoAuthentication)?;
+    let token = Bytes64::from_str(token)?;
+    if OnetimeToken::try_from(token)?.check().await {
+        let connection = request.accept().await?;
+        Ok(connection)
+    } else {
+        request.forbidden().await;
+        Err(WebshooterError::NotAuthorized.into())
     }
 }
 
-// pub async fn capture(config: &Config, session: &Connection) -> Result<()> {
-//     if !scap::has_permission() && !scap::request_permission() {
-//         bail!("Couldn't obtain screen capture permission")
+pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
+    let mut capturer = Capturer::new(Options {
+        ..Default::default()
+    });
+    capturer.start_capture();
+    let mut buf = [0; 512];
+    let mut vec = Vec::new();
+    for _ in 0..10 {
+        let frame = capturer.get_next_frame()?;
+        let mut frame = match frame {
+            scap::frame::Frame::BGRx(frame) => Ok(frame),
+            _ => Err(WebshooterError::InvalidLogin),
+        }?;
+        vec.append(&mut frame.data);
+    }
+    let mut reader = BufReader::new(vec.as_slice());
+    if let Ok(_) = connection.receive_datagram().await {
+        while let n = reader.read(&mut buf[..]).await?
+            && n > 0
+        {
+            connection.send_datagram(&buf[0..(n - 1)])?;
+        }
+    }
+    Ok(())
+}
+// pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
+//     let caster = screencast::Screencast::new().await?;
+//     let mut config = get_config().await;
+//     let session = caster.create_session().await?;
+//     caster
+//         .select_sources(
+//             &session,
+//             screencast::CursorMode::Embedded,
+//             BitFlags::from_flag(config.capture_type.clone().into()),
+//             false,
+//             config.pipewire_key.as_deref(),
+//             PersistMode::ExplicitlyRevoked,
+//         )
+//         .await?;
+//     let pipewire_response = &caster
+//         .start(&session, &WindowIdentifier::None)
+//         .await?
+//         .response()?;
+//     config.pipewire_key = pipewire_response.restore_token().map(str::to_string);
+//     update_config(config).await?;
+//     // let streams = pipewire_response.streams();
+//     let streams_fd = caster.open_pipe_wire_remote(&session).await?;
+//     let mut file = unsafe { File::from_raw_fd(streams_fd.into_raw_fd()) };
+
+//     let mut buf = [0 as u8; 2048];
+//     loop {
+//         if let Ok(_) = connection.receive_datagram().await {
+//             for _ in 1..1000 {
+//                 file.read_exact(&mut buf[..]).await?;
+//                 eprintln!("Read screen data: {:x?}", &buf[..3]);
+//                 connection.send_datagram(&buf)?;
+//             }
+//         }
 //     }
-
-//     let targets = scap::get_all_targets();
-
-//     let options = Options {
-//         fps: 60,
-//         target: None,
-//         show_cursor: true,
-//         show_highlight: true,
-//         excluded_targets: Some(
-//             targets
-//                 .into_iter()
-//                 .filter_map(|t| match t {
-//                     scap::Target::Window(_) => Some(t),
-//                     _ => None,
-//                 })
-//                 .collect(),
-//         ),
-//         output_type: scap::frame::FrameType::BGRAFrame,
-//         output_resolution: scap::capturer::Resolution::_720p,
-//         ..Default::default()
-//     };
-
-//     let mut capturer = Capturer::new(options);
-
-//     capturer.start_capture();
-
-//     let encoder = encoder::new();
-
-//     while let frame = capturer.get_next_frame()
-//         && let Some(frame) = match frame {
-//             Ok(frame) => Ok(Some(frame)),
-//             Err(err) => Err(err),
-//         }?
-//     {}
-
-//     Ok(())
-// }
-
-// #[cfg(target_os = "linux")]
-// pub async fn setup_input(config: &Config, session: &Connection) -> Result<()> {
-//     use ashpd::desktop::remote_desktop::RemoteDesktop;
-
-//     let remote = RemoteDesktop::new().await?;
-
-//     Ok(())
 // }

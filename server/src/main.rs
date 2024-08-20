@@ -22,8 +22,9 @@ use anyhow::Result;
 use auth::negotiate_websocket;
 use config::Config;
 use error::WebshooterError;
-use futures_util::join;
+use futures_util::{join, TryFutureExt};
 use ipc::setup_ipc;
+use logging::log;
 use poem::{
     get, handler,
     listener::{Listener, RustlsCertificate, TcpListener},
@@ -35,7 +36,13 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    sync::{
+        mpsc::{self, Sender},
+        Mutex,
+    },
+};
 use video_serve::setup_wt;
 use wtransport::Identity;
 
@@ -46,59 +53,76 @@ use crate::{
 
 lazy_static::lazy_static! {
     pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+    pub static ref RESET_TRIGGER: Mutex<Option<Sender<()>>> = Mutex::new(None);
+}
+
+pub fn reset_app() {
+    if let Some(trigger) = RESET_TRIGGER.blocking_lock().as_ref() {
+        let _ = tokio::runtime::Handle::current().block_on(trigger.send(()));
+    }
 }
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
     let config_dir = setup_config_dir().await?;
-
     setup_config(&config_dir).await?;
 
-    let config = get_config().await;
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+    RESET_TRIGGER.lock().await.replace(tx);
 
-    setup_ipc(config.clone()).await?;
+    loop {
+        let config = get_config().await;
 
-    setup_ssl_certificates(&config).await?;
+        setup_ipc(config.clone()).await?;
 
-    println!(
-        "Listening for connections on https://{}:{}",
-        config.http_config.host, config.http_config.port
-    );
+        setup_ssl_certificates(&config).await?;
 
-    let listener = TcpListener::bind(format!(
-        "{}:{}",
-        config.http_config.host, config.http_config.port
-    ))
-    .rustls(
-        poem::listener::RustlsConfig::new().fallback(
-            RustlsCertificate::new()
-                .cert(fs::read(&config.http_config.ssl_conf.certificate).await?)
-                .key(fs::read(&config.http_config.ssl_conf.key).await?),
-        ),
-    );
+        println!(
+            "Listening for connections on https://{}:{}",
+            config.http_config.host, config.http_config.port
+        );
 
-    watch_config(&config.path).await;
+        let listener = TcpListener::bind(format!(
+            "{}:{}",
+            config.http_config.host, config.http_config.port
+        ))
+        .rustls(
+            poem::listener::RustlsConfig::new().fallback(
+                RustlsCertificate::new()
+                    .cert(fs::read(&config.http_config.ssl_conf.certificate).await?)
+                    .key(fs::read(&config.http_config.ssl_conf.key).await?),
+            ),
+        );
 
-    let identity = Identity::self_signed(&config.webtransport_permitted_domains)?;
-    let app = Route::new()
-        .at("/check_identity", get(check_identity))
-        .at("/check_auth", get(check_auth))
-        .at("/challenge", get(get_challenge))
-        .at(
-            "/negotiate_websocket",
-            get(negotiate_websocket).data(identity.certificate_chain().as_slice()[0].hash()),
-        )
-        .at("/login", post(login))
-        .at("/*", frontend::frontend);
+        watch_config(&config.path).await;
 
-    let servers = join!(
-        Server::new(listener).run(app),
-        setup_wt(config.clone(), identity)
-    );
-    servers.0?;
-    servers.1?;
+        let identity = Identity::self_signed(&config.webtransport_permitted_domains)?;
+        let app = Route::new()
+            .at("/check_identity", get(check_identity))
+            .at("/check_auth", get(check_auth))
+            .at("/challenge", get(get_challenge))
+            .at(
+                "/negotiate_websocket",
+                get(negotiate_websocket).data(identity.certificate_chain().as_slice()[0].hash()),
+            )
+            .at("/login", post(login))
+            .at("/*", frontend::frontend);
 
-    Ok(())
+        let handle_0 = tokio::spawn(Server::new(listener).run(app).or_else(async |err| {
+            log(err);
+            reset_app();
+            Ok::<_, anyhow::Error>(())
+        }));
+        let handle_1 = tokio::spawn(setup_wt(config.clone(), identity).or_else(async |err| {
+            log(err);
+            reset_app();
+            Ok::<_, anyhow::Error>(())
+        }));
+        // Wait for a reset signal
+        rx.recv().await;
+        handle_0.abort();
+        handle_1.abort();
+    }
 }
 
 async fn setup_ssl_certificates(config: &Config) -> Result<()> {
@@ -199,7 +223,7 @@ pub async fn update_config(config: Config) -> Result<()> {
         serde_json::to_string_pretty(&config)?
     };
     fs::write(path, &contents).await?;
-    // *APP_CONFIG.lock().await = Some(config);
+    *APP_CONFIG.lock().await = Some(config);
     Ok(())
 }
 
