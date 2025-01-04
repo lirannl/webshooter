@@ -3,24 +3,17 @@ use crate::{
     config::{Bytes64, Config},
     error::WebshooterError,
     ipc::IPC_ID,
-    logging::log,
 };
-use anyhow::{anyhow, Result};
-use ffmpeg::{codec, codec::Context as CodecContext, encoder, format, util::frame::video::Video};
-use ffmpeg_next::{self as ffmpeg, codec::traits::Encoder, format::Pixel, Rational};
-use futures_util::{FutureExt, TryFutureExt};
+use anyhow::Result;
+use ffmpeg::{codec, format, util::frame::video::Video};
+use ffmpeg_next::{self as ffmpeg, format::Pixel, Rational};
+use futures_util::FutureExt;
 use interprocess::local_socket::{
     prelude::*, traits::tokio::Listener, GenericNamespaced, ListenerOptions,
 };
 use scap::capturer::{Capturer, Options};
-use std::{
-    error::Error, future::Future, io::ErrorKind, pin::Pin, str::FromStr, sync::Arc, time::Duration,
-};
-use tokio::{
-    io::{AsyncReadExt, BufReader},
-    spawn,
-    task::JoinHandle,
-};
+use std::{io::ErrorKind, str::FromStr, sync::Arc, time::Duration};
+use tokio::{io::AsyncReadExt, spawn, task::JoinHandle};
 use wtransport::{endpoint::IncomingSession, Connection, Endpoint, Identity, ServerConfig};
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
