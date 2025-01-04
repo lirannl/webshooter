@@ -279,7 +279,7 @@ impl<'a> FromRequest<'a> for Authenticated {
 
 pub use onetime::OnetimeToken;
 #[handler]
-pub async fn negotiate_websocket(
+pub async fn negotiate_wt(
     Data(cert_hash): Data<&Sha256Digest>,
     Authenticated { .. }: Authenticated,
 ) -> impl IntoResponse {

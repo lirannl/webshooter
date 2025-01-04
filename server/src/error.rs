@@ -22,6 +22,8 @@ pub enum WebshooterError {
     IPCNotAvailable,
     #[error("Missing authentication")]
     NoAuthentication,
+    #[error("Failure in encoder \"{0:?}\"")]
+    EncoderFailure(ffmpeg_next::codec::Id),
     // #[error("System cryptography is not functioning correctly")]
     // SystemCrypto,
     // #[error("Desktop capture failed")]

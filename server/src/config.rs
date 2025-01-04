@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
 use ashpd::desktop::screencast::SourceType;
 use data_encoding::BASE64;
-use ring::rand::SecureRandom;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::HashSet,
@@ -10,10 +9,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,
     path::{Path, PathBuf},
-    str::{from_utf8, FromStr},
+    str::FromStr,
 };
-
-use crate::error::WebshooterError;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum CaptureType {

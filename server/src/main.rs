@@ -1,7 +1,6 @@
 #![feature(
     io_error_more,
     if_let_guard,
-    async_closure,
     let_chains,
     async_fn_traits,
     extend_one,
@@ -19,10 +18,10 @@ mod ipc;
 mod logging;
 mod video_serve;
 use anyhow::Result;
-use auth::negotiate_websocket;
+use auth::negotiate_wt;
 use config::Config;
 use error::WebshooterError;
-use futures_util::{join, TryFutureExt};
+use futures_util::TryFutureExt;
 use ipc::setup_ipc;
 use logging::log;
 use poem::{
@@ -102,8 +101,8 @@ pub async fn main() -> Result<()> {
             .at("/check_auth", get(check_auth))
             .at("/challenge", get(get_challenge))
             .at(
-                "/negotiate_websocket",
-                get(negotiate_websocket).data(identity.certificate_chain().as_slice()[0].hash()),
+                "/negotiate_wt",
+                get(negotiate_wt).data(identity.certificate_chain().as_slice()[0].hash()),
             )
             .at("/login", post(login))
             .at("/*", frontend::frontend);

@@ -1,3 +1,0 @@
-[submodule "scap"]
-	path = scap
-	url = https://github.com/CapSoftware/scap.git

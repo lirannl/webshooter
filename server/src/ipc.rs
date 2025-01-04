@@ -56,9 +56,9 @@ mod ipc_funcs {
     use anyhow::Result;
     use async_channel::bounded;
     use lazy_static::lazy_static;
-    use tokio::{spawn, sync::Mutex};
+    use tokio::sync::Mutex;
 
-    use crate::{auth::get_challenged_sessions, ipc::IPCMessage, WebshooterError};
+    use crate::{ipc::IPCMessage, WebshooterError};
 
     use super::IPCConnection;
 
@@ -105,13 +105,12 @@ mod ipc_funcs {
 }
 pub use ipc_funcs::{ipc_recv, ipc_send};
 
+pub const IPC_ID: &str = include_str!("../../ipc_id.txt");
+
 #[cfg(target_family = "unix")]
 pub async fn setup_ipc(_config: Config) -> Result<()> {
     let target = env::var("XDG_RUNTIME_DIR")?;
-    let target = PathBuf::from_str(&target)?.join(format!(
-        "webshooter_{}.sock",
-        include_str!("../../ipc_id.txt")
-    ));
+    let target = PathBuf::from_str(&target)?.join(format!("webshooter_{IPC_ID}.sock",));
     use std::process::exit;
     use tokio::{
         fs::remove_file,
@@ -167,7 +166,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                         }
                     }
                     IPCMessage::Exit => exit(0),
-                    _ => None
+                    //_ => None,
                 };
                 if let Some(message) = response {
                     conn.write(message.as_bytes()).await?;
