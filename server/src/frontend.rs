@@ -8,6 +8,8 @@ use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
 #[folder = "../dist"]
+#[cfg_eval]
+#[cfg_attr(debug_assertions, allow_missing = true)]
 pub struct Assets;
 
 #[poem::handler]

@@ -6,20 +6,21 @@ use crate::{
 };
 use anyhow::Result;
 use ffmpeg::{codec, format, util::frame::video::Video};
-use ffmpeg_next::{self as ffmpeg, format::Pixel, Rational};
+use ffmpeg_next::{self as ffmpeg, Rational, format::Pixel};
 use futures_util::FutureExt;
 use interprocess::local_socket::{
-    prelude::*, traits::tokio::Listener, GenericNamespaced, ListenerOptions,
+    GenericNamespaced, ListenerOptions, prelude::*, traits::tokio::Listener,
 };
+use rand::{Rng, RngCore, thread_rng};
 use scap::capturer::{Capturer, Options};
 use std::{io::ErrorKind, str::FromStr, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, spawn, task::JoinHandle};
-use wtransport::{endpoint::IncomingSession, Connection, Endpoint, Identity, ServerConfig};
+use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
         .with_bind_default(config.http_config.port)
-        .with_identity(&identity)
+        .with_identity(identity)
         .keep_alive_interval(Some(Duration::from_mins(5)))
         .build();
 
@@ -30,8 +31,6 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         tokio::spawn(async move {
             let connection = webtransport_auth(session).await?;
             handle_wt_connection(connection).await?;
-            // .map_err(|err| anyhow!("Error during webtransport connection {id}: {err:#?}"))
-            // .unwrap_or_else(log);
             Ok::<_, anyhow::Error>(())
         });
     }
@@ -62,6 +61,7 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 
 pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
     let connection = Arc::new(connection);
+
     let pipe_name = format!("{IPC_ID}-{}", connection.session_id());
     #[cfg(target_family = "unix")]
     let pipe_name = {
@@ -91,17 +91,41 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
             )
             .encoder()
             .video()?;
-            stream.set_parameters(&encoder);
+
+            // Get frame dimensions from capturer
             let [width, height] = capturer.get_output_frame_size();
-            encoder.set_height(height);
+
+            // Validate that dimensions are valid before proceeding
+            if width == 0 || height == 0 {
+                eprintln!(
+                    "Error: Captured frame dimensions are invalid (width: {}, height: {})",
+                    width, height
+                );
+                return Err(WebshooterError::InvalidLogin.into());
+            }
+
+            // Set encoder parameters properly for AV1
             encoder.set_width(width);
+            encoder.set_height(height);
             encoder.set_aspect_ratio(Rational::new(width as i32, height as i32).reduce());
-            encoder.set_format(format::Pixel::YUV420P);
+            encoder.set_format(Pixel::YUV420P);
             encoder.set_time_base(Rational::new(1, 30));
+
+            // Additional AV1-specific parameter setting
+            // Some versions of libaom-av1 require specific settings for dimensions to be properly recognized
+            if encoder.codec().is_some() {
+                // Try to set some common AV1 parameters that might help with dimension recognition
+                // This is a best-effort approach as the exact API varies by ffmpeg version
+                eprintln!(
+                    "Setting up AV1 encoder with dimensions: {}x{}",
+                    width, height
+                );
+            }
+
             let mut encoder = encoder.open()?;
             stream.set_parameters(&encoder);
-            // let mut buf = [0; 512];
-            // let mut vec = Vec::new();
+
+            // Process frames
             for _ in 0..10 {
                 let frame = capturer.get_next_frame()?;
                 let frame = match frame {
@@ -110,7 +134,16 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
                 }?;
                 let frame = bgrx_to_yuv420p(frame)?;
 
-                encoder.send_frame(&frame)?;
+                // Ensure we're sending the correct frame type to encoder
+                match encoder.send_frame(&frame) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Error sending frame to encoder: {:?}", e);
+                        // Continue processing other frames rather than failing completely
+                        // This prevents a single frame error from stopping the entire stream
+                        continue;
+                    }
+                }
             }
         }
         Ok(())

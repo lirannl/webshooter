@@ -1,12 +1,11 @@
 #![feature(
     io_error_more,
     if_let_guard,
-    let_chains,
     async_fn_traits,
     extend_one,
-    slice_as_chunks,
-    generic_arg_infer,
-    duration_constructors
+    duration_constructors,
+    cfg_eval,
+    duration_constructors_lite
 )]
 
 mod auth;
@@ -25,9 +24,9 @@ use futures_util::TryFutureExt;
 use ipc::setup_ipc;
 use logging::log;
 use poem::{
-    get, handler,
+    EndpointExt, IntoResponse, Response, Route, Server, get, handler,
     listener::{Listener, RustlsCertificate, TcpListener},
-    post, EndpointExt, IntoResponse, Response, Route, Server,
+    post,
 };
 use std::{
     env,
@@ -38,15 +37,15 @@ use std::{
 use tokio::{
     fs,
     sync::{
-        mpsc::{self, Sender},
         Mutex,
+        mpsc::{self, Sender},
     },
 };
 use video_serve::setup_wt;
 use wtransport::Identity;
 
 use crate::{
-    auth::{check_identity, get_challenge, login, Authenticated},
+    auth::{Authenticated, check_identity, get_challenge, login},
     config_watch::watch_config,
 };
 
@@ -129,17 +128,17 @@ async fn setup_ssl_certificates(config: &Config) -> Result<()> {
         || !config.http_config.ssl_conf.certificate.exists()
     {
         println!("Ssl certificate not found. Generating...");
-        let gen = rcgen::generate_simple_self_signed(vec![
+        let generator = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
             config.http_config.host.to_string(),
         ])?;
         let ssl_conf = &config.http_config.ssl_conf;
-        tokio::fs::write(&ssl_conf.certificate, gen.cert.pem()).await?;
+        tokio::fs::write(&ssl_conf.certificate, generator.cert.pem()).await?;
         println!(
             "New ssl certificate PEM generated at {:?}",
             ssl_conf.certificate
         );
-        tokio::fs::write(&ssl_conf.key, gen.key_pair.serialize_pem()).await?;
+        tokio::fs::write(&ssl_conf.key, generator.key_pair.serialize_pem()).await?;
         println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
     }
     Ok(())

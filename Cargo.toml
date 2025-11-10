@@ -3,7 +3,7 @@ resolver = "2"
 members = ["server"]
 default-members = ["server"]
 
-package.edition = "2021"
+package.edition = "2024"
 package.version = "0.1.0"
 package.author = "Liran Piade"
 package.repository = "https://github.com/lirannl/webshooter"
