@@ -1,11 +1,14 @@
-# The Marvelous Webshooter
+# Webshooter
 The goal of Webshooter is to enable remote access to machines using a web browser.
 
 ## Targets (in order):
 - [*] Simple authentication
 - [*] Hosting on wayland
-- [*] Front-end
+- [*] Web frontend
 - [*] Hardware encoding
+- [ ] Native linux frontend
+- [ ] Android frontend
+- [ ] OIDC
 - [ ] Audio
 - [ ] Standard input handling (keyboard and mouse)
 - [ ] Advanced input handling (gamepads, touchscreens (as touchscreens, rather than just emulating a mouse))
