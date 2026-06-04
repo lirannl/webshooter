@@ -1,15 +1,16 @@
-import { defineConfig } from "vite"
+import { defineConfig } from "vite";
 
 export default defineConfig({
-    build: {
-        outDir: "../dist",
-	target: "esnext",
+  build: {
+    outDir: "../dist",
+    emptyOutDir: true,
+    target: "esnext",
+  },
+  server: {
+    cors: true,
+    hmr: {
+      protocol: "http",
+      clientPort: 5173,
     },
-    server: {
-        cors: true,
-        hmr: {
-            protocol: "http",
-            clientPort: 5173
-        }
-    }
+  },
 });
