@@ -3,10 +3,10 @@ use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
 use http::StatusCode;
 use lazy_static::lazy_static;
-use p384::{pkcs8::DecodePublicKey, NistP384};
+use p384::{NistP384, pkcs8::DecodePublicKey};
 use poem::web::{Data, Json};
-use poem::{handler, Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result};
-use rand::{thread_rng, Rng};
+use poem::{Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result, handler};
+use rand::{RngExt, rng};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -18,7 +18,7 @@ use ts_rs::TS;
 use wtransport::tls::Sha256Digest;
 
 use crate::error::WebshooterError;
-use crate::ipc::{ipc_recv, ipc_send, IPCMessage};
+use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
 use crate::{get_config, update_config};
 
 lazy_static! {
@@ -55,9 +55,7 @@ pub async fn check_identity(Identity(id): Identity) -> Result<impl IntoResponse>
 pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> {
     let _id = id.to_string();
     let mut challenge = [0 as u8; CHALLENGE_SIZE];
-    thread_rng()
-        .try_fill(&mut challenge)
-        .map_err(|err| Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+    rng().fill(&mut challenge);
     {
         let mut sessions = SESSIONS.lock().await;
         sessions.insert(id.into(), Session::Challenged(challenge.to_vec()));
@@ -191,7 +189,7 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
         .map_err(|err| match err.downcast::<Elapsed>() {
             Ok(elapsed) => Error::from_string(
                 format!("Did not authorise within {}", elapsed),
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::FORBIDDEN,
             ),
             Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         })?;
@@ -213,18 +211,17 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
     verification.map_err(|_| WebshooterError::ChallengeFailed)?;
 
     let mut cookie = [0 as u8; COOKIE_SIZE];
-    thread_rng()
-        .try_fill(&mut cookie)
-        .map_err(|err| Error::new(err, StatusCode::INTERNAL_SERVER_ERROR))?;
+    rng().fill(&mut cookie);
 
-    let mut sessions = SESSIONS.lock().await;
-    sessions.insert(
-        params.into_id().into(),
-        Session::Approved {
-            cookie: cookie.to_vec(),
-        },
-    );
-    drop(sessions);
+    {
+        let mut sessions = SESSIONS.lock().await;
+        sessions.insert(
+            params.into_id().into(),
+            Session::Approved {
+                cookie: cookie.to_vec(),
+            },
+        );
+    }
     config.authorised_keys.extend_one(id.clone());
     let _str = serde_json::to_string(&config).ok();
     update_config(config)
@@ -294,7 +291,7 @@ mod onetime {
     use std::{collections::HashSet, ops::Deref, time::Duration};
 
     use lazy_static::lazy_static;
-    use rand::{thread_rng, RngCore};
+    use rand::{RngExt, rng};
     use tokio::{spawn, sync::Mutex, time::sleep};
 
     use crate::{config::Bytes64, error::WebshooterError};
@@ -314,7 +311,7 @@ mod onetime {
     impl OnetimeToken {
         pub async fn new() -> Self {
             let mut token = [0; ONETIME_LENGTH];
-            thread_rng().fill_bytes(&mut token);
+            rng().fill(&mut token);
             let token = Self(token);
             ONETIME_AUTHORISATIONS.lock().await.insert(token.clone());
             {

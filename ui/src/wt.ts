@@ -23,6 +23,14 @@ export const start = async () => {
   setInterval(() => {
     console.log(`Received ${datagrams} datagrams. ${bytes} bytes in total`);
   }, 5000);
+  const cancelButton = document.createElement("button");
+  cancelButton.textContent = "Cancel";
+  document.body.appendChild(cancelButton);
+  const closeFunc = () => {
+    console.log("Bye!");
+    wt.close();
+  };
+  cancelButton.addEventListener("click", closeFunc);
 
   while (true) {
     const { value, done } = await reader.read();
@@ -32,9 +40,16 @@ export const start = async () => {
     // value is a Uint8Array.
     if (value) datagrams++;
     bytes += BigInt(value?.length ?? 0);
+    try {
+      const decoder = new TextDecoder();
+      const text = decoder.decode(value);
+      console.log(text);
+    } catch {}
   }
-  wt.closed.then(() => {
-    clearInterval(stopWriting);
-  });
+  await wt.closed;
+
+  clearInterval(stopWriting);
+  cancelButton.removeEventListener("click", closeFunc);
+  document.body.removeChild(cancelButton);
   wt.close();
 };

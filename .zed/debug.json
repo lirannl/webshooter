@@ -9,6 +9,6 @@
     "localRoot": "ui",
     "request": "launch",
     "runtimeExecutable": "librewolf",
-    "url": "https://localhost:8443"
-  }
+    "url": "https://localhost:8443",
+  },
 ]

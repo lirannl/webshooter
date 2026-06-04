@@ -1,12 +1,4 @@
-#![feature(
-    io_error_more,
-    if_let_guard,
-    async_fn_traits,
-    extend_one,
-    duration_constructors,
-    cfg_eval,
-    duration_constructors_lite
-)]
+#![feature(extend_one, cfg_eval, oneshot_channel, never_type, unwrap_infallible)]
 
 mod auth;
 pub mod config;
@@ -15,7 +7,11 @@ mod error;
 mod frontend;
 mod ipc;
 mod logging;
+#[cfg(target_os = "linux")]
+mod pipewire;
+mod sources;
 mod video_serve;
+mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;
 use config::Config;
@@ -69,6 +65,9 @@ pub async fn main() -> Result<()> {
     RESET_TRIGGER.lock().await.replace(tx);
 
     loop {
+        #[cfg(target_os = "linux")]
+        crate::pipewire::setup_pipewire();
+
         let config = get_config().await;
 
         setup_ipc(config.clone()).await?;
@@ -138,7 +137,7 @@ async fn setup_ssl_certificates(config: &Config) -> Result<()> {
             "New ssl certificate PEM generated at {:?}",
             ssl_conf.certificate
         );
-        tokio::fs::write(&ssl_conf.key, generator.key_pair.serialize_pem()).await?;
+        tokio::fs::write(&ssl_conf.key, generator.signing_key.serialize_pem()).await?;
         println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
     }
     Ok(())
@@ -159,13 +158,10 @@ async fn setup_config(config_dir: &Path) -> Result<()> {
         if config.trim() == "" {
             update_config(Config::initialise_at(&config_path)?).await?;
         } else {
-            let config: Config = serde_json::from_str(&config)
-                .or_else(|_| {
-                    let mut config: Config = toml::from_str(&config)?;
-                    config.path = config_path.to_owned();
-                    Ok(config)
-                })
-                .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err))?;
+            let mut config: Config = serde_json::from_str(&config)
+                .or_else(|_| toml::from_str(&config))
+                .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err.into()))?;
+            config.path = config_path.to_owned();
             *APP_CONFIG.lock().await = Some(config);
         }
     } else {

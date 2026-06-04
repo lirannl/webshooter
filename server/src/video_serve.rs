@@ -1,21 +1,27 @@
 use crate::{
     auth::OnetimeToken,
-    config::{Bytes64, Config},
+    config::{Bytes64, CaptureType, Config},
     error::WebshooterError,
-    ipc::IPC_ID,
+    get_config,
+    logging::log,
+    update_config,
 };
-use anyhow::Result;
-use ffmpeg::{codec, format, util::frame::video::Video};
-use ffmpeg_next::{self as ffmpeg, Rational, format::Pixel};
-use futures_util::FutureExt;
-use interprocess::local_socket::{
-    GenericNamespaced, ListenerOptions, prelude::*, traits::tokio::Listener,
+use anyhow::{Result, anyhow};
+use ashpd::{
+    desktop::{
+        CreateSessionOptions,
+        screencast::{
+            CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+            StartCastOptions,
+        },
+    },
+    enumflags2::BitFlags,
 };
-use rand::{Rng, RngCore, thread_rng};
-use scap::capturer::{Capturer, Options};
-use std::{io::ErrorKind, str::FromStr, sync::Arc, time::Duration};
-use tokio::{io::AsyncReadExt, spawn, task::JoinHandle};
-use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
+use futures_util::{FutureExt, StreamExt};
+use gstreamer::{self as gst, prelude::*};
+use gstreamer_app as gst_app;
+use std::{os::fd::IntoRawFd, str::FromStr, sync::Arc, time::Duration};
+use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
@@ -30,7 +36,9 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         let session = server.accept().await;
         tokio::spawn(async move {
             let connection = webtransport_auth(session).await?;
-            handle_wt_connection(connection).await?;
+            handle_wt_connection(connection)
+                .await
+                .unwrap_or_else(|err| log(err));
             Ok::<_, anyhow::Error>(())
         });
     }
@@ -62,140 +70,104 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
     let connection = Arc::new(connection);
 
-    let pipe_name = format!("{IPC_ID}-{}", connection.session_id());
-    #[cfg(target_family = "unix")]
-    let pipe_name = {
-        let temp_dir = format!("/tmp/{IPC_ID}");
-        std::fs::create_dir_all(&temp_dir).or_else(|err| match err {
-            err if err.kind() == ErrorKind::AlreadyExists => Ok(()),
-            err => Err(err),
-        })?;
-        format!("{temp_dir}/{pipe_name}.sock")
-    };
-
-    let video_fragment_proxy = proxy_video(connection.clone(), pipe_name.clone());
     async move {
-        ffmpeg::init()?;
-        let mut capturer = Capturer::build(Options {
-            ..Default::default()
-        })?;
-        capturer.start_capture();
-
         if let Ok(_) = connection.receive_datagram().await {
-            let mut output_ctx: ffmpeg::format::context::Output =
-                format::output_as(&pipe_name, "webm")?;
-            let codec = codec::Id::AV1;
-            let mut stream = output_ctx.add_stream(codec)?;
-            let mut encoder = codec::context::Context::new_with_codec(
-                codec::encoder::find(codec).ok_or(ffmpeg::Error::InvalidData)?,
-            )
-            .encoder()
-            .video()?;
+            let _ = connection.send_datagram(b"Hello, World!");
+            let screencast = Screencast::new().await?;
+            let session = screencast
+                .create_session(CreateSessionOptions::default())
+                .await?;
+            let virt_source_token = get_config()
+                .await
+                .capture_sources
+                .into_iter()
+                .find(|s| s.type_ == CaptureType::Virtual)
+                .map(|s| s.session_token);
+            let mut bitflags = BitFlags::empty();
+            bitflags.insert(SourceType::Virtual);
+            screencast
+                .select_sources(
+                    &session,
+                    SelectSourcesOptions::default()
+                        .set_cursor_mode(CursorMode::Embedded)
+                        .set_restore_token(virt_source_token.as_deref())
+                        .set_persist_mode(Some(ashpd::desktop::PersistMode::ExplicitlyRevoked))
+                        .set_sources(bitflags),
+                )
+                .await?;
+            let capture = screencast
+                .start(&session, None, StartCastOptions::default())
+                .await?
+                .response()?;
 
-            // Get frame dimensions from capturer
-            let [width, height] = capturer.get_output_frame_size();
-
-            // Validate that dimensions are valid before proceeding
-            if width == 0 || height == 0 {
-                eprintln!(
-                    "Error: Captured frame dimensions are invalid (width: {}, height: {})",
-                    width, height
-                );
-                return Err(WebshooterError::InvalidLogin.into());
-            }
-
-            // Set encoder parameters properly for AV1
-            encoder.set_width(width);
-            encoder.set_height(height);
-            encoder.set_aspect_ratio(Rational::new(width as i32, height as i32).reduce());
-            encoder.set_format(Pixel::YUV420P);
-            encoder.set_time_base(Rational::new(1, 30));
-
-            // Additional AV1-specific parameter setting
-            // Some versions of libaom-av1 require specific settings for dimensions to be properly recognized
-            if encoder.codec().is_some() {
-                // Try to set some common AV1 parameters that might help with dimension recognition
-                // This is a best-effort approach as the exact API varies by ffmpeg version
-                eprintln!(
-                    "Setting up AV1 encoder with dimensions: {}x{}",
-                    width, height
-                );
-            }
-
-            let mut encoder = encoder.open()?;
-            stream.set_parameters(&encoder);
-
-            // Process frames
-            for _ in 0..10 {
-                let frame = capturer.get_next_frame()?;
-                let frame = match frame {
-                    scap::frame::Frame::BGRx(frame) => Ok(frame),
-                    _ => Err(WebshooterError::InvalidLogin),
-                }?;
-                let frame = bgrx_to_yuv420p(frame)?;
-
-                // Ensure we're sending the correct frame type to encoder
-                match encoder.send_frame(&frame) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("Error sending frame to encoder: {:?}", e);
-                        // Continue processing other frames rather than failing completely
-                        // This prevents a single frame error from stopping the entire stream
-                        continue;
-                    }
+            // Persist the new restore token so future sessions skip the picker.
+            if let Some(token) = capture.restore_token() {
+                let mut config = get_config().await;
+                if let Some(source) = config
+                    .capture_sources
+                    .iter_mut()
+                    .find(|s| s.type_ == CaptureType::Virtual)
+                {
+                    source.session_token = token.to_string();
+                    update_config(config).await?;
                 }
             }
+
+            let stream = capture.streams().first().ok_or(anyhow!("no stream"))?;
+            let fd = screencast
+                .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
+                .await?;
+            let node_id = stream.pipe_wire_node_id();
+            let raw_fd = fd.into_raw_fd();
+
+            gst::init()?;
+
+            let pipeline = gst::parse::launch(&format!(
+                "pipewiresrc fd={raw_fd} path={node_id} \
+                 ! vaapipostproc \
+                 ! vaav1enc \
+                 ! av1parse \
+                 ! matroskamux streamable=true \
+                 ! appsink name=sink sync=false"
+            ))?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| anyhow!("not a pipeline"))?;
+
+            let appsink = pipeline
+                .by_name("sink")
+                .ok_or(anyhow!("no sink element"))?
+                .downcast::<gst_app::AppSink>()
+                .map_err(|_| anyhow!("not an appsink"))?;
+
+            let conn = connection.clone();
+            appsink.set_callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                        let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                        let _ = conn.send_datagram(&map);
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+
+            // Keep the screencast proxy alive — dropping it tears down the portal session.
+            let _screencast = screencast;
+
+            pipeline.set_state(gst::State::Playing)?;
+
+            let reason = tokio::select! {
+                err = connection.closed() => format!("Wt closed {err:#?}"),
+                _ = session.receive_closed() => "Pipewire closed".to_string(),
+            };
+            log(reason);
+
+            pipeline.set_state(gst::State::Null)?;
+            connection.close(VarInt::from_u32(0), b"Aborted");
+            session.close().await?;
         }
         Ok(())
     }
-    .map(move |result| {
-        video_fragment_proxy.abort();
-        result
-    })
     .await
-}
-
-fn bgrx_to_yuv420p(frame: scap::frame::BGRxFrame) -> Result<ffmpeg::frame::Video> {
-    let width = frame.width.abs() as u32;
-    let height = frame.height.abs() as u32;
-    let mut src_frame = Video::empty();
-    src_frame.set_format(Pixel::BGRZ);
-    src_frame.set_width(width);
-    src_frame.set_height(height);
-    src_frame.data_mut(0).copy_from_slice(&frame.data);
-
-    // Set up destination frame (YUV420P)
-    let mut dst_frame = Video::empty();
-    dst_frame.set_format(Pixel::YUV420P);
-    dst_frame.set_width(width);
-    dst_frame.set_height(height);
-
-    // Create a scaling context
-    let mut scaler = ffmpeg::software::scaling::Context::get(
-        src_frame.format(),
-        src_frame.width(),
-        src_frame.height(),
-        dst_frame.format(),
-        dst_frame.width(),
-        dst_frame.height(),
-        ffmpeg::software::scaling::Flags::BILINEAR,
-    )?;
-    // Perform the conversion
-    scaler.run(&src_frame, &mut dst_frame)?;
-    Ok(dst_frame)
-}
-
-fn proxy_video(connection: Arc<Connection>, pipe_name: String) -> JoinHandle<Result<()>> {
-    spawn(async move {
-        let pipe_name = pipe_name.to_ns_name::<GenericNamespaced>()?;
-        let pipe = ListenerOptions::new().name(pipe_name).create_tokio()?;
-        while let Ok(mut encoded) = pipe.accept().await {
-            while let mut buf = Vec::new()
-                && encoded.read(&mut buf).await? > 0
-            {
-                connection.send_datagram(&buf)?;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
 }
