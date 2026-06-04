@@ -1,4 +1,11 @@
-#![feature(extend_one, cfg_eval, oneshot_channel, never_type, unwrap_infallible)]
+#![feature(
+    extend_one,
+    cfg_eval,
+    oneshot_channel,
+    never_type,
+    unwrap_infallible,
+    generic_atomic
+)]
 
 mod auth;
 pub mod config;

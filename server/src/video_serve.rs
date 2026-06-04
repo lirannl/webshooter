@@ -202,28 +202,7 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
             let conn = connection.clone();
             let frame_id_ref = frame_counter.clone();
 
-            // Watchdog: if no frame arrives for 5 s the cast was silently stopped
-            // (pipewiresrc blocks without posting a bus message).
-            let frame_alive = Arc::new(AtomicBool::new(true));
-            {
-                let flag = frame_alive.clone();
-                let tx = shutdown_tx.clone();
-                tokio::spawn(async move {
-                    let mut misses = 0u32;
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        if flag.swap(false, Ordering::Relaxed) {
-                            misses = 0;
-                        } else {
-                            misses += 1;
-                            if misses >= 5 {
-                                let _ = tx.send("watchdog: no frames for 5 s".to_string()).await;
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
+            // let frame_alive = watchdog(&shutdown_tx);
 
             let bus_tx = shutdown_tx.clone();
             // shutdown_tx is moved into the new_sample closure; when the pipeline is
@@ -231,7 +210,7 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
             appsink.set_callbacks(
                 gst_app::AppSinkCallbacks::builder()
                     .new_sample(move |sink| {
-                        frame_alive.store(true, Ordering::Relaxed);
+                        // frame_alive.store(true, Ordering::Relaxed);
                         let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                         let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                         let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
@@ -331,4 +310,29 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
         Ok(())
     }
     .await
+}
+
+#[allow(dead_code)]
+// Watchdog: if no frame arrives for 5 s the cast was silently stopped
+// (pipewiresrc blocks without posting a bus message).
+fn watchdog(shutdown_tx: &mpsc::Sender<String>) -> Arc<std::sync::atomic::Atomic<bool>> {
+    let frame_alive = Arc::new(AtomicBool::new(true));
+    let flag = frame_alive.clone();
+    let tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut misses = 0u32;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if flag.swap(false, Ordering::Relaxed) {
+                misses = 0;
+            } else {
+                misses += 1;
+                if misses >= 5 {
+                    let _ = tx.send("watchdog: no frames for 5 s".to_string()).await;
+                    break;
+                }
+            }
+        }
+    });
+    frame_alive
 }
