@@ -17,7 +17,7 @@ mod logging;
 #[cfg(target_os = "linux")]
 mod pipewire;
 mod sources;
-mod video_serve;
+mod video;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;
@@ -44,7 +44,7 @@ use tokio::{
         mpsc::{self, Sender},
     },
 };
-use video_serve::setup_wt;
+use wt::setup_wt;
 use wtransport::Identity;
 
 use crate::{
