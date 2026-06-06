@@ -17,21 +17,6 @@ use tokio::sync::mpsc;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Logical fields of a video frame, before wire packing.
-pub struct VideoFrameVariant<'a> {
-    pub frame_id: u16,
-    pub frag_idx: u16,
-    pub num_frags: u16,
-    pub is_keyframe: bool,
-    pub payload: &'a [u8],
-}
-
-impl VideoFrameVariant<'_> {
-    pub const fn header_size() -> usize {
-        6
-    }
-}
-
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,

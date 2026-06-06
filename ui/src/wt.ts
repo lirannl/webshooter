@@ -1,5 +1,14 @@
-import { render_video } from "./video";
+import { ClientMessageDiscriminant, toBytes } from "./ClientMessage";
+import { handleKeyboard } from "./input";
+import { render_video as prepareVideo } from "./video";
 
+export type KeepAlive = {
+  discriminant: typeof ClientMessageDiscriminant.KeepAlive;
+};
+
+const KeepAliveMessage = toBytes({
+  discriminant: ClientMessageDiscriminant.KeepAlive,
+});
 export const start = async () => {
   const negotiation = await fetch("negotiate_wt");
   let token = negotiation.headers.get("token");
@@ -14,13 +23,15 @@ export const start = async () => {
     wt.datagrams.readable.getReader();
   const writer: WritableStreamDefaultWriter<Uint8Array> =
     wt.datagrams.writable.getWriter();
-  // Trigger the server to start the portal + pipeline.
-  const stopWriting = setInterval(() => {
-    writer.write(new Uint8Array(1));
+
+  const keepAlive = setInterval(() => {
+    writer.write(KeepAliveMessage);
   }, 50);
 
-  render_video(reader, wt);
+  const [canvas, startRender] = await prepareVideo(reader, wt);
 
-  await wt.closed;
-  clearInterval(stopWriting);
+  handleKeyboard(writer, canvas);
+
+  await Promise.race([startRender(), wt.closed]);
+  clearInterval(keepAlive);
 };

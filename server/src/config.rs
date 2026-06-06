@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use data_encoding::BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::Display,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,

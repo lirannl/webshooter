@@ -1,17 +1,11 @@
-#![feature(
-    extend_one,
-    cfg_eval,
-    oneshot_channel,
-    never_type,
-    unwrap_infallible,
-    generic_atomic
-)]
+#![feature(extend_one, cfg_eval)]
 
 mod auth;
 pub mod config;
 mod config_watch;
 mod error;
 mod frontend;
+mod input;
 mod ipc;
 mod logging;
 #[cfg(target_os = "linux")]

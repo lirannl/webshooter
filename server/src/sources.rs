@@ -17,7 +17,7 @@ use pipewire::{self as pw, context::ContextBox};
 use pw::main_loop::MainLoopBox;
 
 #[cfg(target_os = "linux")]
-use crate::pipewire::{NodeInfo, get_nodes_on_fd};
+use crate::pipewire::NodeInfo;
 use crate::{
     config::{CaptureSource, CaptureType},
     get_config, update_config,
