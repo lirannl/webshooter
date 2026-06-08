@@ -13,10 +13,7 @@ export const Modifiers = {
   meta: 8,
 } as const;
 
-export const handleKeyboard = (
-  writer: WritableStreamDefaultWriter<Uint8Array<ArrayBufferLike>>,
-  canvas: HTMLCanvasElement,
-) => {
+export const handleKeyboard = (wt: WebTransport, canvas: HTMLCanvasElement) => {
   canvas.tabIndex = 0;
   canvas.focus();
   canvas.addEventListener(
@@ -27,7 +24,7 @@ export const handleKeyboard = (
     },
     { once: true },
   );
-  canvas.addEventListener("keydown", (e) => {
+  canvas.addEventListener("keydown", async (e) => {
     e.preventDefault();
     const modifiers: (keyof typeof Modifiers)[] = [];
     if (e.shiftKey) modifiers.push("shift");
@@ -39,7 +36,6 @@ export const handleKeyboard = (
       keycode: e.code,
       modifiers,
     };
-    console.log(`Sending ${JSON.stringify(input)}`);
-    writer.write(toBytes(input));
+    await wt.send(input);
   });
 };

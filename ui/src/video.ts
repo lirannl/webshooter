@@ -1,5 +1,6 @@
 // ── Server-to-client datagram protocol ───────────────────────────────────────
 
+import { ClientMessageDiscriminant, toBytes } from "./ClientMessage";
 import { parseMessage, ServerMessageDiscriminant } from "./serverMessage";
 
 export interface VideoFrameMsg {
@@ -26,23 +27,77 @@ interface PendingFrame {
   received: number;
 }
 
-export const render_video = async (
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  _wt: WebTransport,
-) => {
+export const render_video = async (wt: WebTransport) => {
   const canvas = document.createElement("canvas");
   canvas.style.cssText =
     "position:fixed;inset:0;width:100%;height:100%;background:#000;cursor:pointer;";
   document.body.appendChild(canvas);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await wt.send({
+    discriminant: ClientMessageDiscriminant.Resize,
+    index: 0,
+    width: canvas.offsetWidth,
+    height: canvas.offsetHeight,
+  });
   const ctx = canvas.getContext("2d")!;
 
-  canvas.addEventListener("click", () => {
-    if (document.fullscreenElement === canvas) {
-      document.exitFullscreen();
-    } else {
-      canvas.requestFullscreen();
-    }
-  });
+  // Show a tap-to-resize button for 2 s whenever the canvas changes size
+  // (resize observer) or enters/exits fullscreen.
+  let resizeOverlay: HTMLButtonElement | null = null;
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const showResizePrompt = () => {
+    resizeOverlay?.remove();
+    if (resizeTimer !== null) clearTimeout(resizeTimer);
+
+    const btn = document.createElement("button");
+    btn.textContent = "⤢ Resize";
+    btn.style.cssText = [
+      "position:fixed",
+      "top:50%",
+      "left:50%",
+      "transform:translate(-50%,-50%)",
+      "padding:.6em 1.2em",
+      "font-size:1rem",
+      "background:rgba(0,0,0,.6)",
+      "color:#fff",
+      "border:2px solid rgba(255,255,255,.6)",
+      "border-radius:8px",
+      "cursor:pointer",
+      "z-index:9999",
+    ].join(";");
+    document.body.appendChild(btn);
+    resizeOverlay = btn;
+
+    const dismiss = () => {
+      if (resizeTimer !== null) clearTimeout(resizeTimer);
+      btn.remove();
+      resizeOverlay = null;
+    };
+
+    btn.addEventListener(
+      "pointerdown",
+      () => {
+        dismiss();
+        wt.datagramWriter?.write(
+          toBytes({
+            discriminant: ClientMessageDiscriminant.Resize,
+            index: 0,
+            width: canvas.offsetWidth,
+            height: canvas.offsetHeight,
+          }),
+        );
+      },
+      { once: true },
+    );
+
+    resizeTimer = setTimeout(dismiss, 2000);
+  };
+
+  const ro = new ResizeObserver(showResizePrompt);
+  ro.observe(canvas);
+  document.addEventListener("fullscreenchange", showResizePrompt);
 
   const decoder = new VideoDecoder({
     output(frame) {
@@ -100,7 +155,7 @@ export const render_video = async (
       try {
         try {
           while (true) {
-            const { value, done } = await reader.read();
+            const { value, done } = await wt.datagramReader!.read();
             if (done) break;
             if (!value) continue;
 
@@ -138,6 +193,9 @@ export const render_video = async (
           .catch(() => {})
           .finally(() => decoder.close());
 
+        ro.disconnect();
+        document.removeEventListener("fullscreenchange", showResizePrompt);
+        resizeOverlay?.remove();
         canvas.remove();
 
         const message = document.createElement("p");

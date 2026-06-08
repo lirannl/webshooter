@@ -5,6 +5,7 @@ import { KeepAlive } from "./wt";
 const ClientMessageConst = {
   KeepAlive: [0, {} as KeepAlive],
   Keyboard: [1, {} as KeyboardInput],
+  Resize: [2, {} as ResizeDisplay],
 } as const;
 
 export const ClientMessageDiscriminant = Object.fromEntries(
@@ -45,5 +46,21 @@ export const toBytes = (
         return message;
       },
     )
+    .with({ discriminant: ClientMessageDiscriminant.Resize }, (resize) => {
+      const bytes = new Uint8Array(6);
+      const view = new DataView(bytes.buffer);
+      bytes[0] = resize.discriminant;
+      bytes[1] = resize.index;
+      view.setUint16(2, resize.width, false);
+      view.setUint16(4, resize.height, false);
+      return bytes;
+    })
     .exhaustive();
+};
+
+export type ResizeDisplay = {
+  discriminant: typeof ClientMessageDiscriminant.Resize;
+  index: number;
+  width: number;
+  height: number;
 };

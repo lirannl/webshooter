@@ -6,9 +6,12 @@
   {
     "label": "Debug frontend",
     "adapter": "JavaScript",
-    "localRoot": "ui",
+    "webRoot": "${workspaceFolder}/ui",
     "request": "launch",
-    "runtimeExecutable": "librewolf",
-    "url": "https://localhost:8443",
+    "runtimeExecutable": "/usr/bin/vivaldi-stable",
+    "runtimeArgs": ["--ignore-certificate-errors"],
+    "type": "pwa-chrome",
+    "url": "https://pc:8443",
+    "userDataDir": ".zed/chromium_profile",
   },
 ]

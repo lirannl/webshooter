@@ -1,4 +1,8 @@
-import { ClientMessageDiscriminant, toBytes } from "./ClientMessage";
+import {
+  ClientMessageDiscriminant,
+  ClientMessageType,
+  toBytes,
+} from "./ClientMessage";
 import { handleKeyboard } from "./input";
 import { render_video as prepareVideo } from "./video";
 
@@ -19,19 +23,31 @@ export const start = async () => {
     ],
   });
   await wt.ready;
-  const reader: ReadableStreamDefaultReader<Uint8Array> =
-    wt.datagrams.readable.getReader();
-  const writer: WritableStreamDefaultWriter<Uint8Array> =
-    wt.datagrams.writable.getWriter();
+  wt.datagramWriter = wt.datagrams.writable.getWriter();
+  wt.datagramReader = wt.datagrams.readable.getReader();
 
   const keepAlive = setInterval(() => {
-    writer.write(KeepAliveMessage);
+    wt.datagramWriter?.write(KeepAliveMessage);
   }, 50);
 
-  const [canvas, startRender] = await prepareVideo(reader, wt);
+  const [canvas, startRender] = await prepareVideo(wt);
 
-  handleKeyboard(writer, canvas);
+  handleKeyboard(wt, canvas);
 
   await Promise.race([startRender(), wt.closed]);
   clearInterval(keepAlive);
+};
+
+export const send = async (
+  wt: WebTransport,
+  message: ClientMessageType[keyof ClientMessageType],
+) => {
+  const bytes = toBytes(message);
+  if (bytes.byteLength >= wt.datagrams.maxDatagramSize) {
+    const stream = await wt.createUnidirectionalStream();
+    await stream.getWriter().write(bytes);
+    await stream.close();
+  } else {
+    await wt.datagramWriter!.write(bytes);
+  }
 };
