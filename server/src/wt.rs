@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::Result;
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tokio::{io::AsyncReadExt, spawn, sync::broadcast};
+use tokio::{io::AsyncReadExt, spawn, sync::broadcast, time};
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
 
 // ---------------------------------------------------------------------------
@@ -70,17 +70,26 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
 
     let server = Endpoint::server(server_config)?;
 
-    for _id in 0.. {
+    let mut active: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
         let session = server.accept().await;
-        tokio::spawn(async move {
-            let connection = webtransport_auth(session).await?;
-            handle_wt_connection(connection)
-                .await
-                .unwrap_or_else(|err| log(err));
-            Ok::<_, anyhow::Error>(())
-        });
+
+        // A new client arrived — tear down any existing session immediately
+        // rather than waiting for the QUIC idle timeout to fire.
+        if let Some(prev) = active.take() {
+            prev.abort();
+        }
+
+        active = Some(tokio::spawn(async move {
+            match webtransport_auth(session).await {
+                Ok(connection) => handle_wt_connection(connection)
+                    .await
+                    .unwrap_or_else(|err| log(err)),
+                Err(err) => log(err),
+            }
+        }));
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -120,17 +129,27 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
 
     let connection = _connection.clone();
     let broadcaster = _broadcaster.clone();
-    let datagrams = spawn(async move {
-        while let Ok(datagram) = connection.receive_datagram().await {
-            if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
-                let _ = broadcaster.send(datagram);
+    // The client sends a KeepAlive datagram every 50 ms. 500 ms gives ~10
+    // missed keepalives before we consider the peer gone — enough headroom
+    // for jitter while still detecting a refresh within half a second.
+    const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
+    let mut datagrams = spawn(async move {
+        loop {
+            match time::timeout(KEEPALIVE_TIMEOUT, connection.receive_datagram()).await {
+                Ok(Ok(datagram)) => {
+                    if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
+                        let _ = broadcaster.send(datagram);
+                    }
+                }
+                // Timed out or connection error — peer is gone.
+                Ok(Err(_)) | Err(_) => break,
             }
         }
     });
 
     let connection_clone = _connection.clone();
     let broadcaster_clone = _broadcaster.clone();
-    let unistreams = spawn(async move {
+    let mut unistreams = spawn(async move {
         while let Ok(mut stream) = connection_clone.accept_uni().await {
             let mut vec = Vec::new();
             if stream.read_to_end(&mut vec).await.is_ok()
@@ -141,82 +160,76 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
         }
     });
 
-    let (mut frame_rx, _capture_handle) = video::start_capture().await?;
-
     let payload_size = _connection
         .max_datagram_size()
         .unwrap_or(1200)
         .saturating_sub(ServerDatagram::HEADER)
         .max(1);
 
-    let mut frame_id: u16 = 0;
+    let mut capture_handle: Option<video::CaptureHandle> = None;
 
-    let connection_clone = _connection.clone();
-    let frame_forwarder = spawn(async move {
-        // Forward each encoded frame as one or more datagrams.
-        while let Some(frame) = frame_rx.recv().await {
-            let num_frags = frame.data.len().div_ceil(payload_size) as u16;
-            let mut send_ok = true;
-            for (idx, chunk) in frame.data.chunks(payload_size).enumerate() {
-                let dgram = ServerDatagram::VideoFrame {
-                    frame_id,
-                    frag_idx: idx as u16,
-                    num_frags,
-                    is_keyframe: frame.is_keyframe && idx == 0,
-                    payload: chunk,
+    loop {
+        // Race start_capture against connection closure so a refresh/disconnect
+        // while waiting for the initial resize doesn't leave a zombie capture.
+        let (mut frame_rx, handle) = tokio::select! {
+            r = video::start_capture(_client_rx.resubscribe()) => r?,
+            _ = &mut datagrams  => { log("Datagrams closed");              break; }
+            _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
+            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
+        };
+        capture_handle = Some(handle);
+        let mut frame_id: u16 = 0;
+        let connection_clone = _connection.clone();
+        let frame_forwarder = spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                let num_frags = frame.data.len().div_ceil(payload_size) as u16;
+                let mut send_ok = true;
+                for (idx, chunk) in frame.data.chunks(payload_size).enumerate() {
+                    let dgram = ServerDatagram::VideoFrame {
+                        frame_id,
+                        frag_idx: idx as u16,
+                        num_frags,
+                        is_keyframe: frame.is_keyframe && idx == 0,
+                        payload: chunk,
+                    }
+                    .to_bytes();
+                    if connection_clone.send_datagram(&dgram).is_err() {
+                        log("send_datagram failed: connection closed");
+                        send_ok = false;
+                        break;
+                    }
                 }
-                .to_bytes();
-                if connection_clone.send_datagram(&dgram).is_err() {
-                    log("send_datagram failed: connection closed");
-                    send_ok = false;
+                if !send_ok {
                     break;
                 }
+                frame_id = frame_id.wrapping_add(1);
             }
-            if !send_ok {
-                break;
-            }
-            frame_id = frame_id.wrapping_add(1);
-        }
-    });
-    let mut client_rx = _client_rx.resubscribe();
-    let keyboard_receiver = spawn(async move {
-        loop {
-            match client_rx.recv().await {
-                Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
-                    log(format!("keycode: {keycode}, modifiers: {modifiers:?}"));
+        });
+
+        let mut client_rx = _client_rx.resubscribe();
+        let keyboard_receiver = spawn(async move {
+            loop {
+                match client_rx.recv().await {
+                    Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
+                        log(format!("keycode: {keycode}, modifiers: {modifiers:?}"));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    });
-    let mut client_rx = _client_rx.resubscribe();
-    tokio::select! {
-        _  = spawn(async move {
-            loop{
-                if let Ok(ClientDatagram::ResizeDisplay{ width, height, index }) = client_rx.recv().await {
-                    log(format!("Resize: index={index}, width={width}, height={height}"));
-        }}}) => {
+        });
 
-            }
-        _ = datagrams => {
-            log("Datagrams closed");
-        },
-        _ = unistreams => {
-            log("Unidirectional streams closed");
-        },
-        _ = keyboard_receiver => {},
-
-        _ = frame_forwarder => {
-            // Pipeline stopped (EOS or error) — close gracefully.
-            log("capture pipeline stopped");
-        },
-        // Stop if the QUIC connection is closed by the peer.
-        _ = _connection.closed() => {
-            log("WebTransport connection closed by peer")
+        tokio::select! {
+            _ = datagrams => { log("Datagrams closed"); break; }
+            _ = unistreams => { log("Unidirectional streams closed");  break; }
+            _ = keyboard_receiver => { break; }
+            _ = frame_forwarder => { log("capture pipeline stopped");  break; }
+            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
         }
     }
 
+    if let Some(h) = capture_handle {
+        h.close().await;
+    }
     _connection.close(VarInt::from_u32(0), b"done");
-    // _capture_handle is dropped here, stopping the pipeline and closing the portal session.
     Ok(())
 }

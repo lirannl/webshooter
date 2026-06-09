@@ -50,12 +50,9 @@ pub struct Config {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureSource {
-    #[serde(rename = "type")]
-    pub type_: CaptureType,
     /// Opaque restore token returned by the XDG portal; passed back on future sessions to skip the picker.
     #[cfg(target_os = "linux")]
     pub session_token: String,
-    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

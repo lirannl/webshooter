@@ -1,6 +1,6 @@
-use std::{collections::HashMap, os::fd::OwnedFd, sync::mpsc, thread};
+use std::collections::HashMap;
 
-use pipewire::{context::ContextBox, main_loop::MainLoopRc, permissions::PermissionFlags};
+use pipewire::permissions::PermissionFlags;
 
 struct Terminate;
 

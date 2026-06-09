@@ -1,4 +1,4 @@
-#![feature(extend_one, cfg_eval)]
+#![feature(extend_one, cfg_eval, never_type)]
 
 mod auth;
 pub mod config;

@@ -1,26 +1,11 @@
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
-
+use crate::{
+    config::{CaptureSource, CaptureType},
+    get_config, update_config,
+};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     PersistMode,
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
-};
-#[cfg(target_os = "linux")]
-use ashpd::desktop::{
-    Session,
-    screencast::{self, OpenPipeWireRemoteOptions},
-};
-#[cfg(target_os = "linux")]
-use pipewire::{self as pw, context::ContextBox};
-#[cfg(target_os = "linux")]
-use pw::main_loop::MainLoopBox;
-
-#[cfg(target_os = "linux")]
-use crate::pipewire::NodeInfo;
-use crate::{
-    config::{CaptureSource, CaptureType},
-    get_config, update_config,
 };
 
 /// Opens the XDG ScreenCast portal picker, waits for the user to
@@ -71,7 +56,7 @@ pub async fn setup_sources() -> Result<()> {
     }
 
     let mut config = get_config().await;
-    config.capture_sources.clear();
+    config.capture_sources = Vec::new();
     // let nodes = get_nodes();
     for stream in streams {
         let capture_type = match stream.source_type() {
@@ -79,41 +64,12 @@ pub async fn setup_sources() -> Result<()> {
             _ => CaptureType::Monitor,
         };
 
-        let name = name_source(stream, &HashMap::new()).await;
-        config.capture_sources.push(CaptureSource {
+        config.capture_sources = vec![CaptureSource {
             session_token: restore_token.clone(),
-            name: Some(format!(
-                "{:?}_{}",
-                &capture_type,
-                config
-                    .capture_sources
-                    .iter()
-                    .filter(|s| s.name.as_ref() != Some(&name) && s.type_ == capture_type)
-                    .count()
-                    + 1
-            )),
-            type_: capture_type,
-        });
+        }];
     }
 
     update_config(config).await?;
     session.close().await?;
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn name_source(source: &screencast::Stream, nodes: &HashMap<u32, NodeInfo>) -> String {
-    // let node_info = nodes.get(&source.pipe_wire_node_id()).cloned();
-
-    // node_info
-    //     .map(|node_info| {
-    //         node_info
-    //             .props
-    //             .keys()
-    //             .map(|s| s.to_string())
-    //             .collect::<Vec<_>>()
-    //             .join(", ")
-    //     })
-    // .or_else
-    (|| Some(source.id()?.to_string()))().unwrap_or_else(|| source.pipe_wire_node_id().to_string())
 }

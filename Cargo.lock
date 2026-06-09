@@ -3700,6 +3700,7 @@ dependencies = [
  "http-bytes",
  "interprocess",
  "lazy_static",
+ "libc",
  "mime_guess",
  "notify",
  "p384",

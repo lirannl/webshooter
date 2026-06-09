@@ -18,6 +18,7 @@ rust-embed = { version = "8", features = ["poem", "mime-guess"] }
 aes = "0.9"
 anyhow = "1.0"
 bitflags = "2"
+libc = "0.2"
 async-channel = "2.5"
 bytes = { version = "1.11", features = ["serde"] }
 ecdsa = { version = "0.16.9", features = ["spki", "verifying"] }
