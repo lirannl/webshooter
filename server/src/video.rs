@@ -46,7 +46,7 @@ enum VirtualMonitor {
 }
 
 impl VirtualMonitor {
-    fn spawn(width: u16, height: u16) -> Result<Self> {
+    fn spawn(width: u16, height: u16, index: u8) -> Result<Self> {
         if is_kwin() {
             use std::os::unix::process::CommandExt;
             let mut cmd = Command::new("krfb-virtualmonitor");
@@ -54,11 +54,11 @@ impl VirtualMonitor {
                 "--resolution",
                 &format!("{width}x{height}"),
                 "--name",
-                "webshooter",
+                &format!("webshooter-{}", index),
                 "--password",
                 "x",
                 "--port",
-                &ThreadRng::default().random::<u16>().to_string(),
+                "-1",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -161,7 +161,7 @@ async fn capture(
     // On the first iteration we wait for the initial ResizeDisplay.
     // On resize, the new dimensions come from the previous iteration's
     // end-of-loop wait, so we skip the inner wait.
-    let mut next_size: Option<(u16, u16)> = None;
+    let mut next_size: Option<(u16, u16, u8)> = None;
 
     loop {
         // --- Portal / screencast setup ------------------------------------------
@@ -179,14 +179,14 @@ async fn capture(
 
         // Use dimensions carried over from the previous resize, or wait for
         // the first ResizeDisplay from the client.
-        let (width, height) = match next_size.take() {
+        let (width, height, index) = match next_size.take() {
             Some(size) => size,
             None => loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
                     msg = client_rx.recv() => match msg {
-                        Ok(ClientDatagram::ResizeDisplay { width, height, .. }) => break (width, height),
+                        Ok(ClientDatagram::ResizeDisplay { width, height, index }) => break (width, height, index),
                         Ok(_) => continue,
                         Err(_) => return Ok(()),
                     },
@@ -194,7 +194,7 @@ async fn capture(
             },
         };
 
-        let virtual_monitor = VirtualMonitor::spawn(width, height)?;
+        let virtual_monitor = VirtualMonitor::spawn(width, height, index)?;
 
         if let VirtualMonitor::ChildProcess(_) = virtual_monitor {
             or_cancel!(cancel, sleep(Duration::from_millis(500)));
@@ -335,7 +335,7 @@ async fn capture(
                 _ = cancel.cancelled() => break None,
                 msg = client_rx.recv() => match msg {
                     Ok(ClientDatagram::ResizeDisplay { width, height, .. }) =>
-                        break Some((width, height)),
+                        break Some((width, height, index)),
                     Ok(_) => continue,
                     Err(_) => break None,
                 },
