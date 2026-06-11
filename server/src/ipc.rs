@@ -1,6 +1,6 @@
 use crate::config::Config;
 #[cfg(target_family = "unix")]
-use crate::{logging::log, sources::setup_sources};
+use crate::{logging::log, pipewire::sources::setup_sources};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr};

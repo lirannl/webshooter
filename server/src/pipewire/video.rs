@@ -1,6 +1,7 @@
+use crate::client_datagram::ClientDatagram;
 use crate::{
-    config::CaptureSource, extensions::CancellationTokenExt, get_config, input::ClientDatagram,
-    logging::log, update_config,
+    extensions::CancellationTokenExt, get_config, logging::log, pipewire::touch::touch_task,
+    update_config,
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -15,7 +16,6 @@ use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use libc;
 use std::{
-    collections::HashSet,
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -23,10 +23,7 @@ use std::{
 };
 use tokio::{
     spawn,
-    sync::{
-        broadcast::{self, Receiver},
-        mpsc,
-    },
+    sync::{broadcast::Receiver, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -126,7 +123,7 @@ impl CaptureHandle {
 
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded AV1 frames into the returned channel.
-pub async fn start_capture(
+pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
 ) -> Result<(mpsc::Receiver<EncodedFrame>, CaptureHandle)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
@@ -136,7 +133,7 @@ pub async fn start_capture(
         let cancel = cancel.clone();
         async move {
             while !cancel.is_cancelled() {
-                if let Err(e) = capture(&mut client_rx, frame_tx.clone(), &cancel).await {
+                if let Err(e) = single_capture(&mut client_rx, frame_tx.clone(), &cancel).await {
                     log(format!("Capture error: {:#?}", e));
                 }
             }
@@ -146,7 +143,7 @@ pub async fn start_capture(
     Ok((frame_rx, CaptureHandle { cancel, task }))
 }
 
-async fn capture(
+async fn single_capture(
     client_rx: &mut Receiver<ClientDatagram>,
     frame_tx: mpsc::Sender<EncodedFrame>,
     cancel: &CancellationToken,
@@ -203,11 +200,7 @@ async fn capture(
             VirtualMonitor::ChildProcess(_) => SourceType::Monitor,
             VirtualMonitor::Portal => SourceType::Virtual,
         };
-        let restore_token = get_config()
-            .await
-            .capture_sources
-            .pop()
-            .map(|s| s.session_token);
+        let restore_token = get_config().await.pipewire_token.take();
 
         cancel
             .r(screencast.select_sources(
@@ -243,9 +236,7 @@ async fn capture(
         // Persist the new restore token so future sessions skip the picker.
         if let Some(token) = started.restore_token() {
             let mut config = get_config().await;
-            config.capture_sources = vec![CaptureSource {
-                session_token: token.to_string(),
-            }];
+            config.pipewire_token = Some(token.to_string());
             update_config(config).await?;
         }
 
@@ -349,83 +340,7 @@ async fn capture(
         // arrive over the same broadcast channel as resize events, so we take
         // an independent receiver and run this alongside the resize wait below.
         // The task is tied to this session and is aborted on teardown.
-        let touch_task = spawn({
-            let remote_desktop = remote_desktop.clone();
-            let session = session.clone();
-            let cancel = cancel.clone();
-            let mut touch_rx = client_rx.resubscribe();
-            async move {
-                // Slots that are currently pressed. The first event for a slot
-                // is a touch-down; subsequent events are motion, as the portal
-                // expects.
-                let mut active_slots: HashSet<u8> = Default::default();
-                loop {
-                    let msg = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        msg = touch_rx.recv() => msg,
-                        _ = sleep(Duration::from_secs(1)) => Ok(ClientDatagram::TouchscreenRelease { index: None })
-                    };
-                    match msg {
-                        Ok(ClientDatagram::Touchscreen { x, y, index }) => {
-                            let (x, y) = (x as f64, y as f64);
-                            let slot = index as u32;
-                            let result = if active_slots.insert(index) {
-                                remote_desktop
-                                    .notify_touch_down(
-                                        &session,
-                                        node_id,
-                                        slot,
-                                        x,
-                                        y,
-                                        Default::default(),
-                                    )
-                                    .await
-                            } else {
-                                remote_desktop
-                                    .notify_touch_motion(
-                                        &session,
-                                        node_id,
-                                        slot,
-                                        x,
-                                        y,
-                                        Default::default(),
-                                    )
-                                    .await
-                            };
-                            if let Err(e) = result {
-                                log(format!("touch down/motion failed: {e}"));
-                            }
-                        }
-                        Ok(ClientDatagram::TouchscreenRelease { index }) => {
-                            let indices: Vec<u8> = if let Some(index) = index {
-                                if active_slots.remove(&index) {
-                                    vec![index]
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                active_slots.drain().collect()
-                            };
-                            for index in indices {
-                                if let Err(e) = remote_desktop
-                                    .notify_touch_up(&session, index as u32, Default::default())
-                                    .await
-                                {
-                                    log(format!("touch up failed: {e}"));
-                                }
-                            }
-                        }
-                        // Unrelated datagrams (resize, keyboard, keepalive).
-                        Ok(_) => continue,
-                        // Dropped messages under load — keep going.
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        // Sender gone — nothing left to emulate.
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-        });
+        let touch_task = touch_task(remote_desktop, &session, node_id, client_rx, cancel);
 
         // Wait for the next resize (or cancellation) before tearing down.
         // virtual_monitor must stay alive here — dropping it kills krfb.

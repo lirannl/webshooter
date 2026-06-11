@@ -38,41 +38,15 @@ pub struct Config {
     version: String,
     #[serde(default)]
     pub authorised_keys: HashSet<Bytes64>,
+    #[cfg(target_os = "linux")]
     #[serde(default)]
-    pub capture_sources: Vec<CaptureSource>,
+    pub pipewire_token: Option<String>,
     #[serde(flatten)]
     pub http_config: HttpConfig,
     #[serde(default)]
     pub auth_timeout: Option<u64>,
     #[serde(default = "default_settings::permitted_domains")]
     pub webtransport_permitted_domains: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CaptureSource {
-    /// Opaque restore token returned by the XDG portal; passed back on future sessions to skip the picker.
-    #[cfg(target_os = "linux")]
-    pub session_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum CaptureType {
-    Virtual,
-    #[default]
-    Monitor,
-}
-
-#[cfg(target_os = "linux")]
-use ashpd::desktop::screencast::SourceType;
-#[cfg(target_os = "linux")]
-impl PartialEq<SourceType> for CaptureType {
-    fn eq(&self, other: &SourceType) -> bool {
-        match (self, other) {
-            (CaptureType::Virtual, SourceType::Virtual) => true,
-            (CaptureType::Monitor, SourceType::Monitor) => true,
-            _ => false,
-        }
-    }
 }
 
 mod default_settings {
@@ -104,7 +78,7 @@ impl Config {
             webtransport_permitted_domains: default_settings::permitted_domains(),
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
-            capture_sources: Default::default(),
+            pipewire_token: Default::default(),
         })
     }
 }

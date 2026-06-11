@@ -1,18 +1,17 @@
 #![feature(extend_one, cfg_eval)]
 
 mod auth;
-pub mod config;
+mod client_datagram;
+mod config;
 mod config_watch;
 mod error;
 mod extensions;
 mod frontend;
-mod input;
 mod ipc;
 mod logging;
 #[cfg(target_os = "linux")]
 mod pipewire;
-mod sources;
-mod video;
+mod server_datagram;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;

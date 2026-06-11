@@ -1,4 +1,4 @@
-use crate::{config::CaptureSource, get_config, update_config};
+use crate::{get_config, update_config};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -6,13 +6,13 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use ashpd::enumflags2::BitFlags;
+use std::error::Error as StdError;
 
 /// Opens the XDG RemoteDesktop+ScreenCast portal picker, waits for the user to
 /// select a source, captures the restore token, then closes the portal session
 /// immediately.  The token is compatible with the RemoteDesktop session used
 /// during actual capture (video.rs), so future sessions skip the picker.
-#[cfg(target_os = "linux")]
-pub async fn setup_sources() -> Result<()> {
+pub async fn setup_sources() -> Result<(), Box<dyn StdError>> {
     let remote_desktop = RemoteDesktop::new().await?;
     let screencast = Screencast::new().await?;
     let session = remote_desktop
@@ -60,9 +60,7 @@ pub async fn setup_sources() -> Result<()> {
         .to_string();
 
     let mut config = get_config().await;
-    config.capture_sources = vec![CaptureSource {
-        session_token: restore_token,
-    }];
+    config.pipewire_token = Some(restore_token);
     update_config(config).await?;
 
     session.close().await?;
