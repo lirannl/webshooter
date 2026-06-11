@@ -1,30 +1,32 @@
 use crate::{
-    config::{CaptureSource, CaptureType},
-    get_config,
-    input::ClientDatagram,
-    update_config,
+    config::CaptureSource, extensions::CancellationTokenExt, get_config, input::ClientDatagram,
+    logging::log, update_config,
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions,
+    remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions},
     screencast::{
         CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
-        StartCastOptions,
     },
 };
 use ashpd::enumflags2::BitFlags;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use libc;
-use rand::{RngExt, rngs::ThreadRng};
 use std::{
+    collections::HashSet,
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     spawn,
-    sync::{broadcast::Receiver, mpsc},
+    sync::{
+        broadcast::{self, Receiver},
+        mpsc,
+    },
     task::JoinHandle,
     time::sleep,
 };
@@ -142,17 +144,6 @@ pub async fn start_capture(
     Ok((frame_rx, CaptureHandle { cancel, task }))
 }
 
-/// Await `$fut`, but return `Ok(())` immediately if `$cancel` fires first.
-macro_rules! or_cancel {
-    ($cancel:expr, $fut:expr) => {
-        tokio::select! {
-            biased;
-            _ = $cancel.cancelled() => return Ok(()),
-            result = $fut => result,
-        }
-    };
-}
-
 async fn capture(
     client_rx: &mut Receiver<ClientDatagram>,
     frame_tx: mpsc::Sender<EncodedFrame>,
@@ -165,17 +156,18 @@ async fn capture(
 
     loop {
         // --- Portal / screencast setup ------------------------------------------
-        let screencast = or_cancel!(cancel, Screencast::new())?;
-        let session = or_cancel!(
-            cancel,
-            screencast.create_session(CreateSessionOptions::default())
-        )?;
-
-        let source_token = get_config()
-            .await
-            .capture_sources
-            .pop()
-            .map(|s| s.session_token);
+        // Drive both screen capture and touch emulation from a single
+        // RemoteDesktop session so emulated touch events land on the captured
+        // stream. RemoteDesktop implements HasScreencastSession, which lets the
+        // ScreenCast portal operate on the same session. The session is shared
+        // (Arc) with the touch task spawned further down.
+        let remote_desktop = Arc::new(cancel.r(RemoteDesktop::new()).await?);
+        let screencast = cancel.r(Screencast::new()).await?;
+        let session = Arc::new(
+            cancel
+                .r(remote_desktop.create_session(CreateSessionOptions::default()))
+                .await?,
+        );
 
         // Use dimensions carried over from the previous resize, or wait for
         // the first ResizeDisplay from the client.
@@ -197,7 +189,9 @@ async fn capture(
         let virtual_monitor = VirtualMonitor::spawn(width, height, index)?;
 
         if let VirtualMonitor::ChildProcess(_) = virtual_monitor {
-            or_cancel!(cancel, sleep(Duration::from_millis(500)));
+            cancel
+                .run_until_cancelled(sleep(Duration::from_millis(500)))
+                .await;
         }
 
         // When krfb-virtualmonitor owns the display it appears as a regular
@@ -207,26 +201,44 @@ async fn capture(
             VirtualMonitor::ChildProcess(_) => SourceType::Monitor,
             VirtualMonitor::Portal => SourceType::Virtual,
         };
-        or_cancel!(
-            cancel,
-            screencast.select_sources(
+        let restore_token = get_config()
+            .await
+            .capture_sources
+            .pop()
+            .map(|s| s.session_token);
+
+        // Request a touchscreen device so we can replay client touch events
+        // onto the captured stream. Must be called before select_sources.
+        // persist_mode=2 (ExplicitlyRevoked) causes the portal to return a
+        // restore_token in the Start response, skipping the picker next time.
+        cancel
+            .r(remote_desktop.select_devices(
+                &session,
+                SelectDevicesOptions::default()
+                    .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+                    .set_restore_token(restore_token.as_deref())
+                    .set_persist_mode(Some(ashpd::desktop::PersistMode::ExplicitlyRevoked)),
+            ))
+            .await?;
+
+        cancel
+            .r(screencast.select_sources(
                 &session,
                 SelectSourcesOptions::default()
                     .set_sources(Some(BitFlags::from(source_type)))
-                    .set_cursor_mode(CursorMode::Embedded)
-                    .set_restore_token(source_token.as_deref())
-                    .set_persist_mode(Some(ashpd::desktop::PersistMode::ExplicitlyRevoked)),
-            )
-        )?;
+                    .set_cursor_mode(CursorMode::Embedded),
+            ))
+            .await?;
 
-        let capture = or_cancel!(
-            cancel,
-            screencast.start(&session, None, StartCastOptions::default())
-        )?
-        .response()?;
+        // Starting the RemoteDesktop session also starts the screen cast that
+        // shares it, returning the selected devices and streams together.
+        let started = cancel
+            .r(remote_desktop.start(&session, None, StartOptions::default()))
+            .await?
+            .response()?;
 
         // Persist the new restore token so future sessions skip the picker.
-        if let Some(token) = capture.restore_token() {
+        if let Some(token) = started.restore_token() {
             let mut config = get_config().await;
             config.capture_sources = vec![CaptureSource {
                 session_token: token.to_string(),
@@ -234,12 +246,11 @@ async fn capture(
             update_config(config).await?;
         }
 
-        let stream = capture.streams().first().ok_or(anyhow!("no stream"))?;
-        let fd = or_cancel!(
-            cancel,
-            screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
-        )?;
+        let stream = started.streams().first().ok_or(anyhow!("no stream"))?;
         let node_id = stream.pipe_wire_node_id();
+        let fd = cancel
+            .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
+            .await?;
         let raw_fd = fd.into_raw_fd();
 
         // --- GStreamer pipeline --------------------------------------------------
@@ -327,6 +338,77 @@ async fn capture(
             anyhow!("Pipeline failed to enter Playing state: {bus_msg}")
         })?;
 
+        // Replay client touch events onto the captured stream. Touch datagrams
+        // arrive over the same broadcast channel as resize events, so we take
+        // an independent receiver and run this alongside the resize wait below.
+        // The task is tied to this session and is aborted on teardown.
+        let touch_task = spawn({
+            let remote_desktop = remote_desktop.clone();
+            let session = session.clone();
+            let cancel = cancel.clone();
+            let mut touch_rx = client_rx.resubscribe();
+            async move {
+                // Slots that are currently pressed. The first event for a slot
+                // is a touch-down; subsequent events are motion, as the portal
+                // expects.
+                let mut active_slots: HashSet<u8> = HashSet::new();
+                loop {
+                    let msg = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        msg = touch_rx.recv() => msg,
+                    };
+                    match msg {
+                        Ok(ClientDatagram::Touchscreen { x, y, index }) => {
+                            let (x, y) = (x as f64, y as f64);
+                            let slot = index as u32;
+                            let result = if active_slots.insert(index) {
+                                remote_desktop
+                                    .notify_touch_down(
+                                        &session,
+                                        node_id,
+                                        slot,
+                                        x,
+                                        y,
+                                        Default::default(),
+                                    )
+                                    .await
+                            } else {
+                                remote_desktop
+                                    .notify_touch_motion(
+                                        &session,
+                                        node_id,
+                                        slot,
+                                        x,
+                                        y,
+                                        Default::default(),
+                                    )
+                                    .await
+                            };
+                            if let Err(e) = result {
+                                log(format!("touch down/motion failed: {e}"));
+                            }
+                        }
+                        Ok(ClientDatagram::TouchscreenRelease { index }) => {
+                            if active_slots.remove(&index)
+                                && let Err(e) = remote_desktop
+                                    .notify_touch_up(&session, index as u32, Default::default())
+                                    .await
+                            {
+                                log(format!("touch up failed: {e}"));
+                            }
+                        }
+                        // Unrelated datagrams (resize, keyboard, keepalive).
+                        Ok(_) => continue,
+                        // Dropped messages under load — keep going.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        // Sender gone — nothing left to emulate.
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        });
+
         // Wait for the next resize (or cancellation) before tearing down.
         // virtual_monitor must stay alive here — dropping it kills krfb.
         next_size = loop {
@@ -343,7 +425,9 @@ async fn capture(
         };
 
         // Tear down the current pipeline and session before starting the next
-        // one (or exiting if cancelled).
+        // one (or exiting if cancelled). The touch task borrows this session, so
+        // stop it first.
+        touch_task.abort();
         tokio::task::spawn_blocking({
             let pipeline = pipeline.clone();
             move || {

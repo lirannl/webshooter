@@ -23,6 +23,7 @@ export const start = async () => {
     ],
   });
   await wt.ready;
+  // WASM entry point
   wt.datagramWriter = wt.datagrams.writable.getWriter();
   wt.datagramReader = wt.datagrams.readable.getReader();
 

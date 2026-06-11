@@ -6,6 +6,17 @@ export type KeyboardInput = {
   modifiers: (keyof typeof Modifiers)[];
 };
 
+export type TouchscreenInput = {
+  discriminant: typeof ClientMessageDiscriminant.Touchscreen;
+  x: number;
+  y: number;
+  index: number;
+};
+export type TouchscreenRelease = {
+  discriminant: typeof ClientMessageDiscriminant.TouchscreenRelease;
+  index: number;
+};
+
 export const Modifiers = {
   shift: 1,
   ctrl: 2,
@@ -19,8 +30,17 @@ export const handleKeyboard = (wt: WebTransport, canvas: HTMLCanvasElement) => {
   canvas.addEventListener(
     "click",
     () => {
-      canvas.requestFullscreen();
-      // .then(() => navigator.keyboard?.lock());
+      canvas
+        .requestFullscreen()
+        .then(() =>
+          "keyboard" in navigator &&
+          typeof navigator.keyboard === "object" &&
+          !!navigator.keyboard &&
+          "lock" in navigator.keyboard &&
+          typeof navigator.keyboard.lock === "function"
+            ? navigator.keyboard.lock()
+            : null,
+        );
     },
     { once: true },
   );
@@ -31,11 +51,10 @@ export const handleKeyboard = (wt: WebTransport, canvas: HTMLCanvasElement) => {
     if (e.ctrlKey) modifiers.push("ctrl");
     if (e.altKey) modifiers.push("alt");
     if (e.metaKey) modifiers.push("meta");
-    const input: KeyboardInput = {
+    await wt.send({
       discriminant: ClientMessageDiscriminant.Keyboard,
       keycode: e.code,
       modifiers,
-    };
-    await wt.send(input);
+    });
   });
 };

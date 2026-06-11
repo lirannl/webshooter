@@ -23,6 +23,14 @@ pub enum ClientDatagram {
         width: u16,
         height: u16,
     },
+    Touchscreen {
+        x: u16,
+        y: u16,
+        index: u8,
+    },
+    TouchscreenRelease {
+        index: u8,
+    },
 }
 
 impl ClientDatagram {
@@ -49,6 +57,16 @@ impl ClientDatagram {
                     width,
                     height,
                 }
+            }
+            3 => {
+                let x = u16::from_be_bytes([bytes[1], bytes[2]]);
+                let y = u16::from_be_bytes([bytes[3], bytes[4]]);
+                let index = bytes[5];
+                Self::Touchscreen { x, y, index }
+            }
+            4 => {
+                let index = bytes[1];
+                Self::TouchscreenRelease { index }
             }
             _ => return Err(anyhow::anyhow!("Invalid datagram type")),
         })

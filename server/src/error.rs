@@ -21,10 +21,13 @@ pub enum WebshooterError {
     #[error("Webshooter isn't prepared to accept IPC connections yet")]
     IPCNotAvailable,
     #[error("Missing authentication")]
-    NoAuthentication, // #[error("System cryptography is not functioning correctly")]
-                      // SystemCrypto,
-                      // #[error("Desktop capture failed")]
-                      // CaptureFailed,
+    NoAuthentication,
+    // #[error("System cryptography is not functioning correctly")]
+    // SystemCrypto,
+    // #[error("Desktop capture failed")]
+    // CaptureFailed,
+    #[error("Cancelled")]
+    Cancelled,
 }
 
 impl ResponseError for WebshooterError {

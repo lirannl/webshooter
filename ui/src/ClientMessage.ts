@@ -1,4 +1,9 @@
-import { KeyboardInput, Modifiers } from "./input";
+import {
+  KeyboardInput,
+  Modifiers,
+  TouchscreenInput,
+  TouchscreenRelease,
+} from "./input";
 import { match } from "ts-pattern";
 import { KeepAlive } from "./wt";
 
@@ -6,6 +11,8 @@ const ClientMessageConst = {
   KeepAlive: [0, {} as KeepAlive],
   Keyboard: [1, {} as KeyboardInput],
   Resize: [2, {} as ResizeDisplay],
+  Touchscreen: [3, {} as TouchscreenInput],
+  TouchscreenRelease: [4, {} as TouchscreenRelease],
 } as const;
 
 export const ClientMessageDiscriminant = Object.fromEntries(
@@ -55,6 +62,24 @@ export const toBytes = (
       view.setUint16(4, resize.height, false);
       return bytes;
     })
+    .with({ discriminant: ClientMessageDiscriminant.Touchscreen }, (touch) => {
+      const bytes = new Uint8Array(6);
+      const view = new DataView(bytes.buffer);
+      bytes[0] = touch.discriminant;
+      view.setUint16(1, touch.x, false);
+      view.setUint16(3, touch.y, false);
+      bytes[5] = touch.index;
+      return bytes;
+    })
+    .with(
+      { discriminant: ClientMessageDiscriminant.TouchscreenRelease },
+      (touch) => {
+        const bytes = new Uint8Array(2);
+        bytes[0] = touch.discriminant;
+        bytes[1] = touch.index;
+        return bytes;
+      },
+    )
     .exhaustive();
 };
 

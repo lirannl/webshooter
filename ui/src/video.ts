@@ -97,7 +97,22 @@ export const render_video = async (wt: WebTransport) => {
 
   const ro = new ResizeObserver(showResizePrompt);
   ro.observe(canvas);
-  document.addEventListener("fullscreenchange", showResizePrompt);
+  canvas.addEventListener("fullscreenchange", () =>
+    wt.datagramWriter?.write(
+      toBytes({
+        discriminant: ClientMessageDiscriminant.Resize,
+        index: 0,
+        width: Math.max(
+          document.documentElement.clientWidth || 0,
+          window.innerWidth || 0,
+        ),
+        height: Math.max(
+          document.documentElement.clientHeight || 0,
+          window.innerHeight || 0,
+        ),
+      }),
+    ),
+  );
 
   const decoder = new VideoDecoder({
     output(frame) {

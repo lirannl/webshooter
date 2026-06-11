@@ -1,9 +1,10 @@
-#![feature(extend_one, cfg_eval, never_type)]
+#![feature(extend_one, cfg_eval)]
 
 mod auth;
 pub mod config;
 mod config_watch;
 mod error;
+mod extensions;
 mod frontend;
 mod input;
 mod ipc;
