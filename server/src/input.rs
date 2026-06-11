@@ -29,7 +29,7 @@ pub enum ClientDatagram {
         index: u8,
     },
     TouchscreenRelease {
-        index: u8,
+        index: Option<u8>,
     },
 }
 
@@ -65,7 +65,7 @@ impl ClientDatagram {
                 Self::Touchscreen { x, y, index }
             }
             4 => {
-                let index = bytes[1];
+                let index = Some(bytes[1]);
                 Self::TouchscreenRelease { index }
             }
             _ => return Err(anyhow::anyhow!("Invalid datagram type")),

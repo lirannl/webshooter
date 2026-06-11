@@ -3,7 +3,7 @@ import {
   ClientMessageType,
   toBytes,
 } from "./ClientMessage";
-import { handleKeyboard } from "./input";
+import { handleKeyboard, handleTouch } from "./input";
 import { render_video as prepareVideo } from "./video";
 
 export type KeepAlive = {
@@ -34,6 +34,7 @@ export const start = async () => {
   const [canvas, startRender] = await prepareVideo(wt);
 
   handleKeyboard(wt, canvas);
+  handleTouch(wt, canvas);
 
   await Promise.race([startRender(), wt.closed]);
   clearInterval(keepAlive);

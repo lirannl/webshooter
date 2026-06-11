@@ -4,10 +4,10 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
-    CreateSessionOptions,
+    CreateSessionOptions, PersistMode,
     remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions},
     screencast::{
-        CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
+        CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType, Stream,
     },
 };
 use ashpd::enumflags2::BitFlags;
@@ -136,7 +136,9 @@ pub async fn start_capture(
         let cancel = cancel.clone();
         async move {
             while !cancel.is_cancelled() {
-                let _ = capture(&mut client_rx, frame_tx.clone(), &cancel).await;
+                if let Err(e) = capture(&mut client_rx, frame_tx.clone(), &cancel).await {
+                    log(format!("Capture error: {:#?}", e));
+                }
             }
         }
     });
@@ -207,6 +209,16 @@ async fn capture(
             .pop()
             .map(|s| s.session_token);
 
+        cancel
+            .r(screencast.select_sources(
+                &session,
+                SelectSourcesOptions::default()
+                    .set_multiple(true)
+                    .set_sources(Some(BitFlags::from(source_type)))
+                    .set_cursor_mode(CursorMode::Embedded),
+            ))
+            .await?;
+
         // Request a touchscreen device so we can replay client touch events
         // onto the captured stream. Must be called before select_sources.
         // persist_mode=2 (ExplicitlyRevoked) causes the portal to return a
@@ -217,16 +229,7 @@ async fn capture(
                 SelectDevicesOptions::default()
                     .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
                     .set_restore_token(restore_token.as_deref())
-                    .set_persist_mode(Some(ashpd::desktop::PersistMode::ExplicitlyRevoked)),
-            ))
-            .await?;
-
-        cancel
-            .r(screencast.select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_sources(Some(BitFlags::from(source_type)))
-                    .set_cursor_mode(CursorMode::Embedded),
+                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
             ))
             .await?;
 
@@ -246,7 +249,11 @@ async fn capture(
             update_config(config).await?;
         }
 
-        let stream = started.streams().first().ok_or(anyhow!("no stream"))?;
+        let stream = started
+            .streams()
+            .iter()
+            .rfind(sized_stream(&width, &height))
+            .ok_or(anyhow!("no stream"))?;
         let node_id = stream.pipe_wire_node_id();
         let fd = cancel
             .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
@@ -351,12 +358,13 @@ async fn capture(
                 // Slots that are currently pressed. The first event for a slot
                 // is a touch-down; subsequent events are motion, as the portal
                 // expects.
-                let mut active_slots: HashSet<u8> = HashSet::new();
+                let mut active_slots: HashSet<u8> = Default::default();
                 loop {
                     let msg = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => break,
                         msg = touch_rx.recv() => msg,
+                        _ = sleep(Duration::from_secs(1)) => Ok(ClientDatagram::TouchscreenRelease { index: None })
                     };
                     match msg {
                         Ok(ClientDatagram::Touchscreen { x, y, index }) => {
@@ -390,12 +398,22 @@ async fn capture(
                             }
                         }
                         Ok(ClientDatagram::TouchscreenRelease { index }) => {
-                            if active_slots.remove(&index)
-                                && let Err(e) = remote_desktop
+                            let indices: Vec<u8> = if let Some(index) = index {
+                                if active_slots.remove(&index) {
+                                    vec![index]
+                                } else {
+                                    vec![]
+                                }
+                            } else {
+                                active_slots.drain().collect()
+                            };
+                            for index in indices {
+                                if let Err(e) = remote_desktop
                                     .notify_touch_up(&session, index as u32, Default::default())
                                     .await
-                            {
-                                log(format!("touch up failed: {e}"));
+                                {
+                                    log(format!("touch up failed: {e}"));
+                                }
                             }
                         }
                         // Unrelated datagrams (resize, keyboard, keepalive).
@@ -440,6 +458,18 @@ async fn capture(
 
         if next_size.is_none() {
             return Ok(());
+        }
+    }
+}
+
+fn sized_stream(width: &u16, height: &u16) -> impl Fn(&&Stream) -> bool {
+    |stream| {
+        if let Some((target_width, target_height)) = stream.size() {
+            let w_equals = *width == target_width.unsigned_abs() as u16;
+            let h_equals = *height == target_height.unsigned_abs() as u16;
+            w_equals && h_equals
+        } else {
+            false
         }
     }
 }
