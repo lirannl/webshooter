@@ -6,13 +6,15 @@ The goal of Webshooter is to enable remote access to machines using a web browse
 - [x] Hosting on wayland
 - [x] Web frontend
 - [x] Hardware encoding
-- [ ] Standard input handling (keyboard and mouse)
-- [ ] Custom video request/stream parameters (resolution, bitrate, virtual/real)
+- [x] Custom display resolution (currently assuming virtual display)
+- [ ] Touchscreen handling - as a native touchscreen, rather than emulating a mouse
+- [ ] Standard input handling (keyboard, mouse)
+- [ ] Custom video request/stream parameters (bitrate, encoding, virtual/real)
 - [ ] OIDC
 - [ ] Audio
-- [ ] Advanced input handling (gamepads, touchscreens (as touchscreens, rather than just emulating a mouse))
+- [ ] Advanced input handling (gamepads, pens)
 - [ ] Native linux frontend
 - [ ] Android frontend
-- [ ] Advanced capture handling (handling multi-monitor systems)
+- [ ] Advanced capture handling (handling multi-monitor clients)
 - [ ] Hosting on X11, Windows
 - [ ] Hosting on MacOS, Android(?), iOS(???)
