@@ -7,7 +7,7 @@ The goal of Webshooter is to enable remote access to machines using a web browse
 - [x] Web frontend
 - [x] Hardware encoding
 - [x] Custom display resolution (currently assuming virtual display)
-- [ ] Touchscreen handling - as a native touchscreen, rather than emulating a mouse
+- [x] Touchscreen handling - as a native touchscreen, rather than emulating a mouse
 - [ ] Standard input handling (keyboard, mouse)
 - [ ] Custom video request/stream parameters (bitrate, encoding, virtual/real)
 - [ ] Webauthn
