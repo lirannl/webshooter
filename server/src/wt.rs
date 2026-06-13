@@ -86,7 +86,7 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
     let _connection = Arc::new(connection);
 
-    let (_broadcaster, _client_rx) = broadcast::channel(10);
+    let (_broadcaster, _client_rx) = broadcast::channel(256);
     let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
     let mut unistreams = broadcast_unistreams(_connection.clone(), _broadcaster.clone());
 

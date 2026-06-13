@@ -14,4 +14,14 @@
     "url": "https://pc:8443",
     "userDataDir": ".zed/chromium_profile",
   },
+  {
+    "label": "Debug backend",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "program": "target/debug/webshooter",
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "webshooter"],
+    },
+  },
 ]

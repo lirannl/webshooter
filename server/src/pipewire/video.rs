@@ -6,7 +6,9 @@ use crate::{
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
-    remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions},
+    remote_desktop::{
+        ConnectToEISOptions, DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
+    },
     screencast::{
         CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType, Stream,
     },
@@ -202,20 +204,11 @@ async fn single_capture(
         };
         let restore_token = get_config().await.pipewire_token.take();
 
-        cancel
-            .r(screencast.select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_multiple(true)
-                    .set_sources(Some(BitFlags::from(source_type)))
-                    .set_cursor_mode(CursorMode::Embedded),
-            ))
-            .await?;
-
-        // Request a touchscreen device so we can replay client touch events
-        // onto the captured stream. Must be called before select_sources.
-        // persist_mode=2 (ExplicitlyRevoked) causes the portal to return a
-        // restore_token in the Start response, skipping the picker next time.
+        // select_devices is still required for the restore token flow — the
+        // token returned by start() is a RemoteDesktop session token that
+        // select_devices consumes to bypass the picker on reconnection.
+        // The Touchscreen flag is harmless: ConnectToEIS (libei) after start
+        // supersedes NotifyTouch* for actual touch injection.
         cancel
             .r(remote_desktop.select_devices(
                 &session,
@@ -223,6 +216,16 @@ async fn single_capture(
                     .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
                     .set_restore_token(restore_token.as_deref())
                     .set_persist_mode(PersistMode::ExplicitlyRevoked),
+            ))
+            .await?;
+
+        cancel
+            .r(screencast.select_sources(
+                &session,
+                SelectSourcesOptions::default()
+                    .set_multiple(true)
+                    .set_sources(Some(BitFlags::from(source_type)))
+                    .set_cursor_mode(CursorMode::Embedded),
             ))
             .await?;
 
@@ -246,6 +249,9 @@ async fn single_capture(
             .rfind(sized_stream(&width, &height))
             .ok_or(anyhow!("no stream"))?;
         let node_id = stream.pipe_wire_node_id();
+        // Offset for translating stream-relative touch coordinates into the
+        // compositor coordinate space that libei expects.
+        let stream_pos = stream.position().unwrap_or((0, 0));
         let fd = cancel
             .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
             .await?;
@@ -336,11 +342,21 @@ async fn single_capture(
             anyhow!("Pipeline failed to enter Playing state: {bus_msg}")
         })?;
 
+        // Connect to the EIS implementation for touch injection. This
+        // replaces the NotifyTouch* portal calls which are a no-op on KDE
+        // and many wlroots-based compositors.
+        let eis_fd = cancel
+            .r(remote_desktop.connect_to_eis(
+                &session,
+                ConnectToEISOptions::default(),
+            ))
+            .await?;
+
         // Replay client touch events onto the captured stream. Touch datagrams
         // arrive over the same broadcast channel as resize events, so we take
         // an independent receiver and run this alongside the resize wait below.
         // The task is tied to this session and is aborted on teardown.
-        let touch_task = touch_task(remote_desktop, &session, node_id, client_rx, cancel);
+        let touch_task = touch_task(eis_fd, stream_pos, client_rx, cancel);
 
         // Wait for the next resize (or cancellation) before tearing down.
         // virtual_monitor must stay alive here — dropping it kills krfb.

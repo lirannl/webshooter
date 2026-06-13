@@ -37,8 +37,8 @@ export const render_video = async (wt: WebTransport) => {
   await wt.send({
     discriminant: ClientMessageDiscriminant.Resize,
     index: 0,
-    width: canvas.offsetWidth,
-    height: canvas.offsetHeight,
+    width: canvas.offsetWidth *2,
+    height: canvas.offsetHeight *2,
   });
   const ctx = canvas.getContext("2d")!;
 

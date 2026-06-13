@@ -91,15 +91,16 @@ export const handleTouch = (wt: WebTransport, canvas: HTMLCanvasElement) => {
 
   const flush = () => {
     rafHandle = null;
-    for (const [slot, point] of pending) {
+    const entries = [...pending];
+    pending.clear();
+    for (const [slot, point] of entries) {
       wt.send({
         discriminant: ClientMessageDiscriminant.Touchscreen,
         x: point.x,
         y: point.y,
         index: slot,
-      });
+      }).catch(() => {});
     }
-    pending.clear();
   };
 
   // Map a touch's screen position into the captured frame's pixel space, which
@@ -136,7 +137,7 @@ export const handleTouch = (wt: WebTransport, canvas: HTMLCanvasElement) => {
       wt.send({
         discriminant: ClientMessageDiscriminant.TouchscreenRelease,
         index: slot,
-      });
+      }).catch(() => {});
     }
   };
   canvas.addEventListener("touchend", release, { passive: false });
