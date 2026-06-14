@@ -2,8 +2,6 @@ mod input;
 mod log;
 mod video;
 
-pub use log::log;
-
 use js_sys::Uint8Array;
 use shared::client_datagram::ClientDatagram;
 use std::cell::RefCell;
@@ -13,6 +11,8 @@ use web_sys::{
     HtmlDivElement, ReadableStreamDefaultReader, WebTransport, WebTransportDatagramDuplexStream,
     WebTransportOptions, WritableStreamDefaultWriter,
 };
+
+use crate::log::log;
 
 // ---------------------------------------------------------------------------
 // Global WebTransport handle
@@ -28,6 +28,17 @@ pub(crate) struct GlobalWt {
 
 thread_local! {
     static GLOBAL_WT: RefCell<Option<GlobalWt>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn send_error(msg: &str) {
+    let bytes = ClientDatagram::Error {
+        message: msg.to_string(),
+    }
+    .to_bytes();
+    let buf = Uint8Array::from(&bytes[..]);
+    with_wt(|gwt| {
+        let _ = gwt.writer.write_with_chunk(buf.as_ref());
+    });
 }
 
 pub(crate) fn with_wt<F, R>(f: F) -> R
@@ -136,7 +147,7 @@ pub async fn start() -> Result<(), JsValue> {
 
         // 7. Canvas + video
         let canvas = video::setup_canvas();
-        video::send_initial_resize(&canvas);
+        video::send_initial_resize(&canvas).unwrap_or_else(|err| log(err));
         video::setup_resize_prompt(&canvas);
 
         // 8. Render loop
@@ -148,8 +159,8 @@ pub async fn start() -> Result<(), JsValue> {
 
         // 10. Wait for render loop to finish (signals connection closed).
         if let Err(e) = render_loop.await {
-            log(&format!("render_loop error: {e:?}"));
-            let _ = show_connection_lost();
+            send_error(&format!("render_loop error: {e:?}"));
+            show_connection_lost();
         }
 
         window.clear_interval_with_handle(keepalive_id);
@@ -158,8 +169,8 @@ pub async fn start() -> Result<(), JsValue> {
     .await;
 
     if let Err(e) = result {
-        log(&format!("start error after transport ready: {e:?}"));
-        let _ = show_connection_lost();
+        send_error(&format!("start error after transport ready: {e:?}"));
+        show_connection_lost();
     }
     Ok(())
 }

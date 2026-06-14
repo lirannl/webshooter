@@ -11,8 +11,8 @@ use tokio::sync::{broadcast::Receiver, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use shared::client_datagram::ClientDatagram;
 use crate::logging::log;
+use shared::client_datagram::ClientDatagram;
 
 enum EisTouchEvent {
     Down { x: u16, y: u16, index: u8 },
@@ -67,16 +67,14 @@ pub fn touch_task(
                     }
                 };
                 match msg {
-                    Ok(ClientDatagram::TouchscreenMulti { touches }) => {
-                        for (index, x, y) in touches {
-                            let is_new = active_slots.insert(index);
-                            let ev = if is_new {
-                                EisTouchEvent::Down { x, y, index }
-                            } else {
-                                EisTouchEvent::Motion { x, y, index }
-                            };
-                            let _ = touch_tx.send(ev).await;
-                        }
+                    Ok(ClientDatagram::Touchscreen { index, x, y }) => {
+                        let is_new = active_slots.insert(index);
+                        let ev = if is_new {
+                            EisTouchEvent::Down { x, y, index }
+                        } else {
+                            EisTouchEvent::Motion { x, y, index }
+                        };
+                        let _ = touch_tx.send(ev).await;
                     }
                     Ok(ClientDatagram::TouchscreenRelease { index }) => {
                         if active_slots.remove(&index) {
@@ -214,10 +212,7 @@ async fn wait_for_touch_device(
     }
 }
 
-async fn wait_for_resume(
-    eis_stream: &mut EiConvertEventStream,
-    cancel: &CancellationToken,
-) {
+async fn wait_for_resume(eis_stream: &mut EiConvertEventStream, cancel: &CancellationToken) {
     loop {
         tokio::select! {
             biased;

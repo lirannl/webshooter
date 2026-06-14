@@ -1,4 +1,4 @@
-use crate::{log, with_wt};
+use crate::{log::log, with_wt};
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram::ServerDatagram;
 use std::cell::RefCell;
@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, HtmlElement, VideoFrame,
-};
+use web_sys::{CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, VideoFrame};
 
 // ---------------------------------------------------------------------------
 // Canvas
@@ -28,19 +26,21 @@ pub fn setup_canvas() -> HtmlCanvasElement {
     canvas
 }
 
-pub fn send_initial_resize(canvas: &HtmlCanvasElement) {
-    let w = (canvas.offset_width() as f64 * 2.0) as u16;
-    let h = (canvas.offset_height() as f64 * 2.0) as u16;
+pub fn send_initial_resize(canvas: &HtmlCanvasElement) -> Result<(), JsError> {
+    let window = web_sys::window().ok_or(JsError::new("Window not found"))?;
+    let w = canvas.offset_width() as f64;
+    let h = canvas.offset_height() as f64;
     let msg = ClientDatagram::ResizeDisplay {
         index: 0,
-        width: w,
-        height: h,
+        width: (w * window.device_pixel_ratio()) as u16,
+        height: (h * window.device_pixel_ratio()) as u16,
     };
     let bytes = msg.to_bytes();
     let buf = js_sys::Uint8Array::from(&bytes[..]);
     with_wt(|gwt| {
         let _ = gwt.writer.write_with_chunk(buf.as_ref());
     });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -49,92 +49,77 @@ pub fn send_initial_resize(canvas: &HtmlCanvasElement) {
 
 pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
     let window = web_sys::window().unwrap();
-    let document = window.document().unwrap();
-    let window2 = window.clone();
-    let document2 = document.clone();
-    let canvas_resize = canvas.clone();
+    let performance = window.performance().unwrap();
 
-    let resize_cb = Closure::wrap(Box::new(move || {
-        let btn = document.create_element("button").unwrap();
-        btn.set_text_content(Some("\u{2BA2} Resize"));
-        let style = btn.dyn_ref::<HtmlElement>().unwrap().style();
-        style.set_css_text(
-            &[
-                "position:fixed",
-                "top:50%",
-                "left:50%",
-                "transform:translate(-50%,-50%)",
-                "padding:.6em 1.2em",
-                "font-size:1rem",
-                "background:rgba(0,0,0,.6)",
-                "color:#fff",
-                "border:2px solid rgba(255,255,255,.6)",
-                "border-radius:8px",
-                "cursor:pointer",
-                "z-index:9999",
-            ]
-            .join(";"),
-        );
-        document.body().unwrap().append_child(&btn).unwrap();
+    // Debounced resize sender: first event immediate, then 2s cooldown
+    let last_sent = RefCell::new(None::<f64>);
 
-        let btn2 = btn.clone();
-        let canvas_click = canvas_resize.clone();
-        let click_cb = Closure::wrap(Box::new(move || {
-            btn2.remove();
-            let w = canvas_click.offset_width() as u16;
-            let h = canvas_click.offset_height() as u16;
+    let send_resize = move || -> Result<(), JsError> {
+        let now = performance.now();
+        let should_send = {
+            let mut last = last_sent.borrow_mut();
+            match *last {
+                None => {
+                    *last = Some(now);
+                    true
+                }
+                Some(last_time) => {
+                    if now - last_time >= 2000.0 {
+                        *last = Some(now);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        };
+        if should_send {
+            let window = web_sys::window().ok_or(JsError::new("Window not found"))?;
+            let w = canvas.offset_width() as f64;
+            let h = canvas.offset_height() as f64;
             let msg = ClientDatagram::ResizeDisplay {
                 index: 0,
-                width: w,
-                height: h,
+                width: (w * window.device_pixel_ratio()) as u16,
+                height: (h * window.device_pixel_ratio()) as u16,
             };
             let bytes = msg.to_bytes();
             let buf = js_sys::Uint8Array::from(&bytes[..]);
             with_wt(|gwt| {
                 let _ = gwt.writer.write_with_chunk(buf.as_ref());
             });
-        }) as Box<dyn FnMut()>);
-        let _ = btn.add_event_listener_with_callback(
-            "pointerdown",
-            click_cb.as_ref().unchecked_ref::<js_sys::Function>(),
-        );
-        click_cb.forget();
+        }
+        Ok(())
+    };
 
-        let btn3 = btn.clone();
-        let timer = Closure::wrap(Box::new(move || {
-            btn3.remove();
-        }) as Box<dyn FnMut()>);
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            timer.as_ref().unchecked_ref::<js_sys::Function>(),
-            2000,
-        );
-        timer.forget();
+    let resize_cb = Closure::wrap(Box::new(move || {
+        send_resize().unwrap_or_else(|err| log(err));
     }) as Box<dyn FnMut()>);
 
-    let ro =
-        web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref::<js_sys::Function>())
-            .unwrap();
+    let ro = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref::<js_sys::Function>())
+        .unwrap();
     ro.observe(canvas);
     resize_cb.forget();
 
     let fullscreen_cb = Closure::wrap(Box::new(move || {
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
         let w = std::cmp::max(
-            document2
+            document
                 .document_element()
                 .map(|e| e.client_width())
                 .unwrap_or(0) as u16,
-            window2
+            window
                 .inner_width()
                 .ok()
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0) as u16,
         );
         let h = std::cmp::max(
-            document2
+            document
                 .document_element()
                 .map(|e| e.client_height())
                 .unwrap_or(0) as u16,
-            window2
+            window
                 .inner_height()
                 .ok()
                 .and_then(|v| v.as_f64())
@@ -142,8 +127,8 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
         );
         let msg = ClientDatagram::ResizeDisplay {
             index: 0,
-            width: w,
-            height: h,
+            width: w * window.device_pixel_ratio() as u16,
+            height: h * window.device_pixel_ratio() as u16,
         };
         let bytes = msg.to_bytes();
         let buf = js_sys::Uint8Array::from(&bytes[..]);
@@ -190,8 +175,7 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
         let ctx = ctx.clone();
         let canvas = canvas.clone();
         Closure::wrap(Box::new(move |frame: VideoFrame| {
-            if canvas.width() != frame.display_width()
-                || canvas.height() != frame.display_height()
+            if canvas.width() != frame.display_width() || canvas.height() != frame.display_height()
             {
                 canvas.set_width(frame.display_width());
                 canvas.set_height(frame.display_height());
@@ -207,24 +191,12 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
 
     // Build init dict via Reflect.set for compatibility.
     let init = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &init,
-        &"output".into(),
-        output_cb.as_ref().unchecked_ref(),
-    )
-    .ok();
-    js_sys::Reflect::set(
-        &init,
-        &"error".into(),
-        error_cb.as_ref().unchecked_ref(),
-    )
-    .ok();
+    js_sys::Reflect::set(&init, &"output".into(), output_cb.as_ref().unchecked_ref()).ok();
+    js_sys::Reflect::set(&init, &"error".into(), error_cb.as_ref().unchecked_ref()).ok();
 
-    let decoder = web_sys::VideoDecoder::new(
-        init.unchecked_ref::<web_sys::VideoDecoderInit>(),
-    )
-    .map_err(|_| web_sys::console::error_1(&"Failed to create VideoDecoder".into()))
-    .ok();
+    let decoder = web_sys::VideoDecoder::new(init.unchecked_ref::<web_sys::VideoDecoderInit>())
+        .map_err(|_| web_sys::console::error_1(&"Failed to create VideoDecoder".into()))
+        .ok();
 
     let decoder = match decoder {
         Some(d) => d,
@@ -240,8 +212,7 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
     js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &JsValue::TRUE).ok();
     decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
 
-    let pending: Rc<RefCell<HashMap<u16, PendingFrame>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let pending: Rc<RefCell<HashMap<u16, PendingFrame>>> = Rc::new(RefCell::new(HashMap::new()));
 
     loop {
         // Read one datagram from the reader.
@@ -354,9 +325,8 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
         let data_arr = js_sys::Uint8Array::from(&assembled[..]);
         js_sys::Reflect::set(&chunk_init, &"data".into(), &data_arr).ok();
 
-        let chunk = EncodedVideoChunk::new(
-            chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>(),
-        );
+        let chunk =
+            EncodedVideoChunk::new(chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>());
         match chunk {
             Ok(chunk) => decoder.decode(&chunk),
             Err(e) => {
@@ -364,11 +334,4 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
             }
         }
     }
-
-    // Cleanup
-    if let Err(e) = JsFuture::from(decoder.flush()).await {
-        log(&format!("VideoDecoder flush failed: {e:?}"));
-    }
-    decoder.close();
-    Ok(())
 }

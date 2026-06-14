@@ -37,6 +37,7 @@ web-sys = { workspace = true, features = [
     "ReadableStreamDefaultReader",
     "WritableStream",
     "WritableStreamDefaultWriter",
+    "Performance",
     "ResizeObserver",
     "TouchEvent",
     "Touch",

@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 
 bitflags::bitflags! {
@@ -24,8 +23,10 @@ pub enum ClientDatagram {
         width: u16,
         height: u16,
     },
-    TouchscreenMulti {
-        touches: Vec<(u8, u16, u16)>,
+    Touchscreen {
+        index: u8,
+        x: u16,
+        y: u16,
     },
     TouchscreenRelease {
         index: u8,
@@ -59,15 +60,13 @@ impl ClientDatagram {
                 buf.extend_from_slice(&height.to_be_bytes());
                 buf
             }
-            Self::TouchscreenMulti { touches } => {
-                let mut buf = Vec::with_capacity(1 + 1 + touches.len() * 5);
+            Self::Touchscreen { index, x, y } => {
+                let mut buf = Vec::with_capacity(6);
                 buf.push(3);
-                buf.push(touches.len() as u8);
-                for (index, x, y) in touches {
-                    buf.push(*index);
-                    buf.extend_from_slice(&x.to_be_bytes());
-                    buf.extend_from_slice(&y.to_be_bytes());
-                }
+                buf.extend_from_slice(&x.to_be_bytes());
+                buf.extend_from_slice(&y.to_be_bytes());
+                buf.push(*index);
+
                 buf
             }
             Self::TouchscreenRelease { index } => {
@@ -104,17 +103,11 @@ impl ClientDatagram {
                 }
             }
             3 => {
-                let count = bytes[1] as usize;
-                let mut touches = Vec::with_capacity(count);
-                let mut offset = 2;
-                for _ in 0..count {
-                    let index = bytes[offset];
-                    let x = u16::from_be_bytes([bytes[offset + 1], bytes[offset + 2]]);
-                    let y = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]);
-                    touches.push((index, x, y));
-                    offset += 5;
-                }
-                Self::TouchscreenMulti { touches }
+                let x = u16::from_be_bytes([bytes[1], bytes[2]]);
+                let y = u16::from_be_bytes([bytes[3], bytes[4]]);
+                let index = bytes[5];
+
+                Self::Touchscreen { x, y, index }
             }
             4 => {
                 let index = bytes[1];

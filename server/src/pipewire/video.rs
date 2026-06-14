@@ -1,4 +1,3 @@
-use shared::client_datagram::ClientDatagram;
 use crate::{
     extensions::CancellationTokenExt, get_config, logging::log, pipewire::touch::touch_task,
     update_config,
@@ -17,6 +16,7 @@ use ashpd::enumflags2::BitFlags;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use libc;
+use shared::client_datagram::ClientDatagram;
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
@@ -301,18 +301,36 @@ async fn single_capture(
                 .build(),
         );
 
-        // Watch the bus for EOS / errors from any element (e.g. pipewiresrc
-        // posting an error when the cast is stopped externally).
-        // iter_timed blocks, so run it on the blocking thread pool.
-        // When we break out the task ends and its clone of pipeline is dropped,
-        // which eventually causes the appsink sender to be dropped too.
+        // Watch the bus for EOS / errors from any element.
+        // Detect GPU context loss (AMD GPU hard recovery) and signal for fast restart.
+        let (pipeline_restart, mut pipeline_restart_watcher) = tokio::sync::watch::channel(());
+        let pipeline_restart = Arc::new(pipeline_restart);
         {
             let bus = pipeline.bus().ok_or(anyhow!("no pipeline bus"))?;
             let pipeline_ref = pipeline.clone();
+            let pipeline_restart = pipeline_restart.clone();
             tokio::task::spawn_blocking(move || {
                 for msg in bus.iter_timed(gst::ClockTime::NONE) {
                     match msg.view() {
                         gst::MessageView::Eos(_) | gst::MessageView::Error(_) => {
+                            if let gst::MessageView::Error(err) = msg.view() {
+                                let err_str = format!(
+                                    "{} — {}",
+                                    err.error(),
+                                    err.debug().unwrap_or_default()
+                                );
+                                // Detect AMD GPU context loss / hard recovery
+                                if err_str.contains("context") && err_str.contains("lost")
+                                    || err_str.contains("hard recovery")
+                                    || err_str.contains("context is lost")
+                                    || err_str.contains("GPU")
+                                    || err_str.contains("vaapi")
+                                    || err_str.contains("amf")
+                                {
+                                    log(format!("GPU context loss detected: {err_str}"));
+                                    let _ = pipeline_restart.send(());
+                                }
+                            }
                             let _ = pipeline_ref.set_state(gst::State::Null);
                             break;
                         }
@@ -346,10 +364,7 @@ async fn single_capture(
         // replaces the NotifyTouch* portal calls which are a no-op on KDE
         // and many wlroots-based compositors.
         let eis_fd = cancel
-            .r(remote_desktop.connect_to_eis(
-                &session,
-                ConnectToEISOptions::default(),
-            ))
+            .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
             .await?;
 
         // Replay client touch events onto the captured stream. Touch datagrams
@@ -358,12 +373,16 @@ async fn single_capture(
         // The task is tied to this session and is aborted on teardown.
         let touch_task = touch_task(eis_fd, stream_pos, client_rx, cancel);
 
-        // Wait for the next resize (or cancellation) before tearing down.
+        // Wait for the next resize (or cancellation or GPU loss) before tearing down.
         // virtual_monitor must stay alive here — dropping it kills krfb.
         next_size = loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break None,
+                _ = pipeline_restart_watcher.changed() => {
+                    log("GPU context lost, restarting capture pipeline");
+                    break Some((width, height, index));
+                },
                 msg = client_rx.recv() => match msg {
                     Ok(ClientDatagram::ResizeDisplay { width, height, .. }) =>
                         break Some((width, height, index)),

@@ -2,7 +2,7 @@ use std::fmt::Debug;
 
 use js_sys::{Error, Uint8Array};
 use shared::client_datagram::ClientDatagram;
-use wasm_bindgen::{JsValue, prelude::*};
+use wasm_bindgen::prelude::*;
 
 use crate::with_wt;
 
@@ -18,7 +18,7 @@ pub fn log(msg: impl Debug) {
 }
 
 #[wasm_bindgen(js_name = "log", skip_typescript)]
-pub fn js_log(val: &JsValue) {
+pub fn js_log(val: &wasm_bindgen::JsValue) {
     if let Some(msg) = val.as_string() {
         log(msg);
     } else if val.is_instance_of::<Error>() {
