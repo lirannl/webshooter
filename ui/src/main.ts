@@ -1,7 +1,7 @@
 import { checkCookie, checkIdentity, genKeyPair, getCookie } from "./auth";
 import "./style.css";
-import { start } from "./wt";
-import "./extensions";
+
+import init, { log, start } from "../wasm/pkg/webshooter_wasm";
 
 const root = document.createElement("div");
 root.style.width = "100vw";
@@ -43,4 +43,7 @@ const authenticated = await new Promise<boolean>(async (resolve, reject) => {
   }
 });
 
-if (authenticated) start();
+if (authenticated) {
+  await init();
+  start();
+}

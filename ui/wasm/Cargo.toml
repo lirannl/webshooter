@@ -1,0 +1,57 @@
+[package]
+name = "webshooter-wasm"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Wasm client for webshooter"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "CssStyleDeclaration",
+    "HtmlElement",
+    "Element",
+    "Navigator",
+    "Location",
+    "VideoDecoder",
+    "VideoDecoderConfig",
+    "VideoDecoderInit",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "VideoFrame",
+    "WebTransport",
+    "WebTransportOptions",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportSendStream",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "ResizeObserver",
+    "TouchEvent",
+    "Touch",
+    "TouchList",
+    "KeyboardEvent",
+    "PointerEvent",
+    "console",
+    "Request",
+    "Response",
+    "Headers",
+    "CloseEvent",
+    "DomRect",
+    "DomRectReadOnly",
+    "HtmlButtonElement",
+    "HtmlDivElement",
+    "Text",
+] }
+shared.workspace = true

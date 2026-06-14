@@ -1,13 +1,13 @@
 use crate::{
     auth::OnetimeToken,
-    client_datagram::ClientDatagram,
     config::{Bytes64, Config},
     error::WebshooterError,
     logging::log,
     pipewire::video,
-    server_datagram,
 };
 use anyhow::Result;
+use shared::client_datagram::ClientDatagram;
+use shared::server_datagram;
 use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
@@ -90,6 +90,15 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
     let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
     let mut unistreams = broadcast_unistreams(_connection.clone(), _broadcaster.clone());
 
+    let mut client_rx = _client_rx.resubscribe();
+    let logger = spawn(async move {
+        loop {
+            if let Ok(ClientDatagram::Error { message }) = client_rx.recv().await {
+                log(&message);
+            }
+        }
+    });
+
     let mut capture_handle: Option<video::CaptureHandle> = None;
 
     loop {
@@ -119,6 +128,7 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
         tokio::select! {
             _ = datagrams => { log("Datagrams closed"); break; }
             _ = unistreams => { log("Unidirectional streams closed");  break; }
+            _ = logger => { log("Logger closed"); break; }
             _ = keyboard_receiver => { break; }
             _ = frame_forwarder => { log("capture pipeline stopped");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
@@ -174,7 +184,7 @@ fn frame_forwarder(
     let payload_size = wt
         .max_datagram_size()
         .unwrap_or(1200)
-        .saturating_sub(server_datagram::ServerDatagram::HEADER)
+        .saturating_sub(server_datagram::ServerDatagram::header_size())
         .max(1);
     let mut frame_id: u16 = 0;
     spawn(async move {
@@ -187,7 +197,7 @@ fn frame_forwarder(
                     frag_idx: idx as u16,
                     num_frags,
                     is_keyframe: frame.is_keyframe && idx == 0,
-                    payload: chunk,
+                    payload: chunk.to_vec(),
                 }
                 .to_bytes();
                 if wt.send_datagram(&dgram).is_err() {

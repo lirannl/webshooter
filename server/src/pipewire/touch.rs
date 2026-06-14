@@ -11,7 +11,7 @@ use tokio::sync::{broadcast::Receiver, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::client_datagram::ClientDatagram;
+use shared::client_datagram::ClientDatagram;
 use crate::logging::log;
 
 enum EisTouchEvent {
@@ -67,27 +67,20 @@ pub fn touch_task(
                     }
                 };
                 match msg {
-                    Ok(ClientDatagram::Touchscreen { x, y, index }) => {
-                        let is_new = active_slots.insert(index);
-                        let ev = if is_new {
-                            EisTouchEvent::Down { x, y, index }
-                        } else {
-                            EisTouchEvent::Motion { x, y, index }
-                        };
-                        let _ = touch_tx.send(ev).await;
+                    Ok(ClientDatagram::TouchscreenMulti { touches }) => {
+                        for (index, x, y) in touches {
+                            let is_new = active_slots.insert(index);
+                            let ev = if is_new {
+                                EisTouchEvent::Down { x, y, index }
+                            } else {
+                                EisTouchEvent::Motion { x, y, index }
+                            };
+                            let _ = touch_tx.send(ev).await;
+                        }
                     }
                     Ok(ClientDatagram::TouchscreenRelease { index }) => {
-                        let indices: Vec<u8> = if let Some(index) = index {
-                            if active_slots.remove(&index) {
-                                vec![index]
-                            } else {
-                                vec![]
-                            }
-                        } else {
-                            active_slots.drain().collect()
-                        };
-                        for idx in indices {
-                            let _ = touch_tx.send(EisTouchEvent::Up { index: idx }).await;
+                        if active_slots.remove(&index) {
+                            let _ = touch_tx.send(EisTouchEvent::Up { index }).await;
                         }
                     }
                     Ok(_) => continue,

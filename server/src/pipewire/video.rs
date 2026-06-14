@@ -1,4 +1,4 @@
-use crate::client_datagram::ClientDatagram;
+use shared::client_datagram::ClientDatagram;
 use crate::{
     extensions::CancellationTokenExt, get_config, logging::log, pipewire::touch::touch_task,
     update_config,

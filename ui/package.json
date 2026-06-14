@@ -4,13 +4,19 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "build:wasm": "RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack build wasm --target web --out-dir pkg",
+    "prebuild": "pnpm build:wasm",
+    "dev": "pnpm build:wasm && vite",
     "build": "vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
+    "chokidar": "^5.0.0",
     "typescript": "^5.2.2",
-    "vite": "^5.2.0"
+    "vite": "^5.2.0",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.6.0",
+    "wasm-pack": "^0.15.0"
   },
   "dependencies": {
     "oidc-client-ts": "^3.0.1",

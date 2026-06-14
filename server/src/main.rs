@@ -1,7 +1,6 @@
 #![feature(extend_one, cfg_eval)]
 
 mod auth;
-mod client_datagram;
 mod config;
 mod config_watch;
 mod error;
@@ -11,7 +10,6 @@ mod ipc;
 mod logging;
 #[cfg(target_os = "linux")]
 mod pipewire;
-mod server_datagram;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;

@@ -3757,7 +3757,27 @@ dependencies = [
  "toml",
  "ts-rs",
  "untrusted",
+ "webshooter-shared",
  "wtransport",
+]
+
+[[package]]
+name = "webshooter-shared"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags 2.10.0",
+]
+
+[[package]]
+name = "webshooter-wasm"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "webshooter-shared",
 ]
 
 [[package]]

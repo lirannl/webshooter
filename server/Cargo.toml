@@ -2,68 +2,59 @@
 name = "webshooter"
 edition.workspace = true
 version.workspace = true
-author.workspace = true
 repository.workspace = true
+license.workspace = true
+description = "Webshooter server"
 
 [features]
 debug = []
 
 [dependencies]
-ashpd = { version = "0.13", features = [
-    "pipewire",
-    "remote_desktop",
-    "screencast",
-] }
-rust-embed = { version = "8", features = ["poem", "mime-guess"] }
-aes = "0.9"
-anyhow = "1.0"
-bitflags = "2"
-libc = "0.2"
-async-channel = "2.5"
-bytes = { version = "1.11", features = ["serde"] }
-ecdsa = { version = "0.16.9", features = ["spki", "verifying"] }
-futures-util = "0.3"
-data-encoding = "2.11"
-http = "1.4"
-http-bytes = { version = "0.1.0", default-features = false, features = [
-    "base64",
-] }
-lazy_static = "1.5"
-
-mime_guess = "2.0"
-notify = "8.2"
-p384 = "0.13"
-poem = { version = "3.1", features = [
-    "rustls",
-    "tokio-rustls",
-    "static-files",
-] }
-rand = "0.10"
-rcgen = "0.14"
-regex = "1.12"
-reqwest = "0.13"
-rustls = "0.23"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
-thiserror = "2"
-tokio = { version = "1.52", features = [
+ashpd = { workspace = true, features = ["pipewire", "remote_desktop", "screencast"] }
+rust-embed = { workspace = true, features = ["poem", "mime-guess"] }
+aes.workspace = true
+anyhow.workspace = true
+bitflags.workspace = true
+libc.workspace = true
+async-channel.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+ecdsa = { workspace = true, features = ["spki", "verifying"] }
+futures-util.workspace = true
+data-encoding.workspace = true
+http.workspace = true
+http-bytes = { workspace = true, default-features = false, features = ["base64"] }
+lazy_static.workspace = true
+mime_guess.workspace = true
+notify.workspace = true
+p384.workspace = true
+poem = { workspace = true, features = ["rustls", "tokio-rustls", "static-files"] }
+rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "io-util",
     "io-std",
     "fs",
 ] }
-toml = "1"
-ts-rs = "12.0"
-untrusted = "0.9.0"
-wtransport = "0.7"
-ring = "0.17"
-interprocess = { version = "2.4", features = ["tokio"] }
-rmp-serde = "1.3"
-pipewire = { version = "^0.9" }
-tokio-scoped = "0.2.0"
-tokio-util = "0.7.18"
-gstreamer = "0.25"
-gstreamer-app = "0.25"
-reis = { version = "0.6", features = ["tokio"] }
+toml.workspace = true
+ts-rs.workspace = true
+untrusted.workspace = true
+wtransport.workspace = true
+ring.workspace = true
+interprocess = { workspace = true, features = ["tokio"] }
+rmp-serde.workspace = true
+pipewire.workspace = true
+shared.workspace = true
+tokio-scoped.workspace = true
+tokio-util.workspace = true
+gstreamer.workspace = true
+gstreamer-app.workspace = true
+reis = { workspace = true, features = ["tokio"] }

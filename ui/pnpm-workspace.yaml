@@ -1,2 +1,6 @@
 allowBuilds:
-  esbuild: false
+  '@swc/core': true
+  wasm-pack: true
+onlyBuiltDependencies:
+  - '@swc/core'
+  - wasm-pack

@@ -1,0 +1,11 @@
+[package]
+name = "webshooter-shared"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Shared types for webshooter"
+license.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+anyhow.workspace = true
