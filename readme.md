@@ -14,6 +14,7 @@ The goal of Webshooter is to enable remote access to machines using a web browse
 - [ ] OIDC
 - [ ] Audio
 - [ ] Advanced input handling (gamepads, pens)
+- [ ] USB Forwarding?
 - [ ] Native linux frontend
 - [ ] Android frontend
 - [ ] Advanced capture handling (handling multi-monitor clients)
