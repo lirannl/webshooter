@@ -23,6 +23,10 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint:
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
+    // Initialise the portal-authorisation keyboard and grant portal
+    // permission once, before the first client starts capturing.
+    video::init_portal_auth().await;
+
     let server_config = ServerConfig::builder()
         .with_bind_default(config.http_config.port)
         .with_identity(identity)

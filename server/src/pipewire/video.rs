@@ -20,16 +20,23 @@ use shared::client_datagram::ClientDatagram;
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
     spawn,
-    sync::{broadcast::Receiver, mpsc},
+    sync::{broadcast::Receiver, mpsc, Mutex as AsyncMutex},
     task::JoinHandle,
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
+
+// Virtual keyboard created and authorised once at application startup.
+static KB: OnceLock<AsyncMutex<Option<PortalAuthKb>>> = OnceLock::new();
+
+// Portal restore token: returned by start(), fed back to select_devices /
+// select_sources on the next capture so the portal skips the dialog.
+static RESTORE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Virtual monitor (KWin)
@@ -123,6 +130,23 @@ impl CaptureHandle {
     }
 }
 
+/// Initialise the portal-authorisation keyboard and grant portal permission
+/// once at application startup.  Must be called before any `capture()`.
+#[cfg(target_os = "linux")]
+pub async fn init_portal_auth() {
+    let mut kb = PortalAuthKb::new("Webshooter Portal Authorisation");
+    if kb.is_some() {
+        let cancel = CancellationToken::new();
+        grant_permission_once(&mut kb, &cancel).await;
+    }
+    let _ = KB.set(AsyncMutex::new(kb));
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn init_portal_auth() {
+    let _ = KB.set(AsyncMutex::new(None));
+}
+
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded AV1 frames into the returned channel.
 pub async fn capture(
@@ -135,7 +159,9 @@ pub async fn capture(
         let cancel = cancel.clone();
         async move {
             while !cancel.is_cancelled() {
-                if let Err(e) = single_capture(&mut client_rx, frame_tx.clone(), &cancel).await {
+                if let Err(e) =
+                    single_capture(&mut client_rx, frame_tx.clone(), &cancel).await
+                {
                     log(format!("Capture error: {:#?}", e));
                 }
             }
@@ -143,6 +169,76 @@ pub async fn capture(
     });
 
     Ok((frame_rx, CaptureHandle { cancel, task }))
+}
+
+/// Do the full portal permission flow once (select_devices, select_sources,
+/// start) using the keyboard to auto-accept any dialogs.  The portal should
+/// cache the grant so future sessions skip the dialogs.
+async fn grant_permission_once(
+    kb: &mut Option<PortalAuthKb>,
+    cancel: &CancellationToken,
+) {
+    let remote_desktop = match cancel.r(RemoteDesktop::new()).await {
+        Ok(rd) => Arc::new(rd),
+        Err(e) => {
+            log(format!("grant_permission: RemoteDesktop::new failed: {e:#}"));
+            return;
+        }
+    };
+    let screencast = match cancel.r(Screencast::new()).await {
+        Ok(sc) => sc,
+        Err(e) => {
+            log(format!("grant_permission: Screencast::new failed: {e:#}"));
+            return;
+        }
+    };
+    let session = match cancel
+        .r(remote_desktop.create_session(CreateSessionOptions::default()))
+        .await
+    {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            log(format!("grant_permission: create_session failed: {e:#}"));
+            return;
+        }
+    };
+
+    let source_type = SourceType::Monitor;
+    if let Err(e) = accept_dialog(kb, cancel.r(remote_desktop.select_devices(
+        &session,
+        SelectDevicesOptions::default()
+            .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+            .set_persist_mode(PersistMode::ExplicitlyRevoked),
+    )))
+    .await
+    {
+        log(format!("grant_permission: select_devices failed: {e:#}"));
+    }
+    if let Err(e) = accept_dialog(kb, cancel.r(screencast.select_sources(
+        &session,
+        SelectSourcesOptions::default()
+            .set_multiple(true)
+            .set_sources(Some(BitFlags::from(source_type)))
+            .set_cursor_mode(CursorMode::Embedded),
+    )))
+    .await
+    {
+        log(format!("grant_permission: select_sources failed: {e:#}"));
+    }
+    if let Ok(req) = accept_dialog(kb, cancel.r(remote_desktop.start(
+        &session,
+        None,
+        StartOptions::default(),
+    )))
+    .await
+        && let Ok(started) = req.response()
+    {
+        if let Some(token) = started.restore_token() {
+            *RESTORE_TOKEN.lock().unwrap() = Some(token.to_owned());
+            println!("[video] grant_permission: stored restore_token");
+        }
+    }
+    let _ = session.close().await;
 }
 
 async fn single_capture(
@@ -203,34 +299,46 @@ async fn single_capture(
             VirtualMonitor::Portal => SourceType::Virtual,
         };
 
-        // Auto-accept the devices/sources dialogs via inputtino keyboard.
-        // The keyboard is created once and reused for both dialogs.
-        let mut kb = PortalAuthKb::new("Webshooter Portal Authorisation");
-        accept_dialog(&mut kb, cancel.r(remote_desktop.select_devices(
+        // Swap the previous restore_token into the portal calls so the portal
+        // can skip the selection dialogs.  After start() a fresh token is
+        // stored for the next iteration.
+        let prev_token = RESTORE_TOKEN.lock().unwrap().take();
+
+        let mut kb_guard = KB.get().expect("init_portal_auth must be called first").lock().await;
+        let kb = &mut *kb_guard;
+        accept_dialog(kb, cancel.r(remote_desktop.select_devices(
             &session,
             SelectDevicesOptions::default()
                 .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-                .set_persist_mode(PersistMode::ExplicitlyRevoked),
+                .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                .set_restore_token(prev_token.as_deref()),
         )))
         .await?;
 
-        accept_dialog(&mut kb, cancel.r(screencast.select_sources(
+        accept_dialog(kb, cancel.r(screencast.select_sources(
             &session,
             SelectSourcesOptions::default()
                 .set_multiple(true)
                 .set_sources(Some(BitFlags::from(source_type)))
-                .set_cursor_mode(CursorMode::Embedded),
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_restore_token(prev_token.as_deref()),
         )))
         .await?;
 
         // Starting the RemoteDesktop session also starts the screen cast that
         // shares it, returning the selected devices and streams together.
         let request = accept_dialog(
-            &mut kb,
+            kb,
             cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
         )
         .await?;
+        drop(kb_guard);
         let started = request.response()?;
+
+        // Store the new restore_token for the next capture iteration.
+        if let Some(token) = started.restore_token() {
+            *RESTORE_TOKEN.lock().unwrap() = Some(token.to_owned());
+        }
 
         let stream = started
             .streams()
