@@ -1532,13 +1532,19 @@ dependencies = [
 
 [[package]]
 name = "inputtino"
-version = "2024.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24b4817cb2e52eda2ee5daabd2d6157bb249a38027217c1c713d7436e668d3b5"
+version = "0.1.0"
+source = "git+https://github.com/games-on-whales/inputtino?rev=b887f6a#b887f6a37a4f6babea66ee7b9a79bc8f520d7554"
+dependencies = [
+ "inputtino-sys",
+]
+
+[[package]]
+name = "inputtino-sys"
+version = "0.1.0"
+source = "git+https://github.com/games-on-whales/inputtino?rev=b887f6a#b887f6a37a4f6babea66ee7b9a79bc8f520d7554"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
- "pkg-config",
 ]
 
 [[package]]

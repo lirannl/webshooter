@@ -8,6 +8,7 @@ mod extensions;
 mod frontend;
 mod ipc;
 mod logging;
+mod portal_auth;
 #[cfg(target_os = "linux")]
 mod pipewire;
 mod wt;

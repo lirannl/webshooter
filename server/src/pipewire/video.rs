@@ -1,5 +1,6 @@
 use crate::{
     extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task,
+    portal_auth::{accept_dialog, PortalAuthKb},
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -202,32 +203,34 @@ async fn single_capture(
             VirtualMonitor::Portal => SourceType::Virtual,
         };
 
-        // Select devices without a restore token — always show the portal picker
-        cancel
-            .r(remote_desktop.select_devices(
-                &session,
-                SelectDevicesOptions::default()
-                    .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-                    .set_persist_mode(PersistMode::ExplicitlyRevoked),
-            ))
-            .await?;
+        // Auto-accept the devices/sources dialogs via inputtino keyboard.
+        // The keyboard is created once and reused for both dialogs.
+        let mut kb = PortalAuthKb::new("Webshooter Portal Authorisation");
+        accept_dialog(&mut kb, cancel.r(remote_desktop.select_devices(
+            &session,
+            SelectDevicesOptions::default()
+                .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
+        )))
+        .await?;
 
-        cancel
-            .r(screencast.select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_multiple(true)
-                    .set_sources(Some(BitFlags::from(source_type)))
-                    .set_cursor_mode(CursorMode::Embedded),
-            ))
-            .await?;
+        accept_dialog(&mut kb, cancel.r(screencast.select_sources(
+            &session,
+            SelectSourcesOptions::default()
+                .set_multiple(true)
+                .set_sources(Some(BitFlags::from(source_type)))
+                .set_cursor_mode(CursorMode::Embedded),
+        )))
+        .await?;
 
         // Starting the RemoteDesktop session also starts the screen cast that
         // shares it, returning the selected devices and streams together.
-        let started = cancel
-            .r(remote_desktop.start(&session, None, StartOptions::default()))
-            .await?
-            .response()?;
+        let request = accept_dialog(
+            &mut kb,
+            cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
+        )
+        .await?;
+        let started = request.response()?;
 
         let stream = started
             .streams()

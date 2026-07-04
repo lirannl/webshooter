@@ -35,7 +35,8 @@ const authenticated = await new Promise<boolean>(async (resolve, reject) => {
           button.remove();
           resolve(true);
         } catch (err) {
-          console.log(err);
+          if (err instanceof Error) log(err);
+          else console.log(err);
           resolve(false);
         }
       });
