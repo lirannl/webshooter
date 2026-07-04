@@ -38,9 +38,6 @@ pub struct Config {
     version: String,
     #[serde(default)]
     pub authorised_keys: HashSet<Bytes64>,
-    #[cfg(target_os = "linux")]
-    #[serde(default)]
-    pub pipewire_token: Option<String>,
     #[serde(flatten)]
     pub http_config: HttpConfig,
     #[serde(default)]
@@ -78,7 +75,6 @@ impl Config {
             webtransport_permitted_domains: default_settings::permitted_domains(),
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
-            pipewire_token: Default::default(),
         })
     }
 }

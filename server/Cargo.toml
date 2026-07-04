@@ -8,8 +8,10 @@ description = "Webshooter server"
 
 [features]
 debug = []
+inputtino = ["dep:inputtino"]
 
 [dependencies]
+inputtino = { workspace = true, optional = true }
 ashpd = { workspace = true, features = ["pipewire", "remote_desktop", "screencast"] }
 rust-embed = { workspace = true, features = ["poem", "mime-guess"] }
 aes.workspace = true

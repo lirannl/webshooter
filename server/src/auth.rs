@@ -1,7 +1,4 @@
 use crate::config::Bytes64;
-use crate::logging::log;
-#[cfg(target_os = "linux")]
-use crate::pipewire::sources::setup_sources;
 use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
 use http::StatusCode;
@@ -285,13 +282,6 @@ pub async fn negotiate_wt(
 ) -> Result<impl IntoResponse> {
     let token = OnetimeToken::new().await.to_vec();
     let token = Bytes64(token).to_string();
-    #[cfg(target_os = "linux")]
-    if get_config().await.pipewire_token.is_none() {
-        if let Err(err) = setup_sources().await {
-            log(err);
-            return Err(poem::Error::from_status(StatusCode::INTERNAL_SERVER_ERROR));
-        }
-    }
     Ok(poem::Response::builder()
         .header("token", token)
         .body(cert_hash.as_ref().to_vec()))

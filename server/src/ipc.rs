@@ -1,6 +1,4 @@
 use crate::config::Config;
-#[cfg(target_family = "unix")]
-use crate::{logging::log, pipewire::sources::setup_sources};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr};
@@ -10,7 +8,6 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
 pub enum IPCMessage {
     Exit,
     Authorise(Option<usize>),
-    SetupSources,
 }
 
 impl IPCMessage {
@@ -22,11 +19,8 @@ impl IPCMessage {
             ["exit"] => Ok(IPCMessage::Exit),
             ["authorise"] => Ok(IPCMessage::Authorise(None)),
             ["authorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Authorise(Some(n))),
-            ["sources"] => Ok(IPCMessage::SetupSources),
-            ["setup-sources"] => Ok(IPCMessage::SetupSources),
             _ => bail!(
                 "Webshooter supports the following commands while running:
-    sources
     authorise
     exit"
             ),
@@ -171,13 +165,6 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                             None
                         }
                     }
-                    IPCMessage::SetupSources => match setup_sources().await {
-                        Err(err) => {
-                            log(err);
-                            Some("Failed to setup sources")
-                        }
-                        Ok(_) => Some("Source added"),
-                    },
                     IPCMessage::Exit => {
                         let _ = conn.write(b"Bye!").await;
                         exit(0)

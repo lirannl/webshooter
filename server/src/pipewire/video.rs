@@ -1,6 +1,5 @@
 use crate::{
-    extensions::CancellationTokenExt, get_config, logging::log, pipewire::touch::touch_task,
-    update_config,
+    extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task,
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -202,19 +201,13 @@ async fn single_capture(
             VirtualMonitor::ChildProcess(_) => SourceType::Monitor,
             VirtualMonitor::Portal => SourceType::Virtual,
         };
-        let restore_token = get_config().await.pipewire_token.take();
 
-        // select_devices is still required for the restore token flow — the
-        // token returned by start() is a RemoteDesktop session token that
-        // select_devices consumes to bypass the picker on reconnection.
-        // The Touchscreen flag is harmless: ConnectToEIS (libei) after start
-        // supersedes NotifyTouch* for actual touch injection.
+        // Select devices without a restore token — always show the portal picker
         cancel
             .r(remote_desktop.select_devices(
                 &session,
                 SelectDevicesOptions::default()
                     .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-                    .set_restore_token(restore_token.as_deref())
                     .set_persist_mode(PersistMode::ExplicitlyRevoked),
             ))
             .await?;
@@ -235,13 +228,6 @@ async fn single_capture(
             .r(remote_desktop.start(&session, None, StartOptions::default()))
             .await?
             .response()?;
-
-        // Persist the new restore token so future sessions skip the picker.
-        if let Some(token) = started.restore_token() {
-            let mut config = get_config().await;
-            config.pipewire_token = Some(token.to_string());
-            update_config(config).await?;
-        }
 
         let stream = started
             .streams()

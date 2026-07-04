@@ -25,6 +25,7 @@ use poem::{
 };
 use std::{
     env,
+    error::Error,
     io::ErrorKind,
     path::{Path, PathBuf},
     str::FromStr,
@@ -56,7 +57,7 @@ pub fn reset_app() {
 }
 
 #[tokio::main]
-pub async fn main() -> Result<()> {
+pub async fn main() -> Result<(), Box<dyn Error>> {
     let config_dir = setup_config_dir().await?;
     setup_config(&config_dir).await?;
 
@@ -70,6 +71,8 @@ pub async fn main() -> Result<()> {
         let config = get_config().await;
 
         setup_ipc(config.clone()).await?;
+
+
 
         setup_ssl_certificates(&config).await?;
 
