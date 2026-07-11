@@ -6,10 +6,16 @@
 /// destroyed when it goes out of scope.
 ///
 /// On non-Linux platforms all methods are no-ops.
-
 use anyhow::Result;
 use std::future::Future;
-use tokio::time::{sleep, Duration};
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
+#[cfg(target_os = "linux")]
+use tokio::sync::Mutex;
+use tokio::time::{Duration, sleep};
+
+#[cfg(target_os = "linux")]
+pub static PORTAL_AUTH_TOKEN: LazyLock<Mutex<Option<String>>> = Default::default();
 
 // ---------------------------------------------------------------------------
 // Feature-gated inner module
@@ -36,15 +42,13 @@ mod inner {
                 }
             };
             match kb.get_nodes() {
-                Ok(nodes) => println!(
-                    "[portal_auth] keyboard created at nodes: {:?}",
-                    nodes
-                ),
-                Err(e) => println!(
-                    "[portal_auth] keyboard created but get_nodes failed: {e:?}"
-                ),
+                Ok(nodes) => println!("[portal_auth] keyboard created at nodes: {:?}", nodes),
+                Err(e) => println!("[portal_auth] keyboard created but get_nodes failed: {e:?}"),
             }
-            Some(Self { _definition: def, kb })
+            Some(Self {
+                _definition: def,
+                kb,
+            })
         }
 
         pub fn press_key(&mut self, hid_keycode: i16) {

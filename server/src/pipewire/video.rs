@@ -2,7 +2,7 @@ use crate::{
     extensions::CancellationTokenExt,
     logging::log,
     pipewire::touch::touch_task,
-    portal_auth::{PortalAuthKb, accept_dialog},
+    portal_auth::{PORTAL_AUTH_TOKEN, PortalAuthKb, accept_dialog},
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::{
     spawn,
-    sync::{broadcast::Receiver, mpsc, Mutex as AsyncMutex},
+    sync::{Mutex as AsyncMutex, broadcast::Receiver, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -131,11 +131,6 @@ pub async fn init_portal_auth() -> Option<PortalAuthKb> {
     PortalAuthKb::new("Webshooter Portal Authorisation")
 }
 
-#[cfg(not(target_os = "linux"))]
-pub async fn init_portal_auth() -> Option<PortalAuthKb> {
-    None
-}
-
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded frames into the returned channel.
 pub async fn capture(
@@ -152,11 +147,6 @@ pub async fn capture(
     // reuses the same dimensions instead of hanging for another
     // ResizeDisplay (which was consumed on the first call).
     let mut next_size: Option<(u16, u16, u8)> = None;
-    // Session handle from the first successful start().  Passed to
-    // create_session on subsequent captures so the portal restores the
-    // permissions granted by select_devices / select_sources, skipping
-    // their dialogs (and possibly the start() dialog too).
-    let mut restore_handle: Option<String> = None;
 
     let task = spawn({
         let cancel = cancel.clone();
@@ -171,7 +161,6 @@ pub async fn capture(
                     &mut next_size,
                     &remote_desktop,
                     &screencast,
-                    &mut restore_handle,
                     &kb,
                     &decoder_caps,
                 )
@@ -193,7 +182,6 @@ async fn single_capture(
     last_dims: &mut Option<(u16, u16, u8)>,
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
-    restore_handle: &mut Option<String>,
     kb: &AsyncMutex<Option<PortalAuthKb>>,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
 ) -> Result<()> {
@@ -244,14 +232,17 @@ async fn single_capture(
             .r(remote_desktop.create_session(CreateSessionOptions::default()))
             .await?;
 
+        println!(
+            "[pipewire] portal_auth_token: {:?}",
+            PORTAL_AUTH_TOKEN.lock().await
+        );
+
         // The restore token from the previous start() lets select_devices
         // restore the same device permissions without showing a dialog.
-        let mut select_dev_opts = SelectDevicesOptions::default()
+        let select_dev_opts = SelectDevicesOptions::default()
+            .set_restore_token(PORTAL_AUTH_TOKEN.lock().await.take().as_deref())
             .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
-        if let Some(token) = restore_handle.as_deref() {
-            select_dev_opts = select_dev_opts.set_restore_token(token);
-        }
         accept_dialog(
             kb,
             cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
@@ -281,7 +272,7 @@ async fn single_capture(
         // dialog.  Source selection and start() always show dialogs.
         let token = started.restore_token();
         if let Some(token) = token {
-            *restore_handle = Some(token.to_owned());
+            *PORTAL_AUTH_TOKEN.lock().await = Some(token.to_owned());
         }
 
         let stream = started
@@ -447,8 +438,14 @@ async fn single_capture(
             }
         })
         .await?;
-        // Session, virtual_monitor, remote_desktop, screencast, pw_fd, eis_fd
-        // all dropped here.  Next loop iteration creates fresh ones.
+        // Explicitly close the portal session so the compositor releases
+        // the capture/input grants.  Drop alone does not call the D-Bus
+        // Session.Close method.
+        if let Err(e) = session.close().await {
+            println!("[video] failed to close portal session: {e:#}");
+        }
+        // virtual_monitor, remote_desktop, screencast, pw_fd, eis_fd
+        // dropped here.  Next loop iteration creates fresh ones.
 
         if last_dims.is_none() {
             return Ok(());

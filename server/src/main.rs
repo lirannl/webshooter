@@ -25,7 +25,12 @@ use poem::{
     post,
 };
 use std::{
-    env, error::Error, io::ErrorKind, path::{Path, PathBuf}, str::FromStr, sync::LazyLock,
+    env,
+    error::Error,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::LazyLock,
 };
 use tokio::{
     fs,
@@ -61,7 +66,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         #[cfg(target_os = "linux")]
-        crate::pipewire::setup_pipewire();
+        crate::pipewire::setup_pipewire().await;
 
         let config = get_config().await;
 
