@@ -1,3 +1,4 @@
+use crate::codec::Codec;
 use anyhow::Result;
 
 bitflags::bitflags! {
@@ -34,6 +35,9 @@ pub enum ClientDatagram {
     Error {
         message: String,
     },
+    DecoderCapabilities {
+        decoders: Vec<Codec>,
+    },
 }
 
 impl ClientDatagram {
@@ -66,7 +70,6 @@ impl ClientDatagram {
                 buf.extend_from_slice(&x.to_be_bytes());
                 buf.extend_from_slice(&y.to_be_bytes());
                 buf.push(*index);
-
                 buf
             }
             Self::TouchscreenRelease { index } => {
@@ -76,6 +79,15 @@ impl ClientDatagram {
                 let mut buf = Vec::with_capacity(message.len() + 1);
                 buf.push(5);
                 buf.extend_from_slice(message.as_bytes());
+                buf
+            }
+            Self::DecoderCapabilities { decoders } => {
+                let mut buf = Vec::with_capacity(2 + decoders.len());
+                buf.push(6);
+                buf.push(decoders.len() as u8);
+                for codec in decoders {
+                    buf.push(codec.to_byte());
+                }
                 buf
             }
         }
@@ -106,7 +118,6 @@ impl ClientDatagram {
                 let x = u16::from_be_bytes([bytes[1], bytes[2]]);
                 let y = u16::from_be_bytes([bytes[3], bytes[4]]);
                 let index = bytes[5];
-
                 Self::Touchscreen { x, y, index }
             }
             4 => {
@@ -116,6 +127,13 @@ impl ClientDatagram {
             5 => Self::Error {
                 message: String::from_utf8_lossy(&bytes[1..]).into_owned(),
             },
+            6 => {
+                let len = bytes[1] as usize;
+                let decoders = (0..len)
+                    .filter_map(|i| Codec::from_byte(bytes[2 + i]).ok())
+                    .collect();
+                Self::DecoderCapabilities { decoders }
+            }
             d => anyhow::bail!("Invalid datagram discriminant: {d}"),
         })
     }

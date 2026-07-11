@@ -21,7 +21,7 @@ bitflags.workspace = true
 libc.workspace = true
 async-channel.workspace = true
 bytes = { workspace = true, features = ["serde"] }
-ecdsa = { workspace = true, features = ["spki", "verifying"] }
+ecdsa = { workspace = true, features = ["spki", ] }
 futures-util.workspace = true
 data-encoding.workspace = true
 http.workspace = true

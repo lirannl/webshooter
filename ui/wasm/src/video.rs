@@ -1,5 +1,6 @@
 use crate::{log::log, with_wt};
 use shared::client_datagram::ClientDatagram;
+use shared::codec::Codec;
 use shared::server_datagram::ServerDatagram;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -51,26 +52,25 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
     let window = web_sys::window().unwrap();
     let performance = window.performance().unwrap();
 
-    // Debounced resize sender: first event immediate, then 2s cooldown
-    let last_sent = RefCell::new(None::<f64>);
+    // Debounced resize sender: 2s cooldown after initial send.
+    // Not started as None because send_initial_resize already fired before
+    // the ResizeObserver was attached — its first callback would duplicate.
+    let last_sent = RefCell::new(Some(performance.now()));
 
     let send_resize = move || -> Result<(), JsError> {
         let now = performance.now();
         let should_send = {
             let mut last = last_sent.borrow_mut();
-            match *last {
-                None => {
+            if let Some(last_time) = *last {
+                if now - last_time >= 2000.0 {
                     *last = Some(now);
                     true
+                } else {
+                    false
                 }
-                Some(last_time) => {
-                    if now - last_time >= 2000.0 {
-                        *last = Some(now);
-                        true
-                    } else {
-                        false
-                    }
-                }
+            } else {
+                *last = Some(now);
+                true
             }
         };
         if should_send {
@@ -144,6 +144,44 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
 }
 
 // ---------------------------------------------------------------------------
+// Codec capability probing
+// ---------------------------------------------------------------------------
+
+pub fn send_decoder_capabilities() -> Result<(), JsError> {
+    let decoders = probe_codecs();
+    let msg = ClientDatagram::DecoderCapabilities { decoders };
+    let bytes = msg.to_bytes();
+    let buf = js_sys::Uint8Array::from(&bytes[..]);
+    with_wt(|gwt| {
+        let _ = gwt.writer.write_with_chunk(buf.as_ref());
+    });
+    log(&format!("sent decoder capabilities"));
+    Ok(())
+}
+
+fn probe_codecs() -> Vec<Codec> {
+    // VideoDecoder.isConfigSupported is async and may not be available in
+    // all contexts.  Use MediaSource.isTypeSupported as a sync fallback.
+    let mut supported = Vec::new();
+    for codec in &Codec::ALL {
+        let codec_str = codec.web_codec_string();
+        let mime = format!("video/mp4; codecs=\"{codec_str}\"");
+        if web_sys::MediaSource::is_type_supported(&mime) {
+            supported.push(*codec);
+        }
+    }
+    // Fallback: if MediaSource is not available or returned nothing, try
+    // VideoDecoder.isConfigSupported (async) — but for simplicity, just
+    // always include AV1 and H.264 as a safe fallback.
+    if supported.is_empty() {
+        supported.push(Codec::Av1);
+        supported.push(Codec::H264);
+    }
+    log(&format!("probed codecs: {supported:?}"));
+    supported
+}
+
+// ---------------------------------------------------------------------------
 // Frame reassembly
 // ---------------------------------------------------------------------------
 
@@ -206,11 +244,8 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
         }
     };
 
-    // Configure for AV1
-    let config = js_sys::Object::new();
-    js_sys::Reflect::set(&config, &"codec".into(), &"av01.0.09M.08".into()).ok();
-    js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &JsValue::TRUE).ok();
-    decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
+    // Decoder is configured on first frame (or when codec changes).
+    let current_codec: Rc<RefCell<Option<Codec>>> = Rc::new(RefCell::new(None));
 
     let pending: Rc<RefCell<HashMap<u16, PendingFrame>>> = Rc::new(RefCell::new(HashMap::new()));
 
@@ -261,6 +296,7 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
             frag_idx,
             num_frags,
             is_keyframe,
+            codec,
             payload,
         } = msg;
 
@@ -308,6 +344,29 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
         };
 
         let (entry_is_keyframe, assembled) = assembled;
+
+        // Reconfigure the decoder if the codec changed.
+        {
+            let mut cur = current_codec.borrow_mut();
+            if *cur != Some(codec) {
+                log(&format!("codec changed: {cur:?} -> {codec:?}"));
+                let config = js_sys::Object::new();
+                js_sys::Reflect::set(
+                    &config,
+                    &"codec".into(),
+                    &codec.web_codec_string().into(),
+                )
+                .ok();
+                js_sys::Reflect::set(
+                    &config,
+                    &"optimizeForLatency".into(),
+                    &JsValue::TRUE,
+                )
+                .ok();
+                decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
+                *cur = Some(codec);
+            }
+        }
 
         let chunk_init = js_sys::Object::new();
         let chunk_type = if entry_is_keyframe {

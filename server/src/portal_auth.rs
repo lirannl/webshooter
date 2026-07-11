@@ -47,14 +47,22 @@ mod inner {
             Some(Self { _definition: def, kb })
         }
 
+        pub fn press_key(&mut self, hid_keycode: i16) {
+            println!("[portal_auth] press key 0x{hid_keycode:02X}");
+            self.kb.press_key(hid_keycode);
+        }
+
+        pub fn release_key(&mut self, hid_keycode: i16) {
+            println!("[portal_auth] release key 0x{hid_keycode:02X}");
+            self.kb.release_key(hid_keycode);
+        }
+
         pub fn press_enter(&mut self) {
-            println!("[portal_auth] press KEY_ENTER");
-            self.kb.press_key(0x0D);
+            self.press_key(0x0D_i16);
         }
 
         pub fn release_enter(&mut self) {
-            println!("[portal_auth] release KEY_ENTER");
-            self.kb.release_key(0x0D);
+            self.release_key(0x0D_i16);
         }
     }
 }
@@ -67,6 +75,10 @@ mod inner {
         pub fn new(_name: &str) -> Option<Self> {
             None
         }
+        #[allow(dead_code)]
+        pub fn press_key(&mut self, _hid_keycode: i16) {}
+        #[allow(dead_code)]
+        pub fn release_key(&mut self, _hid_keycode: i16) {}
         #[allow(dead_code)]
         pub fn press_enter(&mut self) {}
         #[allow(dead_code)]

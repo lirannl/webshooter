@@ -1,6 +1,8 @@
 use crate::{
-    extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task,
-    portal_auth::{accept_dialog, PortalAuthKb},
+    extensions::CancellationTokenExt,
+    logging::log,
+    pipewire::touch::touch_task,
+    portal_auth::{PortalAuthKb, accept_dialog},
 };
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -17,6 +19,7 @@ use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use libc;
 use shared::client_datagram::ClientDatagram;
+use shared::codec::{Codec, select_codec};
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
@@ -31,12 +34,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-// Virtual keyboard created and authorised once at application startup.
-static KB: OnceLock<AsyncMutex<Option<PortalAuthKb>>> = OnceLock::new();
-
-// Portal restore token: returned by start(), fed back to select_devices /
-// select_sources on the next capture so the portal skips the dialog.
-static RESTORE_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+// Latest decoder capabilities advertised by the client.  Read when selecting
+// the encoder in single_capture.  Written by handle_wt_connection on
+// receiving a DecoderCapabilities datagram.
+pub(crate) static DECODER_CAPS: OnceLock<Mutex<Option<Vec<Codec>>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Virtual monitor (KWin)
@@ -71,8 +72,6 @@ impl VirtualMonitor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-            // Ask the kernel to send SIGTERM to this child if the parent dies,
-            // so krfb-virtualmonitor is cleaned up even on an abrupt exit.
             unsafe {
                 cmd.pre_exec(|| {
                     libc::prctl(
@@ -112,6 +111,7 @@ impl Drop for VirtualMonitor {
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
+    pub codec: Codec,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,37 +130,54 @@ impl CaptureHandle {
     }
 }
 
-/// Initialise the portal-authorisation keyboard and grant portal permission
-/// once at application startup.  Must be called before any `capture()`.
+/// Create the virtual keyboard at startup.
 #[cfg(target_os = "linux")]
-pub async fn init_portal_auth() {
-    let mut kb = PortalAuthKb::new("Webshooter Portal Authorisation");
-    if kb.is_some() {
-        let cancel = CancellationToken::new();
-        grant_permission_once(&mut kb, &cancel).await;
-    }
-    let _ = KB.set(AsyncMutex::new(kb));
+pub async fn init_portal_auth() -> Option<PortalAuthKb> {
+    PortalAuthKb::new("Webshooter Portal Authorisation")
 }
 
 #[cfg(not(target_os = "linux"))]
-pub async fn init_portal_auth() {
-    let _ = KB.set(AsyncMutex::new(None));
+pub async fn init_portal_auth() -> Option<PortalAuthKb> {
+    None
 }
 
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
-/// start streaming encoded AV1 frames into the returned channel.
+/// start streaming encoded frames into the returned channel.
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
+    kb: Arc<AsyncMutex<Option<PortalAuthKb>>>,
 ) -> Result<(mpsc::Receiver<EncodedFrame>, CaptureHandle)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
     let cancel = CancellationToken::new();
 
+    let remote_desktop = cancel.r(RemoteDesktop::new()).await?;
+    let screencast = cancel.r(Screencast::new()).await?;
+    // Persists across single_capture calls so a pipeline failure retry
+    // reuses the same dimensions instead of hanging for another
+    // ResizeDisplay (which was consumed on the first call).
+    let mut next_size: Option<(u16, u16, u8)> = None;
+    // Session handle from the first successful start().  Passed to
+    // create_session on subsequent captures so the portal restores the
+    // permissions granted by select_devices / select_sources, skipping
+    // their dialogs (and possibly the start() dialog too).
+    let mut restore_handle: Option<String> = None;
+
     let task = spawn({
         let cancel = cancel.clone();
+        let kb = kb.clone();
         async move {
             while !cancel.is_cancelled() {
-                if let Err(e) =
-                    single_capture(&mut client_rx, frame_tx.clone(), &cancel).await
+                if let Err(e) = single_capture(
+                    &mut client_rx,
+                    frame_tx.clone(),
+                    &cancel,
+                    &mut next_size,
+                    &remote_desktop,
+                    &screencast,
+                    &mut restore_handle,
+                    &kb,
+                )
+                .await
                 {
                     log(format!("Capture error: {:#?}", e));
                 }
@@ -171,104 +188,26 @@ pub async fn capture(
     Ok((frame_rx, CaptureHandle { cancel, task }))
 }
 
-/// Do the full portal permission flow once (select_devices, select_sources,
-/// start) using the keyboard to auto-accept any dialogs.  The portal should
-/// cache the grant so future sessions skip the dialogs.
-async fn grant_permission_once(
-    kb: &mut Option<PortalAuthKb>,
-    cancel: &CancellationToken,
-) {
-    let remote_desktop = match cancel.r(RemoteDesktop::new()).await {
-        Ok(rd) => Arc::new(rd),
-        Err(e) => {
-            log(format!("grant_permission: RemoteDesktop::new failed: {e:#}"));
-            return;
-        }
-    };
-    let screencast = match cancel.r(Screencast::new()).await {
-        Ok(sc) => sc,
-        Err(e) => {
-            log(format!("grant_permission: Screencast::new failed: {e:#}"));
-            return;
-        }
-    };
-    let session = match cancel
-        .r(remote_desktop.create_session(CreateSessionOptions::default()))
-        .await
-    {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            log(format!("grant_permission: create_session failed: {e:#}"));
-            return;
-        }
-    };
-
-    let source_type = SourceType::Monitor;
-    if let Err(e) = accept_dialog(kb, cancel.r(remote_desktop.select_devices(
-        &session,
-        SelectDevicesOptions::default()
-            .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-            .set_persist_mode(PersistMode::ExplicitlyRevoked),
-    )))
-    .await
-    {
-        log(format!("grant_permission: select_devices failed: {e:#}"));
-    }
-    if let Err(e) = accept_dialog(kb, cancel.r(screencast.select_sources(
-        &session,
-        SelectSourcesOptions::default()
-            .set_multiple(true)
-            .set_sources(Some(BitFlags::from(source_type)))
-            .set_cursor_mode(CursorMode::Embedded),
-    )))
-    .await
-    {
-        log(format!("grant_permission: select_sources failed: {e:#}"));
-    }
-    if let Ok(req) = accept_dialog(kb, cancel.r(remote_desktop.start(
-        &session,
-        None,
-        StartOptions::default(),
-    )))
-    .await
-        && let Ok(started) = req.response()
-    {
-        if let Some(token) = started.restore_token() {
-            *RESTORE_TOKEN.lock().unwrap() = Some(token.to_owned());
-            println!("[video] grant_permission: stored restore_token");
-        }
-    }
-    let _ = session.close().await;
-}
-
 async fn single_capture(
     client_rx: &mut Receiver<ClientDatagram>,
     frame_tx: mpsc::Sender<EncodedFrame>,
     cancel: &CancellationToken,
+    last_dims: &mut Option<(u16, u16, u8)>,
+    remote_desktop: &RemoteDesktop,
+    screencast: &Screencast,
+    restore_handle: &mut Option<String>,
+    kb: &AsyncMutex<Option<PortalAuthKb>>,
 ) -> Result<()> {
-    // On the first iteration we wait for the initial ResizeDisplay.
-    // On resize, the new dimensions come from the previous iteration's
-    // end-of-loop wait, so we skip the inner wait.
-    let mut next_size: Option<(u16, u16, u8)> = None;
-
     loop {
-        // --- Portal / screencast setup ------------------------------------------
-        // Drive both screen capture and touch emulation from a single
-        // RemoteDesktop session so emulated touch events land on the captured
-        // stream. RemoteDesktop implements HasScreencastSession, which lets the
-        // ScreenCast portal operate on the same session. The session is shared
-        // (Arc) with the touch task spawned further down.
-        let remote_desktop = Arc::new(cancel.r(RemoteDesktop::new()).await?);
-        let screencast = cancel.r(Screencast::new()).await?;
-        let session = Arc::new(
-            cancel
-                .r(remote_desktop.create_session(CreateSessionOptions::default()))
-                .await?,
-        );
+        // --- Portal session -------------------------------------------------
+        // Create a fresh portal session each iteration. Both screencast and
+        // remote-desktop (touchscreen) share this one session.  The session
+        // is dropped at the bottom of the loop and recreated on the next
+        // iteration (which handles both resize and GPU reconnect).
 
-        // Use dimensions carried over from the previous resize, or wait for
-        // the first ResizeDisplay from the client.
-        let (width, height, index) = match next_size.take() {
+        // Use dimensions carried over from the previous resize or retry, or
+        // wait for the first ResizeDisplay from the client.
+        let (width, height, index) = match last_dims.take() {
             Some(size) => size,
             None => loop {
                 tokio::select! {
@@ -282,6 +221,9 @@ async fn single_capture(
                 }
             },
         };
+        // Stash so a pipeline-failure retry reuses the same dimensions
+        // instead of hanging for another ResizeDisplay.
+        last_dims.replace((width, height, index));
 
         let virtual_monitor = VirtualMonitor::spawn(width, height, index)?;
 
@@ -291,78 +233,93 @@ async fn single_capture(
                 .await;
         }
 
-        // When krfb-virtualmonitor owns the display it appears as a regular
-        // Monitor to the compositor. Only request a portal Virtual source when
-        // we don't have our own virtual monitor.
         let source_type = match &virtual_monitor {
             VirtualMonitor::ChildProcess(_) => SourceType::Monitor,
             VirtualMonitor::Portal => SourceType::Virtual,
         };
 
-        // Swap the previous restore_token into the portal calls so the portal
-        // can skip the selection dialogs.  After start() a fresh token is
-        // stored for the next iteration.
-        let prev_token = RESTORE_TOKEN.lock().unwrap().take();
-
-        let mut kb_guard = KB.get().expect("init_portal_auth must be called first").lock().await;
+        let mut kb_guard = kb.lock().await;
         let kb = &mut *kb_guard;
-        accept_dialog(kb, cancel.r(remote_desktop.select_devices(
-            &session,
-            SelectDevicesOptions::default()
-                .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-                .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                .set_restore_token(prev_token.as_deref()),
-        )))
+
+        let session = cancel
+            .r(remote_desktop.create_session(CreateSessionOptions::default()))
+            .await?;
+
+        // The restore token from the previous start() lets select_devices
+        // restore the same device permissions without showing a dialog.
+        let mut select_dev_opts = SelectDevicesOptions::default()
+            .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+            .set_persist_mode(PersistMode::ExplicitlyRevoked);
+        if let Some(token) = restore_handle.as_deref() {
+            select_dev_opts = select_dev_opts.set_restore_token(token);
+        }
+        accept_dialog(
+            kb,
+            cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
+        )
         .await?;
 
-        accept_dialog(kb, cancel.r(screencast.select_sources(
-            &session,
-            SelectSourcesOptions::default()
-                .set_multiple(true)
-                .set_sources(Some(BitFlags::from(source_type)))
-                .set_cursor_mode(CursorMode::Embedded)
-                .set_restore_token(prev_token.as_deref()),
-        )))
+        accept_dialog(
+            kb,
+            cancel.r(screencast.select_sources(
+                &session,
+                SelectSourcesOptions::default()
+                    .set_multiple(true)
+                    .set_sources(Some(BitFlags::from(source_type)))
+                    .set_cursor_mode(CursorMode::Embedded),
+            )),
+        )
         .await?;
 
-        // Starting the RemoteDesktop session also starts the screen cast that
-        // shares it, returning the selected devices and streams together.
         let request = accept_dialog(
             kb,
             cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
         )
         .await?;
-        drop(kb_guard);
         let started = request.response()?;
 
-        // Store the new restore_token for the next capture iteration.
-        if let Some(token) = started.restore_token() {
-            *RESTORE_TOKEN.lock().unwrap() = Some(token.to_owned());
+        // The restore token lets the next capture skip the select_devices
+        // dialog.  Source selection and start() always show dialogs.
+        let token = started.restore_token();
+        if let Some(token) = token {
+            *restore_handle = Some(token.to_owned());
         }
 
         let stream = started
             .streams()
             .iter()
             .rfind(sized_stream(&width, &height))
-            .ok_or(anyhow!("no stream"))?;
+            .ok_or(anyhow!("no stream at {width}x{height} from portal start"))?;
         let node_id = stream.pipe_wire_node_id();
-        // Offset for translating stream-relative touch coordinates into the
-        // compositor coordinate space that libei expects.
         let stream_pos = stream.position().unwrap_or((0, 0));
-        let fd = cancel
+
+        drop(kb_guard);
+
+        let pw_fd = cancel
             .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
             .await?;
-        let raw_fd = fd.into_raw_fd();
+        let raw_fd = pw_fd.into_raw_fd();
 
         // --- GStreamer pipeline --------------------------------------------------
+
+        // Pick the best codec that the client supports.
+        let decoders = DECODER_CAPS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        let codec = select_codec(&decoders);
+        println!("[video] selected codec: {codec:?} (client decoders: {decoders:?})");
 
         gst::init()?;
         let bitrate = 7000;
         let pipeline = gst::parse::launch(&format!(
             "pipewiresrc fd={raw_fd} path={node_id} \
          ! videoconvert \
-         ! vaav1enc rate-control=vbr bitrate={bitrate} target-percentage=75 \
-         ! appsink name=sink sync=false"
+         ! {encoder} rate-control=vbr bitrate={bitrate} target-percentage=75 \
+         ! appsink name=sink sync=false",
+            encoder = codec.gst_encoder_element(),
         ))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
@@ -373,9 +330,6 @@ async fn single_capture(
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("not an appsink"))?;
 
-        // Push encoded frames into the channel from the appsink callback.
-        // The closure holds the only sender; when the pipeline stops the
-        // appsink is torn down, the sender is dropped, and the channel closes.
         let tx = frame_tx.clone();
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -387,9 +341,8 @@ async fn single_capture(
                     let frame = EncodedFrame {
                         data: map.to_vec(),
                         is_keyframe,
+                        codec,
                     };
-                    // try_send so the sync callback never blocks; drop the frame if
-                    // the consumer is too slow rather than stalling the pipeline.
                     if tx.try_send(frame).is_err() {
                         return Err(gst::FlowError::Error);
                     }
@@ -398,8 +351,6 @@ async fn single_capture(
                 .build(),
         );
 
-        // Watch the bus for EOS / errors from any element.
-        // Detect GPU context loss (AMD GPU hard recovery) and signal for fast restart.
         let (pipeline_restart, mut pipeline_restart_watcher) = tokio::sync::watch::channel(());
         let pipeline_restart = Arc::new(pipeline_restart);
         {
@@ -416,7 +367,6 @@ async fn single_capture(
                                     err.error(),
                                     err.debug().unwrap_or_default()
                                 );
-                                // Detect AMD GPU context loss / hard recovery
                                 if err_str.contains("context") && err_str.contains("lost")
                                     || err_str.contains("hard recovery")
                                     || err_str.contains("context is lost")
@@ -460,19 +410,25 @@ async fn single_capture(
         // Connect to the EIS implementation for touch injection. This
         // replaces the NotifyTouch* portal calls which are a no-op on KDE
         // and many wlroots-based compositors.
-        let eis_fd = cancel
+        let eis_fd = match cancel
             .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
-            .await?;
+            .await
+        {
+            Ok(fd) => fd,
+            Err(e) => {
+                println!("[video] connect_to_eis: {e:#}, retrying in 500ms");
+                sleep(Duration::from_millis(500)).await;
+                cancel
+                    .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
+                    .await?
+            }
+        };
 
-        // Replay client touch events onto the captured stream. Touch datagrams
-        // arrive over the same broadcast channel as resize events, so we take
-        // an independent receiver and run this alongside the resize wait below.
-        // The task is tied to this session and is aborted on teardown.
         let touch_task = touch_task(eis_fd, stream_pos, client_rx, cancel);
 
-        // Wait for the next resize (or cancellation or GPU loss) before tearing down.
-        // virtual_monitor must stay alive here — dropping it kills krfb.
-        next_size = loop {
+        // Wait for the next resize (or cancellation or GPU loss) before tearing
+        // down.  virtual_monitor must stay alive here — dropping it kills krfb.
+        *last_dims = loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break None,
@@ -489,9 +445,6 @@ async fn single_capture(
             }
         };
 
-        // Tear down the current pipeline and session before starting the next
-        // one (or exiting if cancelled). The touch task borrows this session, so
-        // stop it first.
         touch_task.abort();
         tokio::task::spawn_blocking({
             let pipeline = pipeline.clone();
@@ -500,10 +453,10 @@ async fn single_capture(
             }
         })
         .await?;
-        let _ = session.close().await;
-        // virtual_monitor dropped here — kills the old krfb process.
+        // Session, virtual_monitor, remote_desktop, screencast, pw_fd, eis_fd
+        // all dropped here.  Next loop iteration creates fresh ones.
 
-        if next_size.is_none() {
+        if last_dims.is_none() {
             return Ok(());
         }
     }

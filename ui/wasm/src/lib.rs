@@ -4,6 +4,7 @@ mod video;
 
 use js_sys::Uint8Array;
 use shared::client_datagram::ClientDatagram;
+use shared::codec::Codec;
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -145,15 +146,18 @@ pub async fn start() -> Result<(), JsValue> {
         )?;
         keepalive.forget();
 
-        // 7. Canvas + video
+        // 7. Advertise decoder capabilities.
+        video::send_decoder_capabilities().unwrap_or_else(|err| log(err));
+
+        // 8. Canvas + video
         let canvas = video::setup_canvas();
         video::send_initial_resize(&canvas).unwrap_or_else(|err| log(err));
         video::setup_resize_prompt(&canvas);
 
-        // 8. Render loop
+        // 9. Render loop
         let render_loop = video::render_loop(&canvas);
 
-        // 9. Input handlers
+        // 10. Input handlers
         input::setup_keyboard(&canvas);
         input::setup_touch(&canvas);
 

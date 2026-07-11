@@ -5,14 +5,15 @@ use crate::{
     logging::log,
     pipewire::video,
 };
+use crate::portal_auth::PortalAuthKb;
 use anyhow::Result;
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram;
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{str::FromStr, sync::{Arc, Mutex}, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     spawn,
-    sync::{broadcast, mpsc::Receiver},
+    sync::{broadcast, mpsc::Receiver, Mutex as AsyncMutex},
     time::{self},
 };
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
@@ -22,10 +23,10 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint:
 // for jitter while still detecting a refresh within half a second.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
 
+
+
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
-    // Initialise the portal-authorisation keyboard and grant portal
-    // permission once, before the first client starts capturing.
-    video::init_portal_auth().await;
+    let kb = Arc::new(AsyncMutex::new(video::init_portal_auth().await));
 
     let server_config = ServerConfig::builder()
         .with_bind_default(config.http_config.port)
@@ -46,12 +47,15 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
             prev.abort();
         }
 
-        active = Some(tokio::spawn(async move {
-            match webtransport_auth(session).await {
-                Ok(connection) => handle_wt_connection(connection)
-                    .await
-                    .unwrap_or_else(|err| log(err)),
-                Err(err) => log(err),
+        active = Some(tokio::spawn({
+            let kb = kb.clone();
+            async move {
+                match webtransport_auth(session).await {
+                    Ok(connection) => handle_wt_connection(connection, kb)
+                        .await
+                        .unwrap_or_else(|err| log(err)),
+                    Err(err) => log(err),
+                }
             }
         }));
     }
@@ -87,7 +91,10 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 // Connection handler
 // ---------------------------------------------------------------------------
 
-pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
+pub async fn handle_wt_connection(
+    connection: Connection,
+    kb: Arc<AsyncMutex<Option<PortalAuthKb>>>,
+) -> Result<()> {
     let _connection = Arc::new(connection);
 
     let (_broadcaster, _client_rx) = broadcast::channel(256);
@@ -97,8 +104,15 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
     let mut client_rx = _client_rx.resubscribe();
     let logger = spawn(async move {
         loop {
-            if let Ok(ClientDatagram::Error { message }) = client_rx.recv().await {
-                log(&message);
+            match client_rx.recv().await {
+                Ok(ClientDatagram::Error { message }) => log(&message),
+                Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
+                    *video::DECODER_CAPS
+                        .get_or_init(|| Mutex::new(None))
+                        .lock()
+                        .unwrap() = Some(decoders);
+                }
+                _ => {}
             }
         }
     });
@@ -109,7 +123,7 @@ pub async fn handle_wt_connection(connection: Connection) -> Result<()> {
         // Race start_capture against connection closure so a refresh/disconnect
         // while waiting for the initial resize doesn't leave a zombie capture.
         let (frame_rx, handle) = tokio::select! {
-            r = video::capture(_client_rx.resubscribe()) => r?,
+            r = video::capture(_client_rx.resubscribe(), kb.clone()) => r?,
             _ = &mut datagrams  => { log("Datagrams closed");              break; }
             _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
@@ -201,6 +215,7 @@ fn frame_forwarder(
                     frag_idx: idx as u16,
                     num_frags,
                     is_keyframe: frame.is_keyframe && idx == 0,
+                    codec: frame.codec,
                     payload: chunk.to_vec(),
                 }
                 .to_bytes();

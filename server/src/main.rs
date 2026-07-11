@@ -1,4 +1,4 @@
-#![feature(extend_one, cfg_eval)]
+#![feature(extend_one, cfg_eval, const_default, const_trait_impl)]
 
 mod auth;
 mod config;
@@ -8,9 +8,9 @@ mod extensions;
 mod frontend;
 mod ipc;
 mod logging;
-mod portal_auth;
 #[cfg(target_os = "linux")]
 mod pipewire;
+mod portal_auth;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;
@@ -72,8 +72,6 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         let config = get_config().await;
 
         setup_ipc(config.clone()).await?;
-
-
 
         setup_ssl_certificates(&config).await?;
 
