@@ -3809,7 +3809,6 @@ dependencies = [
  "http-bytes",
  "inputtino",
  "interprocess",
- "lazy_static",
  "libc",
  "mime_guess",
  "notify",

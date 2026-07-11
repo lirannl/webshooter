@@ -2,7 +2,6 @@ use crate::config::Bytes64;
 use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
 use http::StatusCode;
-use lazy_static::lazy_static;
 use p384::{NistP384, pkcs8::DecodePublicKey};
 use poem::web::{Data, Json};
 use poem::{Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result, handler};
@@ -11,6 +10,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::{error::Elapsed, timeout};
@@ -21,9 +21,7 @@ use crate::error::WebshooterError;
 use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
 use crate::{get_config, update_config};
 
-lazy_static! {
-    pub static ref SESSIONS: Mutex<HashMap<Vec<u8>, Session>> = Mutex::default();
-}
+pub static SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::default();
 
 const CHALLENGE_SIZE: usize = 256;
 
@@ -288,10 +286,8 @@ pub async fn negotiate_wt(
 }
 
 mod onetime {
-    use std::{collections::HashSet, ops::Deref, time::Duration};
-
-    use lazy_static::lazy_static;
     use rand::{RngExt, rng};
+    use std::{collections::HashSet, ops::Deref, sync::LazyLock, time::Duration};
     use tokio::{spawn, sync::Mutex, time::sleep};
 
     use crate::{config::Bytes64, error::WebshooterError};
@@ -304,10 +300,8 @@ mod onetime {
 
     #[derive(Hash, PartialEq, Eq, Clone, Debug)]
     pub struct OnetimeToken([u8; ONETIME_LENGTH]);
-    lazy_static! {
-        static ref ONETIME_AUTHORISATIONS: Mutex<HashSet<OnetimeToken>> =
-            Mutex::new(HashSet::new());
-    }
+    static ONETIME_AUTHORISATIONS: LazyLock<Mutex<HashSet<OnetimeToken>>> = Default::default();
+
     impl OnetimeToken {
         pub async fn new() -> Self {
             let mut token = [0; ONETIME_LENGTH];

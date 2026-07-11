@@ -25,11 +25,7 @@ use poem::{
     post,
 };
 use std::{
-    env,
-    error::Error,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    str::FromStr,
+    env, error::Error, io::ErrorKind, path::{Path, PathBuf}, str::FromStr, sync::LazyLock,
 };
 use tokio::{
     fs,
@@ -46,10 +42,8 @@ use crate::{
     config_watch::watch_config,
 };
 
-lazy_static::lazy_static! {
-    pub static ref APP_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
-    pub static ref RESET_TRIGGER: Mutex<Option<Sender<()>>> = Mutex::new(None);
-}
+pub static APP_CONFIG: LazyLock<Mutex<Option<Config>>> = Default::default();
+pub static RESET_TRIGGER: LazyLock<Mutex<Option<Sender<()>>>> = Default::default();
 
 pub fn reset_app() {
     if let Some(trigger) = RESET_TRIGGER.blocking_lock().as_ref() {

@@ -101,21 +101,22 @@ pub async fn handle_wt_connection(
     let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
     let mut unistreams = broadcast_unistreams(_connection.clone(), _broadcaster.clone());
 
-    let mut client_rx = _client_rx.resubscribe();
-    let logger = spawn(async move {
-        loop {
-            match client_rx.recv().await {
-                Ok(ClientDatagram::Error { message }) => log(&message),
-                Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
-                    *video::DECODER_CAPS
-                        .get_or_init(|| Mutex::new(None))
-                        .lock()
-                        .unwrap() = Some(decoders);
+    let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
+    {
+        let mut client_rx = _client_rx.resubscribe();
+        let decoder_caps = decoder_caps.clone();
+        spawn(async move {
+            loop {
+                match client_rx.recv().await {
+                    Ok(ClientDatagram::Error { message }) => log(&message),
+                    Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
+                        *decoder_caps.lock().unwrap() = Some(decoders);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    });
+        });
+    }
 
     let mut capture_handle: Option<video::CaptureHandle> = None;
 
@@ -123,7 +124,7 @@ pub async fn handle_wt_connection(
         // Race start_capture against connection closure so a refresh/disconnect
         // while waiting for the initial resize doesn't leave a zombie capture.
         let (frame_rx, handle) = tokio::select! {
-            r = video::capture(_client_rx.resubscribe(), kb.clone()) => r?,
+            r = video::capture(_client_rx.resubscribe(), kb.clone(), decoder_caps.clone()) => r?,
             _ = &mut datagrams  => { log("Datagrams closed");              break; }
             _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
@@ -146,7 +147,6 @@ pub async fn handle_wt_connection(
         tokio::select! {
             _ = datagrams => { log("Datagrams closed"); break; }
             _ = unistreams => { log("Unidirectional streams closed");  break; }
-            _ = logger => { log("Logger closed"); break; }
             _ = keyboard_receiver => { break; }
             _ = frame_forwarder => { log("capture pipeline stopped");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }

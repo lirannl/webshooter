@@ -27,7 +27,6 @@ http = "1.4"
 http-bytes = { version = "0.1.0", default-features = false }
 interprocess = "2.4"
 js-sys = "0.3"
-lazy_static = "1.5"
 libc = "0.2"
 mime_guess = "2.0"
 notify = "8.2"

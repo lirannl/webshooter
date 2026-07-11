@@ -23,7 +23,7 @@ use shared::codec::{Codec, select_codec};
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -33,11 +33,6 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
-
-// Latest decoder capabilities advertised by the client.  Read when selecting
-// the encoder in single_capture.  Written by handle_wt_connection on
-// receiving a DecoderCapabilities datagram.
-pub(crate) static DECODER_CAPS: OnceLock<Mutex<Option<Vec<Codec>>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Virtual monitor (KWin)
@@ -146,6 +141,7 @@ pub async fn init_portal_auth() -> Option<PortalAuthKb> {
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     kb: Arc<AsyncMutex<Option<PortalAuthKb>>>,
+    decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
 ) -> Result<(mpsc::Receiver<EncodedFrame>, CaptureHandle)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
     let cancel = CancellationToken::new();
@@ -165,6 +161,7 @@ pub async fn capture(
     let task = spawn({
         let cancel = cancel.clone();
         let kb = kb.clone();
+        let decoder_caps = decoder_caps.clone();
         async move {
             while !cancel.is_cancelled() {
                 if let Err(e) = single_capture(
@@ -176,6 +173,7 @@ pub async fn capture(
                     &screencast,
                     &mut restore_handle,
                     &kb,
+                    &decoder_caps,
                 )
                 .await
                 {
@@ -197,6 +195,7 @@ async fn single_capture(
     screencast: &Screencast,
     restore_handle: &mut Option<String>,
     kb: &AsyncMutex<Option<PortalAuthKb>>,
+    decoder_caps: &Mutex<Option<Vec<Codec>>>,
 ) -> Result<()> {
     loop {
         // --- Portal session -------------------------------------------------
@@ -303,12 +302,7 @@ async fn single_capture(
         // --- GStreamer pipeline --------------------------------------------------
 
         // Pick the best codec that the client supports.
-        let decoders = DECODER_CAPS
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
+        let decoders = decoder_caps.lock().unwrap().clone().unwrap_or_default();
         let codec = select_codec(&decoders);
         println!("[video] selected codec: {codec:?} (client decoders: {decoders:?})");
 

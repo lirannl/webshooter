@@ -53,38 +53,37 @@ impl IPCConnection {
 }
 
 mod ipc_funcs {
+    use std::sync::OnceLock;
+
     use anyhow::Result;
     use async_channel::bounded;
-    use lazy_static::lazy_static;
-    use tokio::sync::Mutex;
 
     use crate::{WebshooterError, ipc::IPCMessage};
 
     use super::IPCConnection;
 
-    lazy_static! {
-        static ref _IPC: Mutex<
-            Option<(
-                async_channel::Sender<Option<(IPCMessage, IPCConnection)>>,
-                async_channel::Receiver<Option<(IPCMessage, IPCConnection)>>,
-            )>,
-        > = Mutex::new(None);
-    }
+    static IPC: OnceLock<(
+        async_channel::Sender<Option<(IPCMessage, IPCConnection)>>,
+        async_channel::Receiver<Option<(IPCMessage, IPCConnection)>>,
+    )> = Default::default();
 
     pub async fn ipc_init() -> () {
         let (tx, rx) = bounded(1);
         tx.send(None)
             .await
             .expect("Webshooter failed to initialise IPC");
-        *_IPC.lock().await = Some((tx, rx));
+        let _ = IPC.set((tx, rx));
     }
 
     pub async fn ipc_recv() -> Result<(IPCMessage, IPCConnection)> {
-        let lock = _IPC.lock().await;
-        let ipc = lock.clone();
-        drop(lock);
         loop {
-            match ipc.as_ref().unwrap().1.recv().await? {
+            match IPC
+                .get()
+                .ok_or(WebshooterError::IPCNotAvailable)?
+                .1
+                .recv()
+                .await?
+            {
                 None => {}
                 Some(recv) => break Ok(recv),
             }
@@ -93,11 +92,7 @@ mod ipc_funcs {
 
     // Always attempt to block the channel after
     pub fn ipc_send(message: IPCMessage, connection: IPCConnection) -> Result<()> {
-        let sender = _IPC
-            .try_lock()?
-            .clone()
-            .ok_or(WebshooterError::IPCNotAvailable)?
-            .0;
+        let sender = &IPC.get().ok_or(WebshooterError::IPCNotAvailable)?.0;
         sender.try_send(Some((message, connection)))?;
         let _ = sender.try_send(None);
         Ok(())

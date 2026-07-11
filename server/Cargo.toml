@@ -13,7 +13,11 @@ debug = []
 inputtino = { workspace = true }
 
 [dependencies]
-ashpd = { workspace = true, features = ["pipewire", "remote_desktop", "screencast"] }
+ashpd = { workspace = true, features = [
+    "pipewire",
+    "remote_desktop",
+    "screencast",
+] }
 rust-embed = { workspace = true, features = ["poem", "mime-guess"] }
 aes.workspace = true
 anyhow.workspace = true
@@ -21,16 +25,21 @@ bitflags.workspace = true
 libc.workspace = true
 async-channel.workspace = true
 bytes = { workspace = true, features = ["serde"] }
-ecdsa = { workspace = true, features = ["spki", ] }
+ecdsa = { workspace = true, features = ["spki"] }
 futures-util.workspace = true
 data-encoding.workspace = true
 http.workspace = true
-http-bytes = { workspace = true, default-features = false, features = ["base64"] }
-lazy_static.workspace = true
+http-bytes = { workspace = true, default-features = false, features = [
+    "base64",
+] }
 mime_guess.workspace = true
 notify.workspace = true
 p384.workspace = true
-poem = { workspace = true, features = ["rustls", "tokio-rustls", "static-files"] }
+poem = { workspace = true, features = [
+    "rustls",
+    "tokio-rustls",
+    "static-files",
+] }
 rand.workspace = true
 rcgen.workspace = true
 regex.workspace = true
