@@ -1,9 +1,18 @@
+use std::ops::Deref;
+
 use inputtino::{DeviceDefinition, Keyboard as DefinedKeyboard};
 use shared::client_datagram::Modifiers;
 
-pub struct Keyboard {
-    _definition: DeviceDefinition,
-    kb: DefinedKeyboard,
+pub struct Keyboard(DefinedKeyboard);
+
+pub const ENTER: i16 = 0x0D;
+
+impl Deref for Keyboard {
+    type Target = DefinedKeyboard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Keyboard {
@@ -21,28 +30,16 @@ impl Keyboard {
             Ok(nodes) => println!("[keyboard] keyboard created at nodes: {:?}", nodes),
             Err(e) => println!("[keyboard] keyboard created but get_nodes failed: {e:?}"),
         }
-        Some(Self {
-            _definition: def,
-            kb,
-        })
+        Some(Self(kb))
     }
 
-    pub fn press_key(&mut self, hid_keycode: i16) {
-        println!("[keyboard] press key 0x{hid_keycode:02X}");
-        self.kb.press_key(hid_keycode);
-    }
-
-    pub fn release_key(&mut self, hid_keycode: i16) {
-        println!("[keyboard] release key 0x{hid_keycode:02X}");
-        self.kb.release_key(hid_keycode);
-    }
 
     pub fn press_enter(&mut self) {
-        self.press_key(0x0D);
+        self.press_key(ENTER);
     }
 
     pub fn release_enter(&mut self) {
-        self.release_key(0x0D);
+        self.release_key(ENTER);
     }
 
     pub fn handle_key_event(&mut self, keycode: &str, modifiers: Modifiers) {
@@ -53,14 +50,14 @@ impl Keyboard {
 
         let modifier_keys = modifier_vks(modifiers);
         for &m in &modifier_keys {
-            self.kb.press_key(m);
+            self.press_key(m);
         }
 
-        self.kb.press_key(vk);
-        self.kb.release_key(vk);
+        self.press_key(vk);
+        self.release_key(vk);
 
         for &m in modifier_keys.iter().rev() {
-            self.kb.release_key(m);
+            self.release_key(m);
         }
     }
 }
@@ -120,7 +117,7 @@ fn js_keycode_to_vk(code: &str) -> Option<i16> {
         "Digit7" => 0x37,
         "Digit8" => 0x38,
         "Digit9" => 0x39,
-        "Enter" => 0x0D,
+        "Enter" => ENTER,
         "Escape" => 0x1B,
         "Backspace" => 0x08,
         "Tab" => 0x09,

@@ -12,6 +12,7 @@ use crate::{
     pipewire::portal_auth::{get_portal_token, set_portal_token},
 };
 
+mod eis_keyboard;
 mod portal_auth;
 pub mod touch;
 pub mod video;
@@ -37,7 +38,9 @@ async fn create_auth_token() -> Result<String, anyhow::Error> {
         .await?;
 
     let select_opts = SelectDevicesOptions::default()
-        .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+        .set_devices(Some(BitFlags::from(
+            DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
+        )))
         .set_restore_token(get_portal_token().await.as_deref())
         .set_persist_mode(PersistMode::ExplicitlyRevoked);
 

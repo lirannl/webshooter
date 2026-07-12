@@ -140,7 +140,6 @@ pub async fn capture(
     // reuses the same dimensions instead of hanging for another
     // ResizeDisplay (which was consumed on the first call).
     let mut next_size: Option<(u16, u16, u8)> = None;
-    let mut kb: Option<Keyboard> = None;
 
     let task = spawn({
         let cancel = cancel.clone();
@@ -154,7 +153,6 @@ pub async fn capture(
                     &mut next_size,
                     &remote_desktop,
                     &screencast,
-                    &mut kb,
                     &decoder_caps,
                 )
                 .await
@@ -175,7 +173,6 @@ async fn single_capture(
     last_dims: &mut Option<(u16, u16, u8)>,
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
-    kb: &mut Option<Keyboard>,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
 ) -> Result<()> {
     loop {
@@ -230,7 +227,9 @@ async fn single_capture(
         // restore the same device permissions without showing a dialog.
         let select_dev_opts = SelectDevicesOptions::default()
             .set_restore_token(get_portal_token().await.as_deref())
-            .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
+            .set_devices(Some(BitFlags::from(
+                DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
+            )))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
         accept_dialog(
             &mut portal_kb,
@@ -413,13 +412,8 @@ async fn single_capture(
                 msg = client_rx.recv() => match msg {
                     Ok(ClientDatagram::ResizeDisplay { width, height, .. }) =>
                         break Some((width, height, index)),
-                    Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
-                        if kb.is_none() {
-                            *kb = Keyboard::new("Webshooter Keyboard");
-                        }
-                        if let Some(kb) = kb.as_mut() {
-                            kb.handle_key_event(&keycode, modifiers);
-                        }
+                    Ok(ClientDatagram::Keyboard { keycode: _, modifiers: _ }) => {
+                        // Handled by the EIS input task in touch.rs
                     }
                     Ok(_) => continue,
                     Err(_) => break None,
