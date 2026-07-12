@@ -1,9 +1,13 @@
+use std::time::Duration;
+
 use reis::ei;
 use reis::event as reis_event;
 
 use shared::client_datagram::Modifiers;
 
-use super::touch::timestamp_us;
+use crate::logging::log;
+
+use super::eis::timestamp_us;
 
 // ---------------------------------------------------------------------------
 // Linux input event key codes (linux/input-event-codes.h)
@@ -125,21 +129,6 @@ pub const KEY_KPDOT: u32 = 83;
 // ---------------------------------------------------------------------------
 // Modifier helpers
 // ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-fn is_modifier_keycode(key: u32) -> bool {
-    matches!(
-        key,
-        KEY_LEFTCTRL
-            | KEY_RIGHTCTRL
-            | KEY_LEFTSHIFT
-            | KEY_RIGHTSHIFT
-            | KEY_LEFTALT
-            | KEY_RIGHTALT
-            | KEY_LEFTMETA
-            | KEY_RIGHTMETA
-    )
-}
 
 /// Return the (left) modifier keycodes for the given modifier flags,
 /// in a stable order: Ctrl, Shift, Alt, Meta.
@@ -360,5 +349,72 @@ pub fn send_keyboard_key(
 
     if let Err(e) = connection.flush() {
         crate::logging::log(format!("EIS: keyboard flush error: {e}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard state — owns modifier tracking and timeout
+// ---------------------------------------------------------------------------
+
+/// Modifier keycodes that the browser sends but should not be forwarded as
+/// standalone key events (modifier state is managed by [`ModifierState`]).
+fn is_modifier_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ShiftLeft" | "ShiftRight"
+            | "ControlLeft" | "ControlRight"
+            | "AltLeft" | "AltRight"
+            | "MetaLeft" | "MetaRight"
+    )
+}
+
+pub struct KeyboardState {
+    mod_state: ModifierState,
+    mod_timeout: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl KeyboardState {
+    pub fn new() -> Self {
+        let mut mod_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(1)));
+        mod_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+        Self {
+            mod_state: ModifierState::new(),
+            mod_timeout,
+        }
+    }
+
+    /// Process a keyboard event from the browser. Returns the EIS events
+    /// that should be sent (modifier sync + key press/release).
+    pub fn handle_event(&mut self, keycode: &str, modifiers: Modifiers) -> Vec<EisKeyboardEvent> {
+        let mut events = self.mod_state.sync(modifiers);
+
+        if is_modifier_code(keycode) {
+            // Modifier keys are handled by ModifierState; ignore them here.
+        } else if let Some(key) = js_keycode_to_eis_key(keycode) {
+            events.push(EisKeyboardEvent { key, press: true });
+            events.push(EisKeyboardEvent { key, press: false });
+        } else {
+            log(format!("EIS keyboard: unmapped keycode: {keycode}"));
+        }
+
+        events
+    }
+
+    /// Returns a future that resolves when the modifier timeout fires
+    /// (no keyboard event received for 1 s).
+    pub async fn timeout_fired(&mut self) {
+        (&mut self.mod_timeout).await;
+    }
+
+    /// Reset the modifier timeout after a keyboard event arrives.
+    pub fn reset_timeout(&mut self) {
+        self.mod_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(1));
+    }
+
+    /// Release all currently held modifiers.
+    pub fn release_all_modifiers(&mut self) -> Vec<EisKeyboardEvent> {
+        self.mod_state.release_all()
     }
 }

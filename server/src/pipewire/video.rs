@@ -1,6 +1,6 @@
 use crate::keyboard::Keyboard;
 use crate::pipewire::portal_auth::{accept_dialog, get_portal_token, set_portal_token};
-use crate::{extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task};
+use crate::{extensions::CancellationTokenExt, logging::log, pipewire::eis::eis_task};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -397,7 +397,7 @@ async fn single_capture(
             }
         };
 
-        let touch_task = touch_task(eis_fd, stream_pos, client_rx, cancel);
+        let touch_task = eis_task(eis_fd, stream_pos, client_rx, cancel);
 
         // Wait for the next resize (or cancellation or GPU loss) before tearing
         // down.  virtual_monitor must stay alive here — dropping it kills krfb.

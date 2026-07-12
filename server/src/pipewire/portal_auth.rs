@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, sleep};
 
 use crate::config::CONFIG_DIR;
-use crate::keyboard::Keyboard;
+use crate::keyboard::{self, Keyboard};
 
 static PORTAL_TOKEN_FILE: LazyLock<PathBuf> =
     LazyLock::new(|| CONFIG_DIR.get().unwrap().join("portal_token"));
@@ -66,9 +66,9 @@ pub async fn accept_dialog<T>(
 
     println!("[portal_auth] pressing Enter once");
     if let Some(k) = kb.as_mut() {
-        k.press_enter();
+        k.press_key(keyboard::ENTER);
         sleep(Duration::from_millis(50)).await;
-        k.release_enter();
+        k.release_key(keyboard::ENTER);
     }
 
     let result = portal_fut.await;

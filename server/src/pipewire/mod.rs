@@ -12,6 +12,7 @@ use crate::{
     pipewire::portal_auth::{get_portal_token, set_portal_token},
 };
 
+mod eis;
 mod eis_keyboard;
 mod portal_auth;
 pub mod touch;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["server", "shared", "ui/wasm"]
+members = ["server", "shared", "webui/wasm"]
 default-members = ["server"]
 
 [workspace.package]
