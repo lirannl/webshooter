@@ -127,22 +127,9 @@ pub async fn handle_wt_connection(
         capture_handle = Some(handle);
         let frame_forwarder = frame_forwarder(frame_rx, _connection.clone());
 
-        let mut client_rx = _client_rx.resubscribe();
-        let keyboard_receiver = spawn(async move {
-            loop {
-                match client_rx.recv().await {
-                    Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
-                        log(format!("keycode: {keycode}, modifiers: {modifiers:?}"));
-                    }
-                    _ => {}
-                }
-            }
-        });
-
         tokio::select! {
             _ = datagrams => { log("Datagrams closed"); break; }
             _ = unistreams => { log("Unidirectional streams closed");  break; }
-            _ = keyboard_receiver => { break; }
             _ = frame_forwarder => { log("capture pipeline stopped");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
         }

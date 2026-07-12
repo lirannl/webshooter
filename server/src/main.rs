@@ -65,12 +65,12 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     RESET_TRIGGER.lock().await.replace(tx);
 
     loop {
-        #[cfg(target_os = "linux")]
-        crate::pipewire::setup_pipewire().await;
-
         let config = get_config().await;
 
         setup_ipc(config.clone()).await?;
+
+        #[cfg(target_os = "linux")]
+        crate::pipewire::setup_pipewire().await;
 
         setup_ssl_certificates(&config).await?;
 

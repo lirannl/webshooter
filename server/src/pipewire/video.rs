@@ -139,6 +139,7 @@ pub async fn capture(
     // reuses the same dimensions instead of hanging for another
     // ResizeDisplay (which was consumed on the first call).
     let mut next_size: Option<(u16, u16, u8)> = None;
+    let mut kb: Option<Keyboard> = None;
 
     let task = spawn({
         let cancel = cancel.clone();
@@ -152,6 +153,7 @@ pub async fn capture(
                     &mut next_size,
                     &remote_desktop,
                     &screencast,
+                    &mut kb,
                     &decoder_caps,
                 )
                 .await
@@ -172,6 +174,7 @@ async fn single_capture(
     last_dims: &mut Option<(u16, u16, u8)>,
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
+    kb: &mut Option<Keyboard>,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
 ) -> Result<()> {
     loop {
@@ -214,7 +217,9 @@ async fn single_capture(
             VirtualMonitor::Portal => SourceType::Virtual,
         };
 
-        let mut kb = Keyboard::new("Webshooter Portal Authorisation");
+        // A short-lived keyboard just for auto-confirming portal dialogs.
+        // Dropped once the portal session is established.
+        let mut portal_kb = Keyboard::new("Webshooter Portal Authorisation");
 
         let session = cancel
             .r(remote_desktop.create_session(CreateSessionOptions::default()))
@@ -232,13 +237,13 @@ async fn single_capture(
             .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
         accept_dialog(
-            &mut kb,
+            &mut portal_kb,
             cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
         )
         .await?;
 
         accept_dialog(
-            &mut kb,
+            &mut portal_kb,
             cancel.r(screencast.select_sources(
                 &session,
                 SelectSourcesOptions::default()
@@ -250,11 +255,13 @@ async fn single_capture(
         .await?;
 
         let request = accept_dialog(
-            &mut kb,
+            &mut portal_kb,
             cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
         )
         .await?;
         let started = request.response()?;
+
+        drop(portal_kb);
 
         // The restore token lets the next capture skip the select_devices
         // dialog.  Source selection and start() always show dialogs.
@@ -270,8 +277,6 @@ async fn single_capture(
             .ok_or(anyhow!("no stream at {width}x{height} from portal start"))?;
         let node_id = stream.pipe_wire_node_id();
         let stream_pos = stream.position().unwrap_or((0, 0));
-
-        drop(kb);
 
         let pw_fd = cancel
             .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
@@ -412,6 +417,14 @@ async fn single_capture(
                 msg = client_rx.recv() => match msg {
                     Ok(ClientDatagram::ResizeDisplay { width, height, .. }) =>
                         break Some((width, height, index)),
+                    Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
+                        if kb.is_none() {
+                            *kb = Keyboard::new("Webshooter Keyboard");
+                        }
+                        if let Some(kb) = kb.as_mut() {
+                            kb.handle_key_event(&keycode, modifiers);
+                        }
+                    }
                     Ok(_) => continue,
                     Err(_) => break None,
                 },
