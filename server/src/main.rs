@@ -7,10 +7,10 @@ mod error;
 mod extensions;
 mod frontend;
 mod ipc;
+mod keyboard;
 mod logging;
 #[cfg(target_os = "linux")]
 mod pipewire;
-mod portal_auth;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;

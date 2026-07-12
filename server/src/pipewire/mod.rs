@@ -1,4 +1,3 @@
-use crate::portal_auth::{PORTAL_AUTH_TOKEN, PortalAuthKb, accept_dialog};
 use anyhow::anyhow;
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -6,7 +5,11 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use ashpd::enumflags2::BitFlags;
+use portal_auth::{PORTAL_AUTH_TOKEN, accept_dialog};
 
+use crate::keyboard::Keyboard;
+
+mod portal_auth;
 pub mod touch;
 pub mod video;
 
@@ -23,7 +26,7 @@ pub async fn setup_pipewire() {
 }
 
 async fn create_auth_token() -> Result<String, anyhow::Error> {
-    let mut kb = PortalAuthKb::new("Webshooter Auth Token");
+    let mut kb = Keyboard::new("Webshooter Auth Token");
 
     let remote_desktop = RemoteDesktop::new().await?;
 
@@ -51,7 +54,9 @@ async fn create_auth_token() -> Result<String, anyhow::Error> {
                 &session,
                 SelectSourcesOptions::default()
                     .set_multiple(true)
-                    .set_sources(Some(BitFlags::from_flag(SourceType::Virtual) | SourceType::Monitor))
+                    .set_sources(Some(
+                        BitFlags::from_flag(SourceType::Virtual) | SourceType::Monitor,
+                    ))
                     .set_cursor_mode(CursorMode::Embedded),
             )
             .await

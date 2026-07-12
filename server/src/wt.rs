@@ -5,15 +5,18 @@ use crate::{
     logging::log,
     pipewire::video,
 };
-use crate::portal_auth::PortalAuthKb;
 use anyhow::Result;
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram;
-use std::{str::FromStr, sync::{Arc, Mutex}, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     io::AsyncReadExt,
     spawn,
-    sync::{broadcast, mpsc::Receiver, Mutex as AsyncMutex},
+    sync::{broadcast, mpsc::Receiver},
     time::{self},
 };
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
@@ -23,11 +26,7 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint:
 // for jitter while still detecting a refresh within half a second.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
 
-
-
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
-    let kb = Arc::new(AsyncMutex::new(video::init_portal_auth().await));
-
     let server_config = ServerConfig::builder()
         .with_bind_default(config.http_config.port)
         .with_identity(identity)
@@ -47,15 +46,12 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
             prev.abort();
         }
 
-        active = Some(tokio::spawn({
-            let kb = kb.clone();
-            async move {
-                match webtransport_auth(session).await {
-                    Ok(connection) => handle_wt_connection(connection, kb)
-                        .await
-                        .unwrap_or_else(|err| log(err)),
-                    Err(err) => log(err),
-                }
+        active = Some(tokio::spawn(async move {
+            match webtransport_auth(session).await {
+                Ok(connection) => handle_wt_connection(connection)
+                    .await
+                    .unwrap_or_else(|err| log(err)),
+                Err(err) => log(err),
             }
         }));
     }
@@ -93,7 +89,6 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 
 pub async fn handle_wt_connection(
     connection: Connection,
-    kb: Arc<AsyncMutex<Option<PortalAuthKb>>>,
 ) -> Result<()> {
     let _connection = Arc::new(connection);
 
@@ -124,7 +119,7 @@ pub async fn handle_wt_connection(
         // Race start_capture against connection closure so a refresh/disconnect
         // while waiting for the initial resize doesn't leave a zombie capture.
         let (frame_rx, handle) = tokio::select! {
-            r = video::capture(_client_rx.resubscribe(), kb.clone(), decoder_caps.clone()) => r?,
+            r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r?,
             _ = &mut datagrams  => { log("Datagrams closed");              break; }
             _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }

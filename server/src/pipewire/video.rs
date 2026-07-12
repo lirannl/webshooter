@@ -1,9 +1,6 @@
-use crate::{
-    extensions::CancellationTokenExt,
-    logging::log,
-    pipewire::touch::touch_task,
-    portal_auth::{PORTAL_AUTH_TOKEN, PortalAuthKb, accept_dialog},
-};
+use crate::keyboard::Keyboard;
+use crate::pipewire::portal_auth::{PORTAL_AUTH_TOKEN, accept_dialog};
+use crate::{extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -28,7 +25,7 @@ use std::{
 };
 use tokio::{
     spawn,
-    sync::{Mutex as AsyncMutex, broadcast::Receiver, mpsc},
+    sync::{broadcast::Receiver, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -127,15 +124,10 @@ impl CaptureHandle {
 
 /// Create the virtual keyboard at startup.
 #[cfg(target_os = "linux")]
-pub async fn init_portal_auth() -> Option<PortalAuthKb> {
-    PortalAuthKb::new("Webshooter Portal Authorisation")
-}
-
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded frames into the returned channel.
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
-    kb: Arc<AsyncMutex<Option<PortalAuthKb>>>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
 ) -> Result<(mpsc::Receiver<EncodedFrame>, CaptureHandle)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
@@ -150,7 +142,6 @@ pub async fn capture(
 
     let task = spawn({
         let cancel = cancel.clone();
-        let kb = kb.clone();
         let decoder_caps = decoder_caps.clone();
         async move {
             while !cancel.is_cancelled() {
@@ -161,7 +152,6 @@ pub async fn capture(
                     &mut next_size,
                     &remote_desktop,
                     &screencast,
-                    &kb,
                     &decoder_caps,
                 )
                 .await
@@ -182,7 +172,6 @@ async fn single_capture(
     last_dims: &mut Option<(u16, u16, u8)>,
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
-    kb: &AsyncMutex<Option<PortalAuthKb>>,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
 ) -> Result<()> {
     loop {
@@ -225,8 +214,7 @@ async fn single_capture(
             VirtualMonitor::Portal => SourceType::Virtual,
         };
 
-        let mut kb_guard = kb.lock().await;
-        let kb = &mut *kb_guard;
+        let mut kb = Keyboard::new("Webshooter Portal Authorisation");
 
         let session = cancel
             .r(remote_desktop.create_session(CreateSessionOptions::default()))
@@ -244,13 +232,13 @@ async fn single_capture(
             .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
         accept_dialog(
-            kb,
+            &mut kb,
             cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
         )
         .await?;
 
         accept_dialog(
-            kb,
+            &mut kb,
             cancel.r(screencast.select_sources(
                 &session,
                 SelectSourcesOptions::default()
@@ -262,7 +250,7 @@ async fn single_capture(
         .await?;
 
         let request = accept_dialog(
-            kb,
+            &mut kb,
             cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
         )
         .await?;
@@ -283,7 +271,7 @@ async fn single_capture(
         let node_id = stream.pipe_wire_node_id();
         let stream_pos = stream.position().unwrap_or((0, 0));
 
-        drop(kb_guard);
+        drop(kb);
 
         let pw_fd = cancel
             .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
