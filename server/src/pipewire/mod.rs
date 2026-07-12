@@ -5,9 +5,12 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use ashpd::enumflags2::BitFlags;
-use portal_auth::{PORTAL_AUTH_TOKEN, accept_dialog};
+use portal_auth::accept_dialog;
 
-use crate::keyboard::Keyboard;
+use crate::{
+    keyboard::Keyboard,
+    pipewire::portal_auth::{get_portal_token, set_portal_token},
+};
 
 mod portal_auth;
 pub mod touch;
@@ -16,11 +19,10 @@ pub mod video;
 pub async fn setup_pipewire() {
     pipewire::init();
 
-    *PORTAL_AUTH_TOKEN.lock().await = match create_auth_token().await {
-        Ok(string) => Some(string),
+    match create_auth_token().await {
+        Ok(string) => set_portal_token(string).await,
         Err(err) => {
             eprintln!("{err:#?}");
-            None
         }
     };
 }
@@ -36,7 +38,8 @@ async fn create_auth_token() -> Result<String, anyhow::Error> {
 
     let select_opts = SelectDevicesOptions::default()
         .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
-        .set_persist_mode(PersistMode::Application);
+        .set_restore_token(get_portal_token().await.as_deref())
+        .set_persist_mode(PersistMode::ExplicitlyRevoked);
 
     accept_dialog(&mut kb, async {
         remote_desktop

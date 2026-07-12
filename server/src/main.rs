@@ -44,6 +44,7 @@ use wtransport::Identity;
 
 use crate::{
     auth::{Authenticated, check_identity, get_challenge, login},
+    config::CONFIG_DIR,
     config_watch::watch_config,
 };
 
@@ -58,8 +59,8 @@ pub fn reset_app() {
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
-    let config_dir = setup_config_dir().await?;
-    setup_config(&config_dir).await?;
+    let _ = CONFIG_DIR.set(setup_config_dir().await?);
+    setup_config(CONFIG_DIR.get().unwrap()).await?;
 
     let (tx, mut rx) = mpsc::channel::<()>(1);
     RESET_TRIGGER.lock().await.replace(tx);

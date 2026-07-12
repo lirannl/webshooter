@@ -4,20 +4,32 @@
 /// Create a single `PortalAuthKb` at the start of the capture session,
 /// then call `accept_dialog` for each portal dialog.  The keyboard is
 /// destroyed when it goes out of scope.
-///
-/// On non-Linux platforms all methods are no-ops.
 use anyhow::Result;
 use std::future::Future;
-#[cfg(target_os = "linux")]
+use std::ops::Deref;
+use std::path::PathBuf;
 use std::sync::LazyLock;
-#[cfg(target_os = "linux")]
-use tokio::sync::Mutex;
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, sleep};
 
+use crate::config::CONFIG_DIR;
 use crate::keyboard::Keyboard;
 
-#[cfg(target_os = "linux")]
-pub static PORTAL_AUTH_TOKEN: LazyLock<Mutex<Option<String>>> = Default::default();
+static PORTAL_TOKEN_FILE: LazyLock<PathBuf> =
+    LazyLock::new(|| CONFIG_DIR.get().unwrap().join("portal_token"));
+
+pub async fn set_portal_token(token: String) {
+    if let Ok(mut file) = File::create(PORTAL_TOKEN_FILE.deref()).await {
+        let _ = file.write_all(token.as_bytes()).await;
+    }
+}
+pub async fn get_portal_token() -> Option<String> {
+    let file = File::open(PORTAL_TOKEN_FILE.deref()).await.ok()?;
+    let mut string = String::default();
+    let _ = BufReader::new(file).read_to_string(&mut string).await;
+    Some(string)
+}
 
 // ---------------------------------------------------------------------------
 // Auto-accept helper

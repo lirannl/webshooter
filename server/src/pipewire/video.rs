@@ -1,5 +1,5 @@
 use crate::keyboard::Keyboard;
-use crate::pipewire::portal_auth::{PORTAL_AUTH_TOKEN, accept_dialog};
+use crate::pipewire::portal_auth::{accept_dialog, get_portal_token, set_portal_token};
 use crate::{extensions::CancellationTokenExt, logging::log, pipewire::touch::touch_task};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -17,6 +17,7 @@ use gstreamer_app as gst_app;
 use libc;
 use shared::client_datagram::ClientDatagram;
 use shared::codec::{Codec, select_codec};
+use std::fs::File;
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
@@ -225,15 +226,10 @@ async fn single_capture(
             .r(remote_desktop.create_session(CreateSessionOptions::default()))
             .await?;
 
-        println!(
-            "[pipewire] portal_auth_token: {:?}",
-            PORTAL_AUTH_TOKEN.lock().await
-        );
-
         // The restore token from the previous start() lets select_devices
         // restore the same device permissions without showing a dialog.
         let select_dev_opts = SelectDevicesOptions::default()
-            .set_restore_token(PORTAL_AUTH_TOKEN.lock().await.take().as_deref())
+            .set_restore_token(get_portal_token().await.as_deref())
             .set_devices(Some(BitFlags::from(DeviceType::Touchscreen)))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
         accept_dialog(
@@ -267,7 +263,7 @@ async fn single_capture(
         // dialog.  Source selection and start() always show dialogs.
         let token = started.restore_token();
         if let Some(token) = token {
-            *PORTAL_AUTH_TOKEN.lock().await = Some(token.to_owned());
+            set_portal_token(token.to_owned()).await;
         }
 
         let stream = started

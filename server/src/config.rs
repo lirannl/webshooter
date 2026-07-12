@@ -8,7 +8,10 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::OnceLock,
 };
+
+pub static CONFIG_DIR: OnceLock<PathBuf> = Default::default();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SslConfig {
