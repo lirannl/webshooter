@@ -23,7 +23,7 @@ pub fn setup_canvas() -> HtmlCanvasElement {
         .dyn_into::<HtmlCanvasElement>()
         .unwrap();
     canvas.style().set_css_text(
-        "position:fixed;inset:0;width:100%;height:100%;background:#000;cursor:pointer;",
+        "position:fixed;inset:0;width:100%;height:100%;background:#000;cursor:pointer;outline:none;",
     );
     document.body().unwrap().append_child(&canvas).unwrap();
     canvas
