@@ -1,6 +1,8 @@
 #![feature(extend_one, cfg_eval, const_default, const_trait_impl)]
 
 mod auth;
+#[cfg(target_os = "linux")]
+mod compositor_discovery;
 mod config;
 mod config_watch;
 mod error;
@@ -44,6 +46,9 @@ use wtransport::Identity;
 
 use crate::{
     auth::{Authenticated, check_identity, get_challenge, login},
+    compositor_discovery::{
+        ensure_wayland_display, ensure_xdg_current_desktop, ensure_xdg_runtime_dir,
+    },
     config::CONFIG_DIR,
     config_watch::watch_config,
 };
@@ -59,6 +64,24 @@ pub fn reset_app() {
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        ensure_xdg_runtime_dir()?;
+        ensure_wayland_display()?;
+        ensure_xdg_current_desktop()?;
+
+        // On Linux a desktop environment is required to choose the capture path;
+        // if we still couldn't determine one, refuse to launch.
+        if env::var_os("XDG_CURRENT_DESKTOP").is_none() {
+            eprintln!(
+                "error: XDG_CURRENT_DESKTOP could not be determined. A graphical \
+             desktop session is required to capture (set XDG_CURRENT_DESKTOP, \
+             e.g. KDE/GNOME/sway, or log in graphically)."
+            );
+            std::process::exit(1);
+        }
+    }
+
     let _ = CONFIG_DIR.set(setup_config_dir().await?);
     setup_config(CONFIG_DIR.get().unwrap()).await?;
 
