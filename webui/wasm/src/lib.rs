@@ -1,3 +1,4 @@
+mod gamepad;
 mod input;
 mod log;
 mod video;
@@ -162,6 +163,7 @@ pub async fn start() -> Result<(), JsValue> {
         // 10. Input handlers
         input::setup_keyboard(&canvas);
         input::setup_touch(&canvas);
+        gamepad::setup_gamepad();
         input::setup_mouse(&canvas, release_flag);
 
         // 10. Wait for render loop to finish (signals connection closed).

@@ -15,6 +15,7 @@ use shared::client_datagram::ClientDatagram;
 use shared::server_datagram::ServerDatagram;
 
 use super::eis_keyboard::{EisKeyboardEvent, KeyboardState, send_keyboard_key};
+use super::gamepad::GamepadManager;
 use super::pointer::{
     EisButtonEvent, EisPointerEvent, EisScrollEvent, MouseState, send_button_event,
     send_pointer_motion, send_scroll_event, web_button_to_linux,
@@ -72,6 +73,7 @@ pub fn eis_task(
             let mut touch_state = TouchState::new();
             let mut keyboard_state = KeyboardState::new();
             let mut mouse_state = MouseState::new();
+            let mut gamepad_state = GamepadManager::new();
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -136,6 +138,22 @@ pub fn eis_task(
                         let _ = input_tx.send(EisInputEvent::Scroll(
                             EisScrollEvent::Scroll { dx, dy },
                         )).await;
+                    }
+                    Ok(ClientDatagram::Gamepad {
+                        id,
+                        buttons,
+                        lx,
+                        ly,
+                        rx,
+                        ry,
+                        lt,
+                        rt,
+                        motion,
+                    }) => {
+                        gamepad_state.update(id, buttons, lx, ly, rx, ry, lt, rt, motion);
+                    }
+                    Ok(ClientDatagram::GamepadDisconnect { id }) => {
+                        gamepad_state.remove(id);
                     }
                     Ok(_) => continue,
                     Err(_) => break,

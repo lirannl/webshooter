@@ -14,6 +14,7 @@ use crate::{
 
 mod eis;
 mod eis_keyboard;
+pub(crate) mod gamepad;
 pub(crate) mod pointer;
 mod portal_auth;
 pub mod touch;
