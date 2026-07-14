@@ -26,7 +26,7 @@ pub static SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::defau
 const CHALLENGE_SIZE: usize = 256;
 
 const COOKIE_SIZE: usize = 1024;
-const COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const COOKIE_TTL: Duration = Duration::from_hours(24);
 
 struct Identity(Bytes64);
 
@@ -119,11 +119,10 @@ struct RateLimitEntry {
     window_start: Instant,
 }
 
-static RATE_LIMITS: LazyLock<Mutex<HashMap<std::net::IpAddr, RateLimitEntry>>> =
-    Default::default();
+static RATE_LIMITS: LazyLock<Mutex<HashMap<std::net::IpAddr, RateLimitEntry>>> = Default::default();
 
-fn check_rate_limit(ip: std::net::IpAddr, max_attempts: u32) -> bool {
-    let mut limits = RATE_LIMITS.blocking_lock();
+async fn check_rate_limit(ip: std::net::IpAddr, max_attempts: u32) -> bool {
+    let mut limits = RATE_LIMITS.lock().await;
     let now = Instant::now();
     if let Some(entry) = limits.get_mut(&ip) {
         if now.duration_since(entry.window_start) > RATE_LIMIT_WINDOW {
@@ -136,8 +135,8 @@ fn check_rate_limit(ip: std::net::IpAddr, max_attempts: u32) -> bool {
     }
 }
 
-fn record_rate_limit_failure(ip: std::net::IpAddr) {
-    let mut limits = RATE_LIMITS.blocking_lock();
+async fn record_rate_limit_failure(ip: std::net::IpAddr) {
+    let mut limits = RATE_LIMITS.lock().await;
     let now = Instant::now();
     if let Some(entry) = limits.get_mut(&ip) {
         if now.duration_since(entry.window_start) > RATE_LIMIT_WINDOW {
@@ -156,8 +155,8 @@ fn record_rate_limit_failure(ip: std::net::IpAddr) {
     }
 }
 
-fn reset_rate_limit(ip: std::net::IpAddr) {
-    RATE_LIMITS.blocking_lock().remove(&ip);
+async fn reset_rate_limit(ip: std::net::IpAddr) {
+    RATE_LIMITS.lock().await.remove(&ip);
 }
 
 fn client_ip(req: &Request) -> std::net::IpAddr {
@@ -189,13 +188,10 @@ fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
 }
 
 #[handler]
-pub async fn login(
-    req: &Request,
-    Json(params): Json<LoginParams>,
-) -> Result<impl IntoResponse> {
+pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<impl IntoResponse> {
     let ip = client_ip(req);
     let rate_limit = get_config().await.rate_limit.unwrap_or(10);
-    if !check_rate_limit(ip, rate_limit) {
+    if !check_rate_limit(ip, rate_limit).await {
         return Err(Error::from_string(
             "Rate limit exceeded",
             StatusCode::TOO_MANY_REQUESTS,
@@ -204,7 +200,7 @@ pub async fn login(
 
     match login_inner(params).await {
         Ok(cookie) => {
-            reset_rate_limit(ip);
+            reset_rate_limit(ip).await;
             Ok(Response::builder()
                 .header(
                     "set-cookie",
@@ -218,7 +214,7 @@ pub async fn login(
         Err(err) => {
             let status = err.status();
             let msg = err.to_string();
-            record_rate_limit_failure(ip);
+            record_rate_limit_failure(ip).await;
             Err(Error::from_string(msg, status))
         }
     }
@@ -353,10 +349,7 @@ impl<'a> FromRequest<'a> for Authenticated {
             .await
             .iter()
             .filter_map(|(k, s)| match s {
-                Session::Approved {
-                    cookie,
-                    created_at,
-                } => {
+                Session::Approved { cookie, created_at } => {
                     if created_at.elapsed() > COOKIE_TTL {
                         None
                     } else {

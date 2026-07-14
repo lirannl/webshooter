@@ -16,7 +16,7 @@ use std::{
 use tokio::{
     io::AsyncReadExt,
     spawn,
-    sync::{broadcast, mpsc::Receiver},
+    sync::{broadcast, mpsc, mpsc::Receiver},
     time::{self},
 };
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
@@ -118,14 +118,14 @@ pub async fn handle_wt_connection(
     loop {
         // Race start_capture against connection closure so a refresh/disconnect
         // while waiting for the initial resize doesn't leave a zombie capture.
-        let (frame_rx, handle) = tokio::select! {
+        let (frame_rx, server_msg_rx, handle) = tokio::select! {
             r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r?,
             _ = &mut datagrams  => { log("Datagrams closed");              break; }
             _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
             _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
         };
         capture_handle = Some(handle);
-        let frame_forwarder = frame_forwarder(frame_rx, _connection.clone());
+        let frame_forwarder = frame_forwarder(frame_rx, server_msg_rx, _connection.clone());
 
         tokio::select! {
             _ = datagrams => { log("Datagrams closed"); break; }
@@ -179,6 +179,7 @@ fn broadcast_datagrams(
 
 fn frame_forwarder(
     mut frame_rx: Receiver<video::EncodedFrame>,
+    mut server_msg_rx: mpsc::Receiver<shared::server_datagram::ServerDatagram>,
     wt: Arc<Connection>,
 ) -> tokio::task::JoinHandle<()> {
     let payload_size = wt
@@ -188,29 +189,43 @@ fn frame_forwarder(
         .max(1);
     let mut frame_id: u16 = 0;
     spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            let num_frags = frame.data.len().div_ceil(payload_size) as u16;
-            let mut send_ok = true;
-            for (idx, chunk) in frame.data.chunks(payload_size).enumerate() {
-                let dgram = server_datagram::ServerDatagram::VideoFrame {
-                    frame_id,
-                    frag_idx: idx as u16,
-                    num_frags,
-                    is_keyframe: frame.is_keyframe && idx == 0,
-                    codec: frame.codec,
-                    payload: chunk.to_vec(),
+        loop {
+            tokio::select! {
+                biased;
+                frame = frame_rx.recv() => {
+                    let Some(frame) = frame else { break };
+                    let num_frags = frame.data.len().div_ceil(payload_size) as u16;
+                    let mut send_ok = true;
+                    for (idx, chunk) in frame.data.chunks(payload_size).enumerate() {
+                        let dgram = server_datagram::ServerDatagram::VideoFrame {
+                            frame_id,
+                            frag_idx: idx as u16,
+                            num_frags,
+                            is_keyframe: frame.is_keyframe && idx == 0,
+                            codec: frame.codec,
+                            payload: chunk.to_vec(),
+                        }
+                        .to_bytes();
+                        if wt.send_datagram(&dgram).is_err() {
+                            log("send_datagram failed: connection closed");
+                            send_ok = false;
+                            break;
+                        }
+                    }
+                    if !send_ok {
+                        break;
+                    }
+                    frame_id = frame_id.wrapping_add(1);
                 }
-                .to_bytes();
-                if wt.send_datagram(&dgram).is_err() {
-                    log("send_datagram failed: connection closed");
-                    send_ok = false;
-                    break;
+                msg = server_msg_rx.recv() => {
+                    let Some(dgram) = msg else { break };
+                    let bytes = dgram.to_bytes();
+                    if wt.send_datagram(&bytes).is_err() {
+                        log("send_datagram (control) failed: connection closed");
+                        break;
+                    }
                 }
             }
-            if !send_ok {
-                break;
-            }
-            frame_id = frame_id.wrapping_add(1);
         }
     })
 }

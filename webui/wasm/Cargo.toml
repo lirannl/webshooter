@@ -45,6 +45,8 @@ web-sys = { workspace = true, features = [
     "TouchList",
     "KeyboardEvent",
     "PointerEvent",
+    "MouseEvent",
+    "WheelEvent",
     "console",
     "Request",
     "Response",

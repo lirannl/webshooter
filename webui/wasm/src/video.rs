@@ -2,12 +2,14 @@ use crate::{log::log, with_wt};
 use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
 use shared::server_datagram::ServerDatagram;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, VideoFrame};
+use web_sys::{
+    CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, KeyboardEvent, VideoFrame,
+};
 
 // ---------------------------------------------------------------------------
 // Canvas
@@ -48,7 +50,7 @@ pub fn send_initial_resize(canvas: &HtmlCanvasElement) -> Result<(), JsError> {
 // Resize prompt
 // ---------------------------------------------------------------------------
 
-pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
+pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
     let window = web_sys::window().unwrap();
     let performance = window.performance().unwrap();
 
@@ -141,6 +143,45 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) {
         fullscreen_cb.as_ref().unchecked_ref::<js_sys::Function>(),
     );
     fullscreen_cb.forget();
+
+    // requestFullscreen() can only be called from within a user gesture, but
+    // the ToggleFullscreen datagram arrives asynchronously over the network.
+    // Stash the intent here and apply it on the next pointerdown (a real
+    // gesture). Exiting fullscreen is not gesture-restricted and is handled
+    // directly in the render loop.
+    let pending_fullscreen = Rc::new(Cell::new(false));
+    {
+        let pending_fullscreen = pending_fullscreen.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            if pending_fullscreen.get() {
+                pending_fullscreen.set(false);
+                let _ = canvas.request_fullscreen();
+            }
+        }) as Box<dyn FnMut()>);
+        let _ = canvas.add_event_listener_with_callback(
+            "pointerdown",
+            cb.as_ref().unchecked_ref::<js_sys::Function>(),
+        );
+        cb.forget();
+    }
+    // keydown is also a user gesture, so keyboard-only input flushes the queue.
+    {
+        let pending_fullscreen = pending_fullscreen.clone();
+        let window = web_sys::window().unwrap();
+        let canvas = canvas.clone();
+        let cb = Closure::wrap(Box::new(move |_: KeyboardEvent| {
+            if pending_fullscreen.get() {
+                pending_fullscreen.set(false);
+                let _ = canvas.request_fullscreen();
+            }
+        }) as Box<dyn FnMut(KeyboardEvent)>);
+        let _ = window.add_event_listener_with_callback(
+            "keydown",
+            cb.as_ref().unchecked_ref::<js_sys::Function>(),
+        );
+        cb.forget();
+    }
+    pending_fullscreen
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +240,11 @@ fn u16_leq(a: u16, b: u16) -> bool {
 // Render loop
 // ---------------------------------------------------------------------------
 
-pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
+pub async fn render_loop(
+    canvas: &HtmlCanvasElement,
+    release_flag: Rc<Cell<bool>>,
+    pending_fullscreen: Rc<Cell<bool>>,
+) -> Result<(), JsValue> {
     let canvas = canvas.clone();
     let ctx = canvas
         .get_context("2d")
@@ -291,14 +336,37 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
             Err(_) => continue,
         };
 
-        let ServerDatagram::VideoFrame {
-            frame_id,
-            frag_idx,
-            num_frags,
-            is_keyframe,
-            codec,
-            payload,
-        } = msg;
+        match msg {
+            ServerDatagram::VideoFrame { .. } => {}
+            ServerDatagram::ReleaseMouse => {
+                release_flag.set(true);
+                continue;
+            }
+            ServerDatagram::ToggleFullscreen => {
+                let window = web_sys::window().unwrap();
+                let document = window.document().unwrap();
+                if document.fullscreen_element().is_some() {
+                    // Exiting fullscreen is allowed without a user gesture.
+                    let _ = document.exit_fullscreen();
+                } else {
+                    // Entering requires a gesture; defer to the next pointerdown.
+                    pending_fullscreen.set(true);
+                }
+                continue;
+            }
+        }
+
+        let (frame_id, frag_idx, num_frags, is_keyframe, codec, payload) = match msg {
+            ServerDatagram::VideoFrame {
+                frame_id,
+                frag_idx,
+                num_frags,
+                is_keyframe,
+                codec,
+                payload,
+            } => (frame_id, frag_idx, num_frags, is_keyframe, codec, payload),
+            _ => continue,
+        };
 
         let assembled = {
             let mut map = pending.borrow_mut();
@@ -351,18 +419,9 @@ pub async fn render_loop(canvas: &HtmlCanvasElement) -> Result<(), JsValue> {
             if *cur != Some(codec) {
                 log(&format!("codec changed: {cur:?} -> {codec:?}"));
                 let config = js_sys::Object::new();
-                js_sys::Reflect::set(
-                    &config,
-                    &"codec".into(),
-                    &codec.web_codec_string().into(),
-                )
-                .ok();
-                js_sys::Reflect::set(
-                    &config,
-                    &"optimizeForLatency".into(),
-                    &JsValue::TRUE,
-                )
-                .ok();
+                js_sys::Reflect::set(&config, &"codec".into(), &codec.web_codec_string().into())
+                    .ok();
+                js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &JsValue::TRUE).ok();
                 decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
                 *cur = Some(codec);
             }

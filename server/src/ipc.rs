@@ -1,14 +1,18 @@
 use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr};
+use shared::server_datagram::ServerDatagram;
+use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr, sync::OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
+use tokio::sync::broadcast;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum IPCMessage {
     Exit,
     Authorise(Option<usize>),
     Deauthorise(Option<usize>),
+    ReleaseMouse,
+    FullscreenToggle(Option<usize>),
 }
 
 impl IPCMessage {
@@ -22,10 +26,24 @@ impl IPCMessage {
             ["authorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Authorise(Some(n))),
             ["deauthorise"] => Ok(IPCMessage::Deauthorise(None)),
             ["deauthorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Deauthorise(Some(n))),
+            ["release_mouse"] => Ok(IPCMessage::ReleaseMouse),
+            ["mouse_release"] => Ok(IPCMessage::ReleaseMouse),
+            ["fullscreen"] => Ok(IPCMessage::FullscreenToggle(None)),
+            ["fullscreen", n] if let Ok(n) = n.parse() => Ok(IPCMessage::FullscreenToggle(Some(n))),
+            ["fullscreen_toggle"] => Ok(IPCMessage::FullscreenToggle(None)),
+            ["fullscreen_toggle", n] if let Ok(n) = n.parse() => {
+                Ok(IPCMessage::FullscreenToggle(Some(n)))
+            }
+            ["toggle_fullscreen"] => Ok(IPCMessage::FullscreenToggle(None)),
+            ["toggle_fullscreen", n] if let Ok(n) = n.parse() => {
+                Ok(IPCMessage::FullscreenToggle(Some(n)))
+            }
             _ => bail!(
                 "Webshooter supports the following commands while running:
     authorise
     deauthorise
+    release_mouse
+    fullscreen
     exit"
             ),
         }
@@ -53,6 +71,33 @@ impl IPCConnection {
             #[cfg(target_os = "linux")]
             Self::Unix(writer) => writer.write_all(str.as_bytes()).await,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client-control broadcast
+//
+// IPC commands that target the connected client (fullscreen toggle, mouse
+// release) are published here and forwarded to the active capture session's
+// server_msg channel, which ultimately reaches the WebTransport client.
+// ---------------------------------------------------------------------------
+
+static CLIENT_CONTROL: OnceLock<broadcast::Sender<ServerDatagram>> = OnceLock::new();
+
+pub fn client_control_init() {
+    let (tx, _rx) = broadcast::channel(16);
+    let _ = CLIENT_CONTROL.set(tx);
+}
+
+/// Subscribe to client-control datagrams routed from IPC commands.
+pub fn subscribe_client_control() -> Option<broadcast::Receiver<ServerDatagram>> {
+    CLIENT_CONTROL.get().map(|tx| tx.subscribe())
+}
+
+/// Publish a control datagram to all connected clients.
+pub fn send_client_control(msg: ServerDatagram) {
+    if let Some(tx) = CLIENT_CONTROL.get() {
+        let _ = tx.send(msg);
     }
 }
 
@@ -147,6 +192,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
     }?;
 
     ipc_funcs::ipc_init().await;
+    client_control_init();
     stdio_setup();
     tokio::spawn(async move {
         loop {
@@ -191,6 +237,8 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                         let _ = conn.write(b"Bye!").await;
                         exit(0)
                     }
+                    IPCMessage::ReleaseMouse => None,
+                    IPCMessage::FullscreenToggle(_) => None,
                 };
                 if let Some(message) = response {
                     conn.write(message.as_bytes()).await?;
@@ -270,7 +318,8 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
         crate::update_config(config).await?;
         conn.write(&format!("Deauthorised {short}")).await?;
     } else {
-        conn.write(&format!("Key {short} not found in authorised_keys")).await?;
+        conn.write(&format!("Key {short} not found in authorised_keys"))
+            .await?;
     }
     Ok(())
 }
@@ -284,7 +333,16 @@ async fn ipc_handler(message: IPCMessage, mut conn: IPCConnection) -> Result<()>
         IPCMessage::Deauthorise(idx) => {
             deauthorise(idx, conn).await?;
         }
-        message => {
+        IPCMessage::FullscreenToggle(_) => {
+            send_client_control(ServerDatagram::ToggleFullscreen);
+            conn.write("Fullscreen toggled").await?;
+        }
+        IPCMessage::ReleaseMouse => {
+            send_client_control(ServerDatagram::ReleaseMouse);
+            conn.write("Mouse released").await?;
+        }
+        IPCMessage::Authorise(_) => {
+            // Routed to the authorisation flow.
             ipc_send(message, conn)?;
         }
     }

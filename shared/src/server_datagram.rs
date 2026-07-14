@@ -1,10 +1,13 @@
 use crate::codec::Codec;
 use anyhow::Result;
+use named_constants::named_constants;
 
 /// 1 byte discriminant + 2×3 frame metadata + 1 is_keyframe + 1 codec = 9
 const HEADER: usize = 9;
 
-#[derive(Debug, Clone)]
+#[named_constants(preserve_original)]
+#[repr(u8)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerDatagram {
     VideoFrame {
         frame_id: u16,
@@ -14,6 +17,8 @@ pub enum ServerDatagram {
         codec: Codec,
         payload: Vec<u8>,
     },
+    ReleaseMouse,
+    ToggleFullscreen,
 }
 
 impl ServerDatagram {
@@ -28,7 +33,7 @@ impl ServerDatagram {
                 payload,
             } => {
                 let mut buf = Vec::with_capacity(HEADER + payload.len());
-                buf.push(0);
+                buf.push(ServerDatagramVariants::VIDEO_FRAME.0);
                 buf.extend_from_slice(&frame_id.to_be_bytes());
                 buf.extend_from_slice(&frag_idx.to_be_bytes());
                 buf.extend_from_slice(&num_frags.to_be_bytes());
@@ -37,15 +42,20 @@ impl ServerDatagram {
                 buf.extend_from_slice(payload);
                 buf
             }
+            Self::ReleaseMouse => vec![ServerDatagramVariants::RELEASE_MOUSE.0],
+            Self::ToggleFullscreen => vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
         }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER {
-            anyhow::bail!("Datagram too short: {} bytes", bytes.len());
+        if bytes.is_empty() {
+            anyhow::bail!("Empty datagram");
         }
-        match bytes[0] {
-            0 => {
+        match ServerDatagramVariants(bytes[0]) {
+            ServerDatagramVariants::VIDEO_FRAME => {
+                if bytes.len() < HEADER {
+                    anyhow::bail!("VideoFrame datagram too short: {} bytes", bytes.len());
+                }
                 let frame_id = u16::from_be_bytes([bytes[1], bytes[2]]);
                 let frag_idx = u16::from_be_bytes([bytes[3], bytes[4]]);
                 let num_frags = u16::from_be_bytes([bytes[5], bytes[6]]);
@@ -61,7 +71,9 @@ impl ServerDatagram {
                     payload,
                 })
             }
-            d => anyhow::bail!("Invalid server datagram discriminant: {d}"),
+            ServerDatagramVariants::RELEASE_MOUSE => Ok(Self::ReleaseMouse),
+            ServerDatagramVariants::TOGGLE_FULLSCREEN => Ok(Self::ToggleFullscreen),
+            n => anyhow::bail!("Invalid server datagram discriminant: {}", n.0),
         }
     }
 

@@ -14,10 +14,11 @@ use ashpd::desktop::{
 use ashpd::enumflags2::BitFlags;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use libc;
 use shared::client_datagram::ClientDatagram;
 use shared::codec::{Codec, select_codec};
-use std::fs::File;
+use shared::server_datagram::ServerDatagram;
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
@@ -130,9 +131,23 @@ impl CaptureHandle {
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
-) -> Result<(mpsc::Receiver<EncodedFrame>, CaptureHandle)> {
+) -> Result<(mpsc::Receiver<EncodedFrame>, mpsc::Receiver<ServerDatagram>, CaptureHandle)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
+    let (server_msg_tx, server_msg_rx) = mpsc::channel::<ServerDatagram>(8);
     let cancel = CancellationToken::new();
+
+    // Forward IPC client-control commands (fullscreen toggle, mouse release)
+    // to the connected client.
+    if let Some(mut client_control_rx) = crate::ipc::subscribe_client_control() {
+        let server_msg_tx = server_msg_tx.clone();
+        spawn(async move {
+            while let Ok(dgram) = client_control_rx.recv().await {
+                if server_msg_tx.send(dgram).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     let remote_desktop = cancel.r(RemoteDesktop::new()).await?;
     let screencast = cancel.r(Screencast::new()).await?;
@@ -149,6 +164,7 @@ pub async fn capture(
                 if let Err(e) = single_capture(
                     &mut client_rx,
                     frame_tx.clone(),
+                    server_msg_tx.clone(),
                     &cancel,
                     &mut next_size,
                     &remote_desktop,
@@ -163,12 +179,13 @@ pub async fn capture(
         }
     });
 
-    Ok((frame_rx, CaptureHandle { cancel, task }))
+    Ok((frame_rx, server_msg_rx, CaptureHandle { cancel, task }))
 }
 
 async fn single_capture(
     client_rx: &mut Receiver<ClientDatagram>,
     frame_tx: mpsc::Sender<EncodedFrame>,
+    server_msg_tx: mpsc::Sender<ServerDatagram>,
     cancel: &CancellationToken,
     last_dims: &mut Option<(u16, u16, u8)>,
     remote_desktop: &RemoteDesktop,
@@ -303,12 +320,24 @@ async fn single_capture(
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("not an appsink"))?;
 
+        let (cursor_tx, cursor_rx) = mpsc::channel::<(i32, i32)>(32);
         let tx = frame_tx.clone();
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+
+                    // Extract compositor cursor position from
+                    // GstVideoRegionOfInterestMeta("cursor") emitted by
+                    // pipewiresrc when CursorMode::Embedded is set.
+                    if let Some(meta) = buffer.meta::<gst_video::VideoRegionOfInterestMeta>() {
+                        if meta.roi_type() == "cursor" {
+                            let (x, y, _w, _h) = meta.rect();
+                            let _ = cursor_tx.try_send((x as i32, y as i32));
+                        }
+                    }
+
                     let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
                     let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let frame = EncodedFrame {
@@ -397,7 +426,7 @@ async fn single_capture(
             }
         };
 
-        let touch_task = eis_task(eis_fd, stream_pos, client_rx, cancel);
+        let touch_task = eis_task(eis_fd, stream_pos, client_rx, &server_msg_tx, cursor_rx, cancel);
 
         // Wait for the next resize (or cancellation or GPU loss) before tearing
         // down.  virtual_monitor must stay alive here — dropping it kills krfb.

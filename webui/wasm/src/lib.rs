@@ -4,8 +4,8 @@ mod video;
 
 use js_sys::Uint8Array;
 use shared::client_datagram::ClientDatagram;
-use shared::codec::Codec;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -152,14 +152,17 @@ pub async fn start() -> Result<(), JsValue> {
         // 8. Canvas + video
         let canvas = video::setup_canvas();
         video::send_initial_resize(&canvas).unwrap_or_else(|err| log(err));
-        video::setup_resize_prompt(&canvas);
+        let pending_fullscreen = video::setup_resize_prompt(&canvas);
 
         // 9. Render loop
-        let render_loop = video::render_loop(&canvas);
+        let release_flag = Rc::new(Cell::new(false));
+        let render_loop =
+            video::render_loop(&canvas, release_flag.clone(), pending_fullscreen.clone());
 
         // 10. Input handlers
         input::setup_keyboard(&canvas);
         input::setup_touch(&canvas);
+        input::setup_mouse(&canvas, release_flag);
 
         // 10. Wait for render loop to finish (signals connection closed).
         if let Err(e) = render_loop.await {
