@@ -1,6 +1,7 @@
 target/
 /local/
 node_modules/
+.vite/
 /dist
 /server/bindings/
 /.direnv/

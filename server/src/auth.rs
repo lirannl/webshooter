@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::{error::Elapsed, timeout};
 use ts_rs::TS;
@@ -26,6 +26,7 @@ pub static SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::defau
 const CHALLENGE_SIZE: usize = 256;
 
 const COOKIE_SIZE: usize = 1024;
+const COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct Identity(Bytes64);
 
@@ -63,7 +64,10 @@ pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> 
 
 pub enum Session {
     Challenged(Vec<u8>),
-    Approved { cookie: Vec<u8> },
+    Approved {
+        cookie: Vec<u8>,
+        created_at: Instant,
+    },
 }
 
 #[derive(Deserialize, TS)]
@@ -107,6 +111,74 @@ pub async fn get_challenged_sessions() -> Vec<Vec<u8>> {
         })
         .collect::<Vec<_>>()
 }
+
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+struct RateLimitEntry {
+    count: u32,
+    window_start: Instant,
+}
+
+static RATE_LIMITS: LazyLock<Mutex<HashMap<std::net::IpAddr, RateLimitEntry>>> =
+    Default::default();
+
+fn check_rate_limit(ip: std::net::IpAddr, max_attempts: u32) -> bool {
+    let mut limits = RATE_LIMITS.blocking_lock();
+    let now = Instant::now();
+    if let Some(entry) = limits.get_mut(&ip) {
+        if now.duration_since(entry.window_start) > RATE_LIMIT_WINDOW {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count < max_attempts
+    } else {
+        true
+    }
+}
+
+fn record_rate_limit_failure(ip: std::net::IpAddr) {
+    let mut limits = RATE_LIMITS.blocking_lock();
+    let now = Instant::now();
+    if let Some(entry) = limits.get_mut(&ip) {
+        if now.duration_since(entry.window_start) > RATE_LIMIT_WINDOW {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count += 1;
+    } else {
+        limits.insert(
+            ip,
+            RateLimitEntry {
+                count: 1,
+                window_start: now,
+            },
+        );
+    }
+}
+
+fn reset_rate_limit(ip: std::net::IpAddr) {
+    RATE_LIMITS.blocking_lock().remove(&ip);
+}
+
+fn client_ip(req: &Request) -> std::net::IpAddr {
+    req.headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| {
+            req.headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or_else(|| {
+            req.remote_addr()
+                .as_socket_addr()
+                .map(|addr| addr.ip())
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        })
+}
 // const BYTES_TO_SHOW: Range<usize> = 24..8;
 
 fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
@@ -117,7 +189,42 @@ fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
 }
 
 #[handler]
-pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse> {
+pub async fn login(
+    req: &Request,
+    Json(params): Json<LoginParams>,
+) -> Result<impl IntoResponse> {
+    let ip = client_ip(req);
+    let rate_limit = get_config().await.rate_limit.unwrap_or(10);
+    if !check_rate_limit(ip, rate_limit) {
+        return Err(Error::from_string(
+            "Rate limit exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+        ));
+    }
+
+    match login_inner(params).await {
+        Ok(cookie) => {
+            reset_rate_limit(ip);
+            Ok(Response::builder()
+                .header(
+                    "set-cookie",
+                    format!(
+                        "token={}; HttpOnly; Secure; SameSite=Strict",
+                        BASE64.encode(&cookie),
+                    ),
+                )
+                .finish())
+        }
+        Err(err) => {
+            let status = err.status();
+            let msg = err.to_string();
+            record_rate_limit_failure(ip);
+            Err(Error::from_string(msg, status))
+        }
+    }
+}
+
+async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     let mut config = get_config().await;
 
     let (id, signature) = match &params {
@@ -125,9 +232,6 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
         _ => Err(WebshooterError::InvalidLogin),
     }?;
     let id = id.to_owned();
-    // for start in 0..35 {
-    //     println!("{start}: {}", Bytes64(&id[start..]));
-    // }
     if !config.authorised_keys.contains(&Bytes64(id.to_vec())) {
         let timeout_secs = config.auth_timeout.unwrap_or(30);
         timeout(Duration::from_secs(timeout_secs), async {
@@ -217,6 +321,7 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
             params.into_id().into(),
             Session::Approved {
                 cookie: cookie.to_vec(),
+                created_at: Instant::now(),
             },
         );
     }
@@ -226,15 +331,7 @@ pub async fn login(Json(params): Json<LoginParams>) -> Result<impl IntoResponse>
         .await
         .map_err(|err| Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
-    Ok(Response::builder()
-        .header(
-            "set-cookie",
-            format!(
-                "token={}; HttpOnly; Secure; SameSite=Strict",
-                BASE64.encode(&cookie),
-            ),
-        )
-        .finish())
+    Ok(Bytes64(cookie.to_vec()))
 }
 
 pub struct Authenticated {
@@ -256,8 +353,15 @@ impl<'a> FromRequest<'a> for Authenticated {
             .await
             .iter()
             .filter_map(|(k, s)| match s {
-                Session::Approved { cookie } => {
-                    Some((Bytes64(cookie.to_vec()).to_string(), k.to_owned()))
+                Session::Approved {
+                    cookie,
+                    created_at,
+                } => {
+                    if created_at.elapsed() > COOKIE_TTL {
+                        None
+                    } else {
+                        Some((Bytes64(cookie.to_vec()).to_string(), k.to_owned()))
+                    }
                 }
                 _ => None,
             })

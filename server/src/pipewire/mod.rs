@@ -24,7 +24,9 @@ pub async fn setup_pipewire() {
     match create_auth_token().await {
         Ok(string) => set_portal_token(string).await,
         Err(err) => {
-            eprintln!("{err:#?}");
+            eprintln!("Failed to create portal auth token: {err:#}");
+            eprintln!("Cannot run without portal auto-approval. Exiting.");
+            std::process::exit(1);
         }
     };
 }

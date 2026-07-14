@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
 pub enum IPCMessage {
     Exit,
     Authorise(Option<usize>),
+    Deauthorise(Option<usize>),
 }
 
 impl IPCMessage {
@@ -19,21 +20,24 @@ impl IPCMessage {
             ["exit"] => Ok(IPCMessage::Exit),
             ["authorise"] => Ok(IPCMessage::Authorise(None)),
             ["authorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Authorise(Some(n))),
+            ["deauthorise"] => Ok(IPCMessage::Deauthorise(None)),
+            ["deauthorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Deauthorise(Some(n))),
             _ => bail!(
                 "Webshooter supports the following commands while running:
     authorise
+    deauthorise
     exit"
             ),
         }
     }
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 use tokio::net::UnixStream;
 
 pub enum IPCConnection {
     StdOut,
-    #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
     Unix(UnixStream),
 }
 
@@ -46,7 +50,7 @@ impl IPCConnection {
                 }
                 Ok(())
             }
-            #[cfg(target_family = "unix")]
+            #[cfg(target_os = "linux")]
             Self::Unix(writer) => writer.write_all(str.as_bytes()).await,
         }
     }
@@ -102,7 +106,7 @@ pub use ipc_funcs::{ipc_recv, ipc_send};
 
 pub const IPC_ID: &str = include_str!("../../ipc_id.txt");
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 pub async fn setup_ipc(_config: Config) -> Result<()> {
     let target = env::var("XDG_RUNTIME_DIR")?;
     let target = PathBuf::from_str(&target)?.join(format!("webshooter_{IPC_ID}.sock",));
@@ -113,6 +117,8 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
     };
 
     use crate::auth::get_challenged_sessions;
+
+    let my_uid = unsafe { libc::getuid() };
 
     let listener = match UnixListener::bind(&target) {
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
@@ -148,6 +154,26 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
             (async || {
                 let (mut conn, _) = listener.accept().await?;
 
+                // Verify the connecting process runs as the same user
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+                    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                    let rc = unsafe {
+                        libc::getsockopt(
+                            conn.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_PEERCRED,
+                            &mut cred as *mut _ as *mut libc::c_void,
+                            &mut len,
+                        )
+                    };
+                    if rc != 0 || cred.uid != my_uid {
+                        let _ = conn.write(b"Rejected: not same user").await;
+                        return Ok(());
+                    }
+                }
+
                 let mut buf = Vec::new();
                 conn.read_buf(&mut buf).await?;
                 let message = serde_json::from_slice(&mut buf)?;
@@ -160,6 +186,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                             None
                         }
                     }
+                    IPCMessage::Deauthorise(_) => None,
                     IPCMessage::Exit => {
                         let _ = conn.write(b"Bye!").await;
                         exit(0)
@@ -198,11 +225,64 @@ fn stdio_setup() {
     });
 }
 
+fn format_id(id: &[u8]) -> String {
+    use data_encoding::BASE64;
+    if id.len() >= 32 {
+        BASE64.encode(&id[24..32]).trim_matches('=').to_string()
+    } else {
+        BASE64.encode(id).trim_matches('=').to_string()
+    }
+}
+
+pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Result<()> {
+    let sessions = crate::auth::get_challenged_sessions().await;
+    let id = match sessions.len() {
+        0 => {
+            conn.write("No challenged sessions").await?;
+            return Ok(());
+        }
+        1 => sessions.into_iter().next().unwrap(),
+        _ => {
+            if let Some(n) = index {
+                sessions
+                    .into_iter()
+                    .nth(n)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid index"))?
+            } else {
+                conn.write(&format!(
+                    "Please select a session:\n{}",
+                    sessions
+                        .iter()
+                        .enumerate()
+                        .map(|(n, s)| format!("{n}: {}", format_id(s)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+                .await?;
+                return Ok(());
+            }
+        }
+    };
+    let short = format_id(&id);
+    let mut config = crate::get_config().await;
+    let key = crate::config::Bytes64(id);
+    if config.authorised_keys.remove(&key) {
+        crate::update_config(config).await?;
+        conn.write(&format!("Deauthorised {short}")).await?;
+    } else {
+        conn.write(&format!("Key {short} not found in authorised_keys")).await?;
+    }
+    Ok(())
+}
+
 async fn ipc_handler(message: IPCMessage, mut conn: IPCConnection) -> Result<()> {
     match message {
         IPCMessage::Exit => {
             conn.write("Webshooter shutting down").await?;
             exit(0)
+        }
+        IPCMessage::Deauthorise(idx) => {
+            deauthorise(idx, conn).await?;
         }
         message => {
             ipc_send(message, conn)?;

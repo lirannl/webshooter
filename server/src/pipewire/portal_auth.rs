@@ -39,14 +39,21 @@ pub async fn get_portal_token() -> Option<String> {
 /// ~150 ms.  Returns the portal call's result.
 ///
 /// When no keyboard is available (creation failed or feature disabled)
-/// the portal call runs without any key injection.
+/// the portal call runs without any key injection but with a timeout;
+/// if the dialog is not approved in time, the application exits.
 pub async fn accept_dialog<T>(
     kb: &mut Option<Keyboard>,
     portal_fut: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     if kb.is_none() {
-        println!("[portal_auth] no keyboard — running portal call without injection");
-        return portal_fut.await;
+        println!("[portal_auth] no keyboard — manual approval required (30s timeout)");
+        tokio::pin!(portal_fut);
+        return tokio::time::timeout(Duration::from_secs(30), portal_fut.as_mut())
+            .await
+            .map_err(|_| {
+                eprintln!("[portal_auth] timed out waiting for manual portal approval");
+                std::process::exit(1);
+            })?;
     }
 
     println!("[portal_auth] portal call started");

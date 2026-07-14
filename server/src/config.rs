@@ -45,6 +45,8 @@ pub struct Config {
     pub http_config: HttpConfig,
     #[serde(default)]
     pub auth_timeout: Option<u64>,
+    #[serde(default)]
+    pub rate_limit: Option<u32>,
     #[serde(default = "default_settings::permitted_domains")]
     pub webtransport_permitted_domains: Vec<String>,
 }
@@ -78,6 +80,7 @@ impl Config {
             webtransport_permitted_domains: default_settings::permitted_domains(),
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
+            rate_limit: Default::default(),
         })
     }
 }
