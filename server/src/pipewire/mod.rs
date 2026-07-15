@@ -12,6 +12,7 @@ use crate::{
     pipewire::portal_auth::{get_portal_token, set_portal_token},
 };
 
+mod audio;
 mod eis;
 mod eis_keyboard;
 pub(crate) mod gamepad;

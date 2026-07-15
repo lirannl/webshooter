@@ -21,7 +21,8 @@ use tokio::{
 };
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
 
-// The client sends a KeepAlive datagram every 50 ms. 500 ms gives ~10
+// The client sends
+//  a KeepAlive datagram every 50 ms. 500 ms gives ~10
 // missed keepalives before we consider the peer gone — enough headroom
 // for jitter while still detecting a refresh within half a second.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);

@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "webshooter"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3879,7 +3879,7 @@ dependencies = [
 
 [[package]]
 name = "webshooter-shared"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "bitflags 2.10.0",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "webshooter-wasm"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

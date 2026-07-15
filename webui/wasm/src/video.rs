@@ -1,3 +1,4 @@
+use crate::audio::AudioPlayer;
 use crate::{log::log, with_wt};
 use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
@@ -316,6 +317,14 @@ pub async fn render_loop(
     let last_assembled: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
     let waiting_for_keyframe: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
+    // Audio player: decodes the Opus frames we receive and plays them through
+    // the (user-gesture-resumed) AudioContext. `None` if the browser lacks an
+    // Opus AudioDecoder, in which case AudioFrames are ignored.
+    let audio = AudioPlayer::new();
+    if audio.is_none() {
+        crate::log::log("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
+    }
+
     loop {
         // Read one datagram from the reader.
         let promise = with_wt(|gwt| gwt.reader.read());
@@ -359,6 +368,20 @@ pub async fn render_loop(
         };
 
         match msg {
+            ServerDatagram::AudioFrame {
+                frame_id,
+                frag_idx,
+                num_frags,
+                channels,
+                rate,
+                format: _,
+                payload,
+            } => {
+                if let Some(a) = &audio {
+                    a.push(frame_id, frag_idx, num_frags, channels, rate, payload);
+                }
+                continue;
+            }
             ServerDatagram::VideoFrame { .. } => {}
             ServerDatagram::ReleaseMouse => {
                 release_flag.set(true);
@@ -390,24 +413,60 @@ pub async fn render_loop(
             _ => continue,
         };
 
-        let assembled = {
+        let (entry_is_keyframe, assembled) = {
             let mut map = pending.borrow_mut();
+
+            // Drop fragments for frames we have already fully moved past. On a
+            // lossy link a fragment can arrive late (after its frame was
+            // already displayed); re-decoding a stale frame would feed the
+            // decoder garbage. Compared in circular order so the u16 wraparound
+            // at frame_id 65535 is handled correctly.
+            if let Some(last) = last_assembled.get() {
+                if u16_leq(frame_id, last) {
+                    continue;
+                }
+            }
+
             let entry = map.entry(frame_id).or_insert_with(|| PendingFrame {
                 fragments: vec![None; num_frags as usize],
                 is_keyframe: false,
                 received: 0,
             });
+
+            // A fragment's declared fragment count must match the entry we are
+            // accumulating. A mismatch means a stale entry from a previous use
+            // of this frame_id (the u16 counter wrapped) collided with a new
+            // frame. Restart it cleanly instead of indexing out of bounds and
+            // aborting the entire stream.
+            if num_frags as usize != entry.fragments.len() {
+                *entry = PendingFrame {
+                    fragments: vec![None; num_frags as usize],
+                    is_keyframe: false,
+                    received: 0,
+                };
+            }
+
+            let idx = frag_idx as usize;
+            if idx >= entry.fragments.len() {
+                // Impossible fragment index (corrupt/truncated datagram). Drop
+                // the whole frame rather than panic on out-of-bounds access.
+                map.remove(&frame_id);
+                continue;
+            }
+            if entry.fragments[idx].is_some() {
+                continue;
+            }
+            entry.fragments[idx] = Some(payload);
+            entry.received += 1;
             if is_keyframe {
                 entry.is_keyframe = true;
             }
-            if entry.fragments[frag_idx as usize].is_some() {
-                continue;
-            }
-            entry.fragments[frag_idx as usize] = Some(payload);
-            entry.received += 1;
             seen.borrow_mut().insert(frame_id);
 
             if entry.received < entry.fragments.len() {
+                // Not all fragments arrived yet — wait for the rest. A lost
+                // fragment here simply means this frame is skipped (frozen
+                // until the next keyframe) rather than crashing the stream.
                 continue;
             }
 
@@ -470,8 +529,6 @@ pub async fn render_loop(
 
             (is_keyframe, assembled)
         };
-
-        let (entry_is_keyframe, assembled) = assembled;
 
         // Reconfigure the decoder if the codec changed.
         {

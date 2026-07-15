@@ -1,4 +1,5 @@
 use crate::keyboard::Keyboard;
+use crate::pipewire::audio::AudioSink;
 use crate::pipewire::portal_auth::{accept_dialog, get_portal_token, set_portal_token};
 use crate::{extensions::CancellationTokenExt, logging::log, pipewire::eis::eis_task};
 use anyhow::{Result, anyhow};
@@ -115,6 +116,11 @@ pub struct EncodedFrame {
 pub struct CaptureHandle {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    /// Held so the PipeWire audio sink stays alive for the capture's lifetime
+    /// and is torn down when the handle is dropped. `None` until the client
+    /// signals it is ready to play audio.
+    #[allow(dead_code)]
+    audio_sink: Arc<std::sync::Mutex<Option<AudioSink>>>,
 }
 
 impl CaptureHandle {
@@ -135,6 +141,52 @@ pub async fn capture(
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
     let (server_msg_tx, server_msg_rx) = mpsc::channel::<ServerDatagram>(8);
     let cancel = CancellationToken::new();
+
+    // Defer creation of the application-owned PipeWire audio sink until the
+    // client tells us its AudioContext is actually `Running` (a user gesture
+    // has occurred). Before that the browser cannot play audio, so streaming
+    // Opus would just be wasted bandwidth/CPU. The sink is kept alive in the
+    // CaptureHandle so it is torn down when the capture ends.
+    let audio_sink: Arc<std::sync::Mutex<Option<AudioSink>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let mut audio_ready_rx = client_rx.resubscribe();
+        let server_msg_tx = server_msg_tx.clone();
+        let cancel = cancel.clone();
+        let audio_sink = audio_sink.clone();
+        spawn(async move {
+            // Wait for the client's AudioReady signal, or for cancellation.
+            let recv = async {
+                loop {
+                    match audio_ready_rx.recv().await {
+                        Ok(ClientDatagram::AudioReady) => return true,
+                        Ok(_) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            };
+            let cancel_fut = cancel.cancelled();
+            tokio::pin!(recv);
+            tokio::pin!(cancel_fut);
+            let ready = tokio::select! {
+                r = &mut recv => r,
+                _ = &mut cancel_fut => false,
+            };
+            if !ready || cancel.is_cancelled() {
+                return;
+            }
+            match crate::pipewire::audio::start_audio_sink(cancel.clone()).await {
+                Ok((sink, rx)) => {
+                    println!("[video] client ready — created PipeWire audio sink");
+                    spawn(async move {
+                        crate::pipewire::audio::forward_audio(rx, server_msg_tx).await;
+                    });
+                    *audio_sink.lock().unwrap() = Some(sink);
+                }
+                Err(e) => println!("[video] audio sink unavailable: {e:#}"),
+            }
+        });
+    }
 
     // Forward IPC client-control commands (fullscreen toggle, mouse release)
     // to the connected client.
@@ -179,7 +231,15 @@ pub async fn capture(
         }
     });
 
-    Ok((frame_rx, server_msg_rx, CaptureHandle { cancel, task }))
+    Ok((
+        frame_rx,
+        server_msg_rx,
+        CaptureHandle {
+            cancel,
+            task,
+            audio_sink,
+        },
+    ))
 }
 
 async fn single_capture(

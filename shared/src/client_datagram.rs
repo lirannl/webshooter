@@ -133,6 +133,11 @@ pub enum ClientDatagram {
     DecoderCapabilities {
         decoders: Vec<Codec>,
     },
+    /// The client's AudioContext has entered the `Running` state (i.e. a user
+    /// gesture has occurred and audio can actually be played). The server
+    /// should only create the PipeWire audio sink and forward Opus once this
+    /// arrives, so we don't stream audio the browser cannot play yet.
+    AudioReady,
     MouseMove {
         dx: i16,
         dy: i16,
@@ -255,6 +260,7 @@ impl ClientDatagram {
                 }
                 buf
             }
+            Self::AudioReady => vec![ClientDatagramVariants::AUDIO_READY.0],
             Self::MouseMove { dx, dy } => {
                 let mut buf = Vec::with_capacity(5);
                 buf.push(ClientDatagramVariants::MOUSE_MOVE.0);
@@ -367,6 +373,7 @@ impl ClientDatagram {
                     .collect();
                 Self::DecoderCapabilities { decoders }
             }
+            ClientDatagramVariants::AUDIO_READY => Self::AudioReady,
             ClientDatagramVariants::MOUSE_MOVE => {
                 let dx = i16::from_be_bytes([bytes[1], bytes[2]]);
                 let dy = i16::from_be_bytes([bytes[3], bytes[4]]);

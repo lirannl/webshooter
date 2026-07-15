@@ -5,7 +5,7 @@ default-members = ["server"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.8.0"
 repository = "https://github.com/lirannl/webshooter"
 license = "LICENSE"
 

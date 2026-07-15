@@ -1,3 +1,4 @@
+mod audio;
 mod gamepad;
 mod input;
 mod log;
@@ -51,6 +52,16 @@ where
         let mut opt = cell.borrow_mut();
         f(opt.as_mut().expect("WebTransport not initialised"))
     })
+}
+
+/// Send an arbitrary [`ClientDatagram`] to the server over the WebTransport
+/// datagram stream.
+pub(crate) fn send_datagram(d: shared::client_datagram::ClientDatagram) {
+    let bytes = d.to_bytes();
+    let buf = Uint8Array::from(&bytes[..]);
+    with_wt(|gwt| {
+        let _ = gwt.writer.write_with_chunk(buf.as_ref());
+    });
 }
 
 fn show_connection_lost() -> Option<()> {

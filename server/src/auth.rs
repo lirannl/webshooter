@@ -21,7 +21,7 @@ use crate::error::WebshooterError;
 use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
 use crate::{get_config, update_config};
 
-pub static SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::default();
+pub static AUTH_SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::default();
 
 const CHALLENGE_SIZE: usize = 256;
 
@@ -56,7 +56,7 @@ pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> 
     let mut challenge = [0 as u8; CHALLENGE_SIZE];
     rng().fill(&mut challenge);
     {
-        let mut sessions = SESSIONS.lock().await;
+        let mut sessions = AUTH_SESSIONS.lock().await;
         sessions.insert(id.into(), Session::Challenged(challenge.to_vec()));
     }
     poem::Result::Ok(Response::builder().body(challenge.to_vec()))
@@ -102,7 +102,7 @@ impl LoginParams {
 }
 
 pub async fn get_challenged_sessions() -> Vec<Vec<u8>> {
-    let sessions_lock = SESSIONS.lock().await;
+    let sessions_lock = AUTH_SESSIONS.lock().await;
     sessions_lock
         .iter()
         .filter_map(|(id, session)| match session {
@@ -292,7 +292,7 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
             Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         })?;
     }
-    let sessions = SESSIONS.lock().await;
+    let sessions = AUTH_SESSIONS.lock().await;
     let challenge = match sessions.get(id.deref()) {
         Some(Session::Challenged(challenge)) => Ok(challenge),
         _ => Err(WebshooterError::NotChallenged),
@@ -312,7 +312,7 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     rng().fill(&mut cookie);
 
     {
-        let mut sessions = SESSIONS.lock().await;
+        let mut sessions = AUTH_SESSIONS.lock().await;
         sessions.insert(
             params.into_id().into(),
             Session::Approved {
@@ -344,7 +344,7 @@ impl<'a> FromRequest<'a> for Authenticated {
             .filter_map(|value| value.to_str().ok()?.split_once("="))
             .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
             .ok_or(WebshooterError::NoAuthentication)?;
-        let current_sessions = SESSIONS
+        let current_sessions = AUTH_SESSIONS
             .lock()
             .await
             .iter()

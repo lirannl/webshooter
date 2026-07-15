@@ -1,11 +1,12 @@
+#[cfg(debug_assertions)]
 use http::Version;
 use poem::{
+    Error, IntoResponse, Response,
     error::{IntoResult, NotFoundError},
     web::Path,
-    Error, IntoResponse, Response,
 };
 #[cfg(debug_assertions)]
-use poem::{error::NotFound, ResponseParts};
+use poem::{ResponseParts, error::NotFound};
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -33,8 +34,10 @@ pub async fn frontend(path: Option<Path<String>>) -> impl IntoResult<Response> {
         }
     }
     let asset = Assets::get(&path).ok_or(NotFoundError)?;
-    Ok::<_, Error>(Response::builder()
-        .body(asset.data.to_vec())
-        .set_content_type(asset.metadata.mimetype())
-        .into_response())
+    Ok::<_, Error>(
+        Response::builder()
+            .body(asset.data.to_vec())
+            .set_content_type(asset.metadata.mimetype())
+            .into_response(),
+    )
 }
