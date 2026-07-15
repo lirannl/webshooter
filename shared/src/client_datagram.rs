@@ -145,6 +145,12 @@ pub enum ClientDatagram {
         dx: i32,
         dy: i32,
     },
+    /// Picture Loss Indication: the client detected a gap in the frame
+    /// sequence (a frame was lost to packet loss) and asks the server to
+    /// emit a fresh keyframe so decoding can resynchronise. Cheap to send
+    /// because a back-channel already exists; bounded recovery instead of
+    /// waiting for the next scheduled keyframe.
+    RequestKeyframe,
 }
 
 impl ClientDatagram {
@@ -270,6 +276,7 @@ impl ClientDatagram {
                 buf.extend_from_slice(&dy.to_be_bytes());
                 buf
             }
+            Self::RequestKeyframe => vec![ClientDatagramVariants::REQUEST_KEYFRAME.0],
         }
     }
 
@@ -375,6 +382,7 @@ impl ClientDatagram {
                 let dy = i32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
                 Self::Scroll { dx, dy }
             }
+            ClientDatagramVariants::REQUEST_KEYFRAME => Self::RequestKeyframe,
             n => anyhow::bail!("Invalid datagram discriminant: {}", n.0),
         })
     }

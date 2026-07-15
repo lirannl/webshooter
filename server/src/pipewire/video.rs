@@ -103,7 +103,7 @@ impl Drop for VirtualMonitor {
 // ---------------------------------------------------------------------------
 
 pub struct EncodedFrame {
-    pub data: Vec<u8>,
+    pub data: gst::Buffer,
     pub is_keyframe: bool,
     pub codec: Codec,
 }
@@ -307,12 +307,42 @@ async fn single_capture(
         let pipeline = gst::parse::launch(&format!(
             "pipewiresrc fd={raw_fd} path={node_id} \
          ! videoconvert \
-         ! {encoder} rate-control=vbr bitrate={bitrate} target-percentage=75 \
+         ! {encoder} name=enc rate-control=vbr bitrate={bitrate} target-percentage=75 \
          ! appsink name=sink sync=false",
             encoder = codec.gst_encoder_element(),
         ))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
+
+        // Force a keyframe on demand (PLI) or on a fixed interval so that a
+        // single dropped frame cannot poison the inter-frame prediction chain
+        // indefinitely. Packet loss turns into a bounded clean resync rather
+        // than progressive corruption.
+        let encoder = pipeline
+            .by_name("enc")
+            .ok_or(anyhow!("no encoder element"))?;
+        {
+            let mut keyframe_rx = client_rx.resubscribe();
+            let encoder = encoder.clone();
+            let cancel = cancel.clone();
+            spawn(async move {
+                // Bound corruption duration even if no PLI arrives.
+                let mut interval = tokio::time::interval(Duration::from_secs(2));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        msg = keyframe_rx.recv() => match msg {
+                            Ok(ClientDatagram::RequestKeyframe) => force_keyframe(&encoder),
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        },
+                        _ = interval.tick() => force_keyframe(&encoder),
+                    }
+                }
+            });
+        }
 
         let appsink = pipeline
             .by_name("sink")
@@ -339,14 +369,17 @@ async fn single_capture(
                     }
 
                     let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let frame = EncodedFrame {
-                        data: map.to_vec(),
+                        data: buffer.to_owned(),
                         is_keyframe,
                         codec,
                     };
+                    // Backpressure: if the consumer can't keep up, drop this
+                    // frame rather than returning FlowError::Error, which would
+                    // tear down the whole GStreamer pipeline and trigger a
+                    // restart storm.
                     if tx.try_send(frame).is_err() {
-                        return Err(gst::FlowError::Error);
+                        return Ok(gst::FlowSuccess::Ok);
                     }
                     Ok(gst::FlowSuccess::Ok)
                 })
@@ -359,8 +392,20 @@ async fn single_capture(
             let bus = pipeline.bus().ok_or(anyhow!("no pipeline bus"))?;
             let pipeline_ref = pipeline.clone();
             let pipeline_restart = pipeline_restart.clone();
+            let cancel = cancel.clone();
             tokio::task::spawn_blocking(move || {
-                for msg in bus.iter_timed(gst::ClockTime::NONE) {
+                // Exit on cancellation as well as EOS/Error, otherwise this
+                // task would block forever (iter_timed with no timeout) and
+                // keep a strong ref to the pipeline — preventing it from ever
+                // being finalized and leaking the VA-API encoder context across
+                // sessions.
+                loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) else {
+                        continue;
+                    };
                     match msg.view() {
                         gst::MessageView::Eos(_) | gst::MessageView::Error(_) => {
                             if let gst::MessageView::Error(err) = msg.view() {
@@ -483,4 +528,15 @@ fn sized_stream(width: &u16, height: &u16) -> impl Fn(&&Stream) -> bool {
             false
         }
     }
+}
+
+/// Ask the encoder to produce a keyframe as soon as possible. We send a
+/// standard `GstForceKeyUnit` downstream event, which every GStreamer video
+/// encoder recognises. This is how the server answers a client's PLI and how
+/// it enforces a periodic keyframe interval to bound corruption from packet
+/// loss — no bitstream-specific logic required.
+fn force_keyframe(encoder: &gst::Element) {
+    let structure = gst::Structure::new_empty("GstForceKeyUnit");
+    let event = gst::event::CustomDownstream::new(structure);
+    let _ = encoder.send_event(event);
 }

@@ -3,7 +3,7 @@ use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
 use shared::server_datagram::ServerDatagram;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -200,6 +200,18 @@ pub fn send_decoder_capabilities() -> Result<(), JsError> {
     Ok(())
 }
 
+/// Picture Loss Indication: tell the server a frame was lost so it can emit a
+/// fresh keyframe. Cheap — the WebTransport back-channel already exists, and
+/// it bounds corruption to a single round-trip instead of waiting for the
+/// next scheduled keyframe.
+fn send_request_keyframe() {
+    let bytes = ClientDatagram::RequestKeyframe.to_bytes();
+    let buf = js_sys::Uint8Array::from(&bytes[..]);
+    with_wt(|gwt| {
+        let _ = gwt.writer.write_with_chunk(buf.as_ref());
+    });
+}
+
 fn probe_codecs() -> Vec<Codec> {
     // VideoDecoder.isConfigSupported is async and may not be available in
     // all contexts.  Use MediaSource.isTypeSupported as a sync fallback.
@@ -294,6 +306,16 @@ pub async fn render_loop(
 
     let pending: Rc<RefCell<HashMap<u16, PendingFrame>>> = Rc::new(RefCell::new(HashMap::new()));
 
+    // Loss-tracking state for packet-loss resilience. We detect a lost frame
+    // by positive evidence (a later frame_id assembled while an earlier one
+    // was never seen) rather than a timeout, so no extra latency is added in
+    // the steady state. On loss we ask the server for a keyframe (PLI) and
+    // stop feeding delta frames to the decoder until one arrives — otherwise
+    // the dropped frame poisons every subsequent inter-predicted frame.
+    let seen: Rc<RefCell<HashSet<u16>>> = Rc::new(RefCell::new(HashSet::new()));
+    let last_assembled: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
+    let waiting_for_keyframe: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
     loop {
         // Read one datagram from the reader.
         let promise = with_wt(|gwt| gwt.reader.read());
@@ -383,6 +405,7 @@ pub async fn render_loop(
             }
             entry.fragments[frag_idx as usize] = Some(payload);
             entry.received += 1;
+            seen.borrow_mut().insert(frame_id);
 
             if entry.received < entry.fragments.len() {
                 continue;
@@ -400,6 +423,43 @@ pub async fn render_loop(
                 }
             }
             let is_keyframe = entry.is_keyframe;
+
+            // --- Loss detection (packet-loss resilience) -----------------
+            // A frame is lost when a later frame_id assembles but an earlier
+            // one was never observed. Detecting by positive evidence (rather
+            // than a timeout) keeps steady-state latency at zero. On loss we
+            // request a keyframe and stop decoding deltas until it arrives,
+            // so a single dropped frame can't poison the prediction chain.
+            if is_keyframe {
+                // Fresh keyframe: resynced, reset all loss state.
+                waiting_for_keyframe.set(false);
+                seen.borrow_mut().clear();
+                seen.borrow_mut().insert(frame_id);
+                last_assembled.set(Some(frame_id));
+            } else if let Some(l) = last_assembled.get() {
+                let diff = frame_id.wrapping_sub(l);
+                // Only consider a forward gap (diff in [1, 0x8000)); equal or
+                // out-of-order frames are not loss evidence.
+                if diff != 0 && diff < 0x8000 {
+                    let lost = (1..diff)
+                        .any(|g| !seen.borrow().contains(&l.wrapping_add(g)));
+                    if lost && !waiting_for_keyframe.get() {
+                        send_request_keyframe();
+                        waiting_for_keyframe.set(true);
+                    }
+                }
+                last_assembled.set(Some(frame_id));
+                seen.borrow_mut().insert(frame_id);
+            } else {
+                // First frame is a delta: nothing to predict from, request a
+                // keyframe to establish a clean reference.
+                if !waiting_for_keyframe.get() {
+                    send_request_keyframe();
+                    waiting_for_keyframe.set(true);
+                }
+                last_assembled.set(Some(frame_id));
+                seen.borrow_mut().insert(frame_id);
+            }
 
             let keys: Vec<u16> = map.keys().copied().collect();
             for id in keys {
@@ -446,7 +506,14 @@ pub async fn render_loop(
         let chunk =
             EncodedVideoChunk::new(chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>());
         match chunk {
-            Ok(chunk) => decoder.decode(&chunk),
+            Ok(chunk) => {
+                // While waiting for a keyframe to resync, every delta frame
+                // still references the lost one — decoding it would just
+                // reproduce corruption, so discard it.
+                if !(waiting_for_keyframe.get() && !entry_is_keyframe) {
+                    decoder.decode(&chunk);
+                }
+            }
             Err(e) => {
                 log(&format!("EncodedVideoChunk creation failed: {e:?}"));
             }

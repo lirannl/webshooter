@@ -22,6 +22,27 @@ pub enum ServerDatagram {
 }
 
 impl ServerDatagram {
+    /// Serialize a video frame directly from an already-encoded payload slice,
+    /// avoiding an intermediate `Vec<u8>` allocation per fragment.
+    pub fn video_frame_to_bytes(
+        frame_id: u16,
+        frag_idx: u16,
+        num_frags: u16,
+        is_keyframe: bool,
+        codec: Codec,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(HEADER + payload.len());
+        buf.push(ServerDatagramVariants::VIDEO_FRAME.0);
+        buf.extend_from_slice(&frame_id.to_be_bytes());
+        buf.extend_from_slice(&frag_idx.to_be_bytes());
+        buf.extend_from_slice(&num_frags.to_be_bytes());
+        buf.push(is_keyframe as u8);
+        buf.push(codec.to_byte());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Self::VideoFrame {

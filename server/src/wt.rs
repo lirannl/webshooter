@@ -107,7 +107,12 @@ pub async fn handle_wt_connection(
                     Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
                         *decoder_caps.lock().unwrap() = Some(decoders);
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    // The broadcast channel is closed once the connection's
+                    // broadcaster is dropped; recv() then returns Err
+                    // immediately, so without this break the task would spin
+                    // at 100% of a core forever (one leaked task per session).
+                    Err(_) => break,
                 }
             }
         });
@@ -194,18 +199,25 @@ fn frame_forwarder(
                 biased;
                 frame = frame_rx.recv() => {
                     let Some(frame) = frame else { break };
-                    let num_frags = frame.data.len().div_ceil(payload_size) as u16;
-                    let mut send_ok = true;
-                    for (idx, chunk) in frame.data.chunks(payload_size).enumerate() {
-                        let dgram = server_datagram::ServerDatagram::VideoFrame {
-                            frame_id,
-                            frag_idx: idx as u16,
-                            num_frags,
-                            is_keyframe: frame.is_keyframe && idx == 0,
-                            codec: frame.codec,
-                            payload: chunk.to_vec(),
+                    let mapped = match frame.data.map_readable() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            frame_id = frame_id.wrapping_add(1);
+                            continue;
                         }
-                        .to_bytes();
+                    };
+                    let data = mapped.as_slice();
+                    let num_frags = data.len().div_ceil(payload_size) as u16;
+                    let mut send_ok = true;
+                    for (idx, chunk) in data.chunks(payload_size).enumerate() {
+                        let dgram = server_datagram::ServerDatagram::video_frame_to_bytes(
+                            frame_id,
+                            idx as u16,
+                            num_frags,
+                            frame.is_keyframe && idx == 0,
+                            frame.codec,
+                            chunk,
+                        );
                         if wt.send_datagram(&dgram).is_err() {
                             log("send_datagram failed: connection closed");
                             send_ok = false;
