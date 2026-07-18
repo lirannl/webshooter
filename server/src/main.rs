@@ -5,6 +5,7 @@ mod auth;
 mod compositor_discovery;
 mod config;
 mod config_watch;
+mod cert_watch;
 mod error;
 mod extensions;
 mod frontend;
@@ -15,17 +16,15 @@ mod logging;
 mod pipewire;
 mod wt;
 use anyhow::Result;
-use auth::negotiate_wt;
+use futures_util::TryFutureExt;
 use config::Config;
 use error::WebshooterError;
-use futures_util::TryFutureExt;
 use ipc::setup_ipc;
 use logging::log;
-use poem::{
-    EndpointExt, IntoResponse, Response, Route, Server, get, handler,
-    listener::{Listener, RustlsCertificate, TcpListener},
-    post,
-};
+use salvo::conn::rustls::RustlsConfig;
+use salvo::conn::{QuinnListener, TcpListener};
+use salvo::routing::Router;
+use salvo::{Listener, Server};
 use std::{
     env,
     error::Error,
@@ -34,27 +33,23 @@ use std::{
     str::FromStr,
     sync::LazyLock,
 };
-use tokio::{
-    fs,
-    sync::{
-        Mutex,
-        mpsc::{self, Sender},
-    },
-};
-use wt::setup_wt;
-use wtransport::Identity;
+use tokio::fs;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
-    auth::{Authenticated, check_identity, get_challenge, login},
+    auth::{check_auth, check_identity, get_challenge, login, negotiate_wt},
     compositor_discovery::{
         ensure_wayland_display, ensure_xdg_current_desktop, ensure_xdg_runtime_dir,
     },
     config::CONFIG_DIR,
     config_watch::watch_config,
+    frontend::index as serve_frontend,
 };
 
 pub static APP_CONFIG: LazyLock<Mutex<Option<Config>>> = Default::default();
-pub static RESET_TRIGGER: LazyLock<Mutex<Option<Sender<()>>>> = Default::default();
+pub static RESET_TRIGGER: LazyLock<Mutex<Option<mpsc::Sender<()>>>> = Default::default();
 
 pub fn reset_app() {
     if let Some(trigger) = RESET_TRIGGER.blocking_lock().as_ref() {
@@ -103,72 +98,78 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             config.http_config.host, config.http_config.port
         );
 
-        let listener = TcpListener::bind(format!(
-            "{}:{}",
-            config.http_config.host, config.http_config.port
+        // Hot-reloadable TLS config shared by the TCP (HTTP/1.1 + h2) and QUIC
+        // (HTTP/3 + WebTransport) listeners. Both bind the same port.
+        let (cert_tx_tcp, cert_rx_tcp) = mpsc::unbounded_channel::<RustlsConfig>();
+        let (cert_tx_quic, cert_rx_quic) = mpsc::unbounded_channel::<RustlsConfig>();
+        let rustls_config = cert_watch::build_rustls_config(&config.http_config.ssl_conf)?;
+        let _ = cert_tx_tcp.send(rustls_config.clone());
+        let _ = cert_tx_quic.send(rustls_config);
+
+        let tcp_listener = TcpListener::new((
+            config.http_config.host,
+            config.http_config.port,
         ))
-        .rustls(
-            poem::listener::RustlsConfig::new().fallback(
-                RustlsCertificate::new()
-                    .cert(fs::read(&config.http_config.ssl_conf.certificate).await?)
-                    .key(fs::read(&config.http_config.ssl_conf.key).await?),
-            ),
+        .rustls(UnboundedReceiverStream::new(cert_rx_tcp));
+
+        let quinn_listener = QuinnListener::new(
+            UnboundedReceiverStream::new(cert_rx_quic),
+            (config.http_config.host, config.http_config.port),
+        );
+
+        let acceptor = quinn_listener.join(tcp_listener).bind().await;
+
+        // Reload certificates from disk whenever they change.
+        let _ = cert_watch::spawn_cert_watcher(
+            config.http_config.ssl_conf.clone(),
+            vec![cert_tx_tcp, cert_tx_quic],
         );
 
         watch_config(&config.path).await;
 
-        let identity = Identity::self_signed(&config.webtransport_permitted_domains)?;
-        let app = Route::new()
-            .at("/check_identity", get(check_identity))
-            .at("/check_auth", get(check_auth))
-            .at("/challenge", get(get_challenge))
-            .at(
-                "/negotiate_wt",
-                get(negotiate_wt).data(identity.certificate_chain().as_slice()[0].hash()),
-            )
-            .at("/login", post(login))
-            .at("/*", frontend::frontend);
+        let router = Router::new()
+            .push(Router::with_path("/check_identity").goal(check_identity))
+            .push(Router::with_path("/check_auth").goal(check_auth))
+            .push(Router::with_path("/challenge").goal(get_challenge))
+            .push(Router::with_path("/negotiate_wt").goal(negotiate_wt))
+            .push(Router::with_path("/login").goal(login))
+            .push(
+                Router::with_path("/{*path}")
+                    .hoop(wt::connect)
+                    .goal(serve_frontend),
+            );
 
-        let handle_0 = tokio::spawn(Server::new(listener).run(app).or_else(async |err| {
+        let handle_0 = tokio::spawn(Server::new(acceptor).try_serve(router).or_else(async |err| {
             log(err);
             reset_app();
             Ok::<_, anyhow::Error>(())
         }));
-        let handle_1 = tokio::spawn(setup_wt(config.clone(), identity).or_else(async |err| {
-            log(err);
-            reset_app();
-            Ok::<_, anyhow::Error>(())
-        }));
+
         // Wait for a reset signal
         rx.recv().await;
         handle_0.abort();
-        handle_1.abort();
     }
 }
 
 async fn setup_ssl_certificates(config: &Config) -> Result<()> {
-    if !config.http_config.ssl_conf.key.exists()
-        || !config.http_config.ssl_conf.certificate.exists()
-    {
-        println!("Ssl certificate not found. Generating...");
-        let generator = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_string(),
-            config.http_config.host.to_string(),
-        ])?;
-        let ssl_conf = &config.http_config.ssl_conf;
-        tokio::fs::write(&ssl_conf.certificate, generator.cert.pem()).await?;
-        println!(
-            "New ssl certificate PEM generated at {:?}",
+    let ssl_conf = &config.http_config.ssl_conf;
+    if !ssl_conf.key.exists() {
+        anyhow::bail!(
+            "SSL key not found at {:?}. Generate or copy a certificate before starting.",
+            ssl_conf.key
+        );
+    }
+    if !ssl_conf.certificate.exists() {
+        anyhow::bail!(
+            "SSL certificate not found at {:?}. Generate or copy a certificate before starting.",
             ssl_conf.certificate
         );
-        tokio::fs::write(&ssl_conf.key, generator.signing_key.serialize_pem()).await?;
-        println!("New ssl keys PEM generated at {:?}", ssl_conf.key);
     }
     Ok(())
 }
 
 async fn setup_config(config_dir: &Path) -> Result<()> {
-    let config_file_name = std::fs::read_dir(&config_dir)?.find_map(|p| {
+    let config_file_name = std::fs::read_dir(config_dir)?.find_map(|p| {
         let name = p.ok()?.file_name().to_str()?.to_string();
         if name.starts_with("config") {
             Some(name)
@@ -247,9 +248,4 @@ pub async fn update_config(config: Config) -> Result<()> {
 
 pub async fn get_config() -> Config {
     APP_CONFIG.lock().await.clone().unwrap()
-}
-
-#[handler]
-fn check_auth(Authenticated { id }: Authenticated) -> impl IntoResponse {
-    Response::builder().body(format!("Authenticated as: {id}"))
 }

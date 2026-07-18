@@ -102,6 +102,7 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
 /// 2. the running compositor process (reliable even when launched manually,
 ///    where logind's `Desktop` is often empty — common on Arch),
 /// 3. the `DESKTOP_SESSION` env var as a last resort.
+///
 /// Leaving it unset is handled by the caller (exit on Linux).
 pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
     if env::var_os("XDG_CURRENT_DESKTOP").is_some() {
@@ -110,29 +111,25 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
 
     // 1. logind session `Desktop` property.
     let uid = unsafe { libc::getuid() };
-    if let Some(session_id) = seat_session_for_uid(uid)? {
-        if let Ok(output) = std::process::Command::new("loginctl")
+    if let Some(session_id) = seat_session_for_uid(uid)?
+        && let Ok(output) = std::process::Command::new("loginctl")
             .args(["show-session", &session_id, "-p", "Desktop"])
             .output()
-        {
-            if output.status.success() {
-                if let Some(desktop) = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Desktop="))
-                {
-                    let desktop = desktop.trim();
-                    if !desktop.is_empty() {
-                        // Safe: single-threaded startup.
-                        unsafe {
-                            env::set_var("XDG_CURRENT_DESKTOP", desktop);
-                        }
-                        log(format!(
-                            "Discovered XDG_CURRENT_DESKTOP={desktop} from session {session_id}"
-                        ));
-                        return Ok(());
-                    }
-                }
+        && output.status.success()
+        && let Some(desktop) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("Desktop="))
+    {
+        let desktop = desktop.trim();
+        if !desktop.is_empty() {
+            // Safe: single-threaded startup.
+            unsafe {
+                env::set_var("XDG_CURRENT_DESKTOP", desktop);
             }
+            log(format!(
+                "Discovered XDG_CURRENT_DESKTOP={desktop} from session {session_id}"
+            ));
+            return Ok(());
         }
     }
 
@@ -149,18 +146,18 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
     }
 
     // 3. Session env var as a last resort.
-    if let Some(desktop) = env::var_os("DESKTOP_SESSION") {
-        if !desktop.is_empty() {
-            let desktop = desktop.to_string_lossy().into_owned();
-            // Safe: single-threaded startup.
-            unsafe {
-                env::set_var("XDG_CURRENT_DESKTOP", &desktop);
-            }
-            log(format!(
-                "Using DESKTOP_SESSION={desktop} for XDG_CURRENT_DESKTOP"
-            ));
-            return Ok(());
+    if let Some(desktop) = env::var_os("DESKTOP_SESSION")
+        && !desktop.is_empty()
+    {
+        let desktop = desktop.to_string_lossy().into_owned();
+        // Safe: single-threaded startup.
+        unsafe {
+            env::set_var("XDG_CURRENT_DESKTOP", &desktop);
         }
+        log(format!(
+            "Using DESKTOP_SESSION={desktop} for XDG_CURRENT_DESKTOP"
+        ));
+        return Ok(());
     }
 
     Ok(())
@@ -194,17 +191,18 @@ fn desktop_from_compositor() -> Option<String> {
 /// Whether a process with the given comm name is running. Tries `pgrep` first,
 /// then falls back to scanning `/proc` (so it works without procps installed).
 fn compositor_running(name: &str) -> bool {
-    if let Ok(out) = std::process::Command::new("pgrep").args(["-x", name]).output() {
-        if out.status.success() && !out.stdout.is_empty() {
-            return true;
-        }
+    if let Ok(out) = std::process::Command::new("pgrep").args(["-x", name]).output()
+        && out.status.success()
+        && !out.stdout.is_empty()
+    {
+        return true;
     }
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for entry in entries.flatten() {
-            if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
-                if comm.trim() == name {
-                    return true;
-                }
+            if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm"))
+                && comm.trim() == name
+            {
+                return true;
             }
         }
     }
@@ -227,14 +225,12 @@ pub(super) fn ensure_wayland_display() -> Result<()> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = name.strip_prefix("wayland-") {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_socket() {
-                        if let Ok(n) = rest.parse::<u32>() {
-                            candidates.push((n, name));
-                        }
-                    }
-                }
+            if let Some(rest) = name.strip_prefix("wayland-")
+                && let Ok(ft) = entry.file_type()
+                && ft.is_socket()
+                && let Ok(n) = rest.parse::<u32>()
+            {
+                candidates.push((n, name));
             }
         }
     }

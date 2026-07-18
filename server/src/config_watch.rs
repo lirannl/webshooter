@@ -28,14 +28,11 @@ pub async fn watch_config(file: &Path) {
     spawn(async move {
         let future_execution = Mutex::new(None::<JoinHandle<Result<()>>>);
         while let Some(event) = rx.recv().await {
-            match event.kind {
-                EventKind::Modify(_) => {
-                    if let Some(future_execution) = future_execution.lock().await.take() {
-                        future_execution.abort();
-                    }
-                    *future_execution.lock().await = Some(watch_respond(file.to_owned()));
+            if let EventKind::Modify(_) = event.kind {
+                if let Some(future_execution) = future_execution.lock().await.take() {
+                    future_execution.abort();
                 }
-                _ => {}
+                *future_execution.lock().await = Some(watch_respond(file.to_owned()));
             }
         }
     });

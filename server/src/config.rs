@@ -27,9 +27,9 @@ pub struct HttpConfig {
     pub ssl_conf: SslConfig,
 }
 
-impl Into<SocketAddr> for &HttpConfig {
-    fn into(self) -> SocketAddr {
-        SocketAddr::new(self.host, self.port)
+impl From<&HttpConfig> for SocketAddr {
+    fn from(c: &HttpConfig) -> SocketAddr {
+        SocketAddr::new(c.host, c.port)
     }
 }
 
@@ -103,9 +103,9 @@ impl<B: Deref<Target = [u8]>> Deref for Bytes64<B> {
     }
 }
 
-impl<B: Deref<Target = [u8]>> Into<Vec<u8>> for Bytes64<B> {
-    fn into(self) -> Vec<u8> {
-        self.0.to_vec()
+impl<B: Deref<Target = [u8]>> From<Bytes64<B>> for Vec<u8> {
+    fn from(b: Bytes64<B>) -> Vec<u8> {
+        b.0.to_vec()
     }
 }
 
@@ -177,6 +177,6 @@ impl<'de> Deserialize<'de> for Bytes64 {
         let str = deserialiser.deserialize_string(StringVisitor {})?;
         let bytes =
             Bytes64::from_str(&str).map_err(|err| serde::de::Error::custom(err.to_string()))?;
-        Ok(bytes.into())
+        Ok(bytes)
     }
 }

@@ -1,107 +1,127 @@
-use crate::{
-    auth::OnetimeToken,
-    config::{Bytes64, Config},
-    error::WebshooterError,
-    logging::log,
-    pipewire::video,
-};
-use anyhow::Result;
+use crate::auth::OnetimeToken;
+use crate::config::Bytes64;
+use crate::error::WebshooterError;
+use crate::logging::log;
+use crate::pipewire::video;
+use bytes::Bytes;
+use data_encoding::BASE64URL;
+use salvo::http::StatusCode;
+use salvo::{Depot, FlowCtrl, Request, Response, handler};
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram;
-use std::{
-    str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-use tokio::{
-    io::AsyncReadExt,
-    spawn,
-    sync::{broadcast, mpsc, mpsc::Receiver},
-    time::{self},
-};
-use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, Mutex, mpsc::Receiver};
+use tokio::time;
 
-// The client sends
-//  a KeepAlive datagram every 50 ms. 500 ms gives ~10
+use salvo::proto::webtransport::server::WebTransportSession;
+use salvo_http3::ext::Protocol as H3Protocol;
+
+
+type Conn = salvo_http3::quinn::Connection;
+type WtSession = WebTransportSession<Conn, Bytes>;
+
+// The client sends a KeepAlive datagram every 50 ms. 500 ms gives ~10
 // missed keepalives before we consider the peer gone — enough headroom
 // for jitter while still detecting a refresh within half a second.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
 
-pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
-    let server_config = ServerConfig::builder()
-        .with_bind_default(config.http_config.port)
-        .with_identity(identity)
-        .keep_alive_interval(Some(Duration::from_mins(5)))
-        .build();
+// WebTransport rides the same QUIC connection as HTTP/3, so there is no
+// separate MTU probe. 1200 is the conservative QUIC datagram ceiling; the
+// original `wtransport` server used `max_datagram_size().unwrap_or(1200)`.
+const MAX_DATAGRAM_SIZE: usize = 1200;
 
-    let server = Endpoint::server(server_config)?;
+// Only one active capture session is allowed; a new connect aborts the previous.
+static ACTIVE: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::const_new(None);
 
-    let mut active: Option<tokio::task::JoinHandle<()>> = None;
+#[handler]
+pub async fn connect(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    flow: &mut FlowCtrl,
+) {
+    // Only a WebTransport CONNECT reaches us here; anything else (ordinary
+    // HTTP requests for static assets) falls through to the frontend. We
+    // detect it without accepting the session yet, because `web_transport_mut()`
+    // consumes the CONNECT stream by sending the 200 response. This mirrors
+    // salvo's private `is_wt_connect`, which keys off the `:protocol` pseudo-
+    // header (a `Protocol` extension), not a regular header.
+    let is_wt_connect = req.method() == salvo::http::Method::CONNECT
+        && req
+            .extensions()
+            .get::<H3Protocol>()
+            .map(|p| *p == H3Protocol::WEB_TRANSPORT)
+            .unwrap_or(false);
+    if !is_wt_connect {
+        flow.call_next(req, depot, res).await;
+        return;
+    }
 
-    loop {
-        let session = server.accept().await;
+    // Authenticate the one-time token passed as a query parameter *before*
+    // accepting the WebTransport session. If we accepted first and then
+    // returned 403 on a bad token, salvo would try to write a second response
+    // on the same stream, which the client sees as a QUIC protocol error.
+    // Validating first lets salvo send a single clean 403 instead.
+    let token = req
+        .queries()
+        .get("token")
+        .and_then(|t| BASE64URL.decode(t.as_bytes()).ok())
+        .and_then(|bytes| OnetimeToken::try_from(Bytes64(bytes)).ok());
+    let valid = match token {
+        Some(t) => t.check().await,
+        None => false,
+    };
+    if !valid {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(WebshooterError::NotAuthorized.to_string());
+        return;
+    }
 
-        // A new client arrived — tear down any existing session immediately
-        // rather than waiting for the QUIC idle timeout to fire.
-        if let Some(prev) = active.take() {
-            prev.abort();
-        }
+    // Token is good — now accept the WebTransport session, which sends the
+    // successful CONNECT response and hands us the session handle.
+    let _ = req.web_transport_mut().await;
+    let Some(session) = req.extensions().get::<Arc<WtSession>>().cloned() else {
+        res.status_code(StatusCode::FORBIDDEN);
+        res.render(WebshooterError::NotAuthorized.to_string());
+        return;
+    };
 
-        active = Some(tokio::spawn(async move {
-            match webtransport_auth(session).await {
-                Ok(connection) => handle_wt_connection(connection)
-                    .await
-                    .unwrap_or_else(|err| log(err)),
-                Err(err) => log(err),
-            }
-        }));
+    // Tear down any previous session before starting a new one.
+    if let Some(prev) = ACTIVE.lock().await.take() {
+        prev.abort();
+    }
+
+    // Run the session to completion *inside* this handler. salvo's
+    // `process_web_transport` (which runs immediately after the handler
+    // returns) must take unique ownership of the `Arc<WebTransportSession>`
+    // to restore the underlying QUIC connection. If we spawned `run_session`
+    // and returned, the cloned `Arc` we hold here would keep the reference
+    // count above one, `take_unique_arc_extension` would fail, and salvo would
+    // tear the whole QUIC connection down — the browser surfaces this as a
+    // "QUIC protocol error". Awaiting here drops our `Arc` clone before
+    // return, leaving the framework's copy uniquely owned. A WebTransport
+    // CONNECT legitimately owns its stream for the session's lifetime, so
+    // blocking the handler until disconnect is the correct model.
+    let handle = tokio::spawn(run_session(session));
+    *ACTIVE.lock().await = Some(handle);
+    if let Some(handle) = ACTIVE.lock().await.take() {
+        let _ = handle.await;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
+async fn run_session(session: Arc<WtSession>) {
+    let (broadcaster, _client_rx) = broadcast::channel(256);
+    let mut datagrams = tokio::spawn(broadcast_datagrams(session.clone(), broadcaster.clone()));
+    let mut unistreams =
+        tokio::spawn(broadcast_unistreams(session.clone(), broadcaster.clone()));
 
-async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
-    let request = session.await?;
-    let token = request
-        .path()
-        .split_once('?')
-        .map(|(_, params)| params.split('&'))
-        .and_then(|params| {
-            params
-                .filter_map(|param| param.split_once('='))
-                .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
-        })
-        .ok_or(WebshooterError::NoAuthentication)?;
-    let token = Bytes64::from_str(token)?;
-    if OnetimeToken::try_from(token)?.check().await {
-        let connection = request.accept().await?;
-        Ok(connection)
-    } else {
-        request.forbidden().await;
-        Err(WebshooterError::NotAuthorized.into())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Connection handler
-// ---------------------------------------------------------------------------
-
-pub async fn handle_wt_connection(
-    connection: Connection,
-) -> Result<()> {
-    let _connection = Arc::new(connection);
-
-    let (_broadcaster, _client_rx) = broadcast::channel(256);
-    let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
-    let mut unistreams = broadcast_unistreams(_connection.clone(), _broadcaster.clone());
-
-    let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
+    let decoder_caps: Arc<std::sync::Mutex<Option<Vec<shared::codec::Codec>>>> =
+        Arc::new(std::sync::Mutex::new(None));
     {
         let mut client_rx = _client_rx.resubscribe();
         let decoder_caps = decoder_caps.clone();
-        spawn(async move {
+        tokio::spawn(async move {
             loop {
                 match client_rx.recv().await {
                     Ok(ClientDatagram::Error { message }) => log(&message),
@@ -120,59 +140,86 @@ pub async fn handle_wt_connection(
     }
 
     let mut capture_handle: Option<video::CaptureHandle> = None;
+    let mut frame_forwarder_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         // Race start_capture against connection closure so a refresh/disconnect
         // while waiting for the initial resize doesn't leave a zombie capture.
-        let (frame_rx, server_msg_rx, handle) = tokio::select! {
-            r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r?,
+        let result = tokio::select! {
+            r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r,
             _ = &mut datagrams  => { log("Datagrams closed");              break; }
             _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
-            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
+        };
+        let (frame_rx, server_msg_rx, handle) = match result {
+            Ok(v) => v,
+            Err(err) => {
+                log(err);
+                break;
+            }
         };
         capture_handle = Some(handle);
-        let frame_forwarder = frame_forwarder(frame_rx, server_msg_rx, _connection.clone());
+        frame_forwarder_handle =
+            Some(frame_forwarder(frame_rx, server_msg_rx, session.clone(), broadcaster.clone()));
 
         tokio::select! {
-            _ = datagrams => { log("Datagrams closed"); break; }
-            _ = unistreams => { log("Unidirectional streams closed");  break; }
-            _ = frame_forwarder => { log("capture pipeline stopped");  break; }
-            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
+            _ = &mut datagrams => { log("Datagrams closed"); break; }
+            _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
+            _ = frame_forwarder_handle.as_mut().unwrap() => { log("capture pipeline stopped");  break; }
         }
     }
 
     if let Some(h) = capture_handle {
         h.close().await;
     }
-    _connection.close(VarInt::from_u32(0), b"done");
-    Ok(())
+
+    // Release every clone of the `Arc<WebTransportSession>` before returning.
+    // salvo's `process_web_transport` (which runs right after this handler
+    // returns) needs unique ownership of the session `Arc`; any surviving
+    // clone here would keep the reference count above one and make salvo tear
+    // the QUIC connection down (browser sees a "QUIC protocol error"). Abort
+    // the reader/forwarder tasks and await them so all `session` clones are
+    // dropped while we still own them.
+    datagrams.abort();
+    unistreams.abort();
+    if let Some(ref h) = frame_forwarder_handle {
+        h.abort();
+    }
+    let _ = datagrams.await;
+    let _ = unistreams.await;
+    if let Some(h) = frame_forwarder_handle {
+        let _ = h.await;
+    }
 }
 
 fn broadcast_unistreams(
-    connection_clone: Arc<Connection>,
-    broadcaster_clone: broadcast::Sender<ClientDatagram>,
+    connection: Arc<WtSession>,
+    broadcaster: broadcast::Sender<ClientDatagram>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        while let Ok(mut stream) = connection_clone.accept_uni().await {
+    tokio::spawn(async move {
+        while let Ok(Some((_, mut stream))) = connection.accept_uni().await {
             let mut vec = Vec::new();
-            if stream.read_to_end(&mut vec).await.is_ok()
+            if tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut vec)
+                .await
+                .is_ok()
                 && let Ok(datagram) = ClientDatagram::from_bytes(&vec)
             {
-                let _ = broadcaster_clone.send(datagram);
+                let _ = broadcaster.send(datagram);
             }
         }
     })
 }
 
 fn broadcast_datagrams(
-    connection: Arc<Connection>,
+    connection: Arc<WtSession>,
     broadcaster: broadcast::Sender<ClientDatagram>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
+    tokio::spawn(async move {
+        let mut reader = connection.datagram_reader();
         loop {
-            match time::timeout(KEEPALIVE_TIMEOUT, connection.receive_datagram()).await {
+            match time::timeout(KEEPALIVE_TIMEOUT, reader.read_datagram()).await {
                 Ok(Ok(datagram)) => {
-                    if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
+                    let bytes = datagram.into_payload();
+                    if let Ok(datagram) = ClientDatagram::from_bytes(&bytes) {
                         let _ = broadcaster.send(datagram);
                     }
                 }
@@ -186,15 +233,15 @@ fn broadcast_datagrams(
 fn frame_forwarder(
     mut frame_rx: Receiver<video::EncodedFrame>,
     mut server_msg_rx: mpsc::Receiver<shared::server_datagram::ServerDatagram>,
-    wt: Arc<Connection>,
+    wt: Arc<WtSession>,
+    _broadcaster: broadcast::Sender<ClientDatagram>,
 ) -> tokio::task::JoinHandle<()> {
-    let payload_size = wt
-        .max_datagram_size()
-        .unwrap_or(1200)
+    let payload_size = MAX_DATAGRAM_SIZE
         .saturating_sub(server_datagram::ServerDatagram::header_size())
         .max(1);
     let mut frame_id: u16 = 0;
-    spawn(async move {
+    let mut sender = wt.datagram_sender();
+    tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
@@ -219,7 +266,7 @@ fn frame_forwarder(
                             frame.codec,
                             chunk,
                         );
-                        if wt.send_datagram(&dgram).is_err() {
+                        if sender.send_datagram(Bytes::from(dgram)).is_err() {
                             log("send_datagram failed: connection closed");
                             send_ok = false;
                             break;
@@ -233,7 +280,7 @@ fn frame_forwarder(
                 msg = server_msg_rx.recv() => {
                     let Some(dgram) = msg else { break };
                     let bytes = dgram.to_bytes();
-                    if wt.send_datagram(&bytes).is_err() {
+                    if sender.send_datagram(Bytes::from(bytes)).is_err() {
                         log("send_datagram (control) failed: connection closed");
                         break;
                     }

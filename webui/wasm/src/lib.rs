@@ -88,12 +88,16 @@ fn show_connection_lost() -> Option<()> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[wasm_bindgen]
-pub async fn start() -> Result<(), JsValue> {
-    let window = web_sys::window().ok_or("no window")?;
-    let location = window.location();
-    let href = location.href()?;
-
+/// Negotiates a one-time token + server certificate hash and opens the
+/// WebTransport connection. Returns the ready [`WebTransport`] on success.
+///
+/// A cert rotation between `negotiate_wt` and the WebTransport handshake can
+/// make `ready()` reject with a certificate-hash mismatch; callers should
+/// retry this once with a fresh negotiation.
+async fn negotiate_and_connect(
+    window: &web_sys::Window,
+    href: &str,
+) -> Result<WebTransport, JsValue> {
     // 1. Negotiate — fetch token + server certificate hash.
     let negotiate_resp: web_sys::Response = JsFuture::from(window.fetch_with_str("negotiate_wt"))
         .await?
@@ -121,6 +125,26 @@ pub async fn start() -> Result<(), JsValue> {
 
     // 3. Wait for ready.
     JsFuture::from(wt.ready()).await?;
+
+    Ok(wt)
+}
+
+#[wasm_bindgen]
+pub async fn start() -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or("no window")?;
+    let location = window.location();
+    let href = location.href()?;
+
+    // Negotiate + connect, retrying once if the handshake fails — a cert
+    // rotation between negotiation and the WebTransport CONNECT would
+    // otherwise surface as a certificate-hash mismatch here.
+    let wt = match negotiate_and_connect(&window, &href).await {
+        Ok(wt) => wt,
+        Err(e) => {
+            log("WebTransport handshake failed, retrying negotiation once");
+            negotiate_and_connect(&window, &href).await.map_err(|_| e)?
+        }
+    };
 
     // 4. Open datagram streams.
     let datagrams: WebTransportDatagramDuplexStream = wt.datagrams();

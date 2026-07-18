@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use http::StatusCode;
-use poem::error::ResponseError;
+use salvo::Error;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,17 +24,30 @@ pub enum WebshooterError {
     NoAuthentication,
     #[error("Cancelled")]
     Cancelled,
+    #[error("Internal server error")]
+    InternalServerError,
 }
 
-impl ResponseError for WebshooterError {
-    fn status(&self) -> StatusCode {
+impl WebshooterError {
+    pub fn status(&self) -> StatusCode {
         match &self {
             Self::NotChallenged => StatusCode::FORBIDDEN,
             Self::InvalidLogin => StatusCode::BAD_REQUEST,
             Self::ChallengeFailed => StatusCode::FORBIDDEN,
             Self::NotAuthorized => StatusCode::FORBIDDEN,
             Self::NoAuthentication => StatusCode::UNAUTHORIZED,
+            Self::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+impl From<WebshooterError> for Error {
+    fn from(err: WebshooterError) -> Self {
+        let code = err.status();
+        let status_error = salvo::http::StatusError::from_code(code)
+            .unwrap_or_else(salvo::http::StatusError::internal_server_error)
+            .brief(err.to_string());
+        Error::from(status_error)
     }
 }

@@ -80,13 +80,10 @@ pub fn eis_task(
                     _ = cancel.cancelled() => break,
                     msg = event_rx.recv() => msg,
                     cursor = cursor_rx.recv() => {
-                        match cursor {
-                            Some((x, y)) => {
-                                if mouse_state.update_compositor_pos(x, y) {
-                                    let _ = server_tx.send(ServerDatagram::ReleaseMouse).await;
-                                }
-                            }
-                            None => {}
+                        if let Some((x, y)) = cursor
+                            && mouse_state.update_compositor_pos(x, y)
+                        {
+                            let _ = server_tx.send(ServerDatagram::ReleaseMouse).await;
                         }
                         continue;
                     }
@@ -277,7 +274,7 @@ async fn wait_for_devices(
             event = eis_stream.next() => {
                 match event {
                     Some(Ok(EiEvent::SeatAdded(ev))) => {
-                        ev.seat.bind_capabilities((DeviceCapability::Touch | DeviceCapability::Keyboard | DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll).into());
+                        ev.seat.bind_capabilities(DeviceCapability::Touch | DeviceCapability::Keyboard | DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll);
                         if let Err(e) = connection.flush() {
                             log(format!("EIS: seat bind flush: {e}"));
                         }
@@ -294,23 +291,24 @@ async fn wait_for_devices(
                         }
                     }
                     Some(Ok(EiEvent::DeviceResumed(ev))) => {
-                        if let Some(ref td) = touch_device {
-                            if ev.device == *td {
-                                touch_resumed = true;
-                            }
+                        if let Some(ref td) = touch_device
+                            && ev.device == *td
+                        {
+                            touch_resumed = true;
                         }
-                        if let Some(ref kd) = keyboard_device {
-                            if ev.device == *kd {
-                                keyboard_resumed = true;
-                            }
+                        if let Some(ref kd) = keyboard_device
+                            && ev.device == *kd
+                        {
+                            keyboard_resumed = true;
                         }
-                        if let Some(ref pd) = pointer_device {
-                            if ev.device == *pd {
-                                pointer_resumed = true;
-                            }
+                        if let Some(ref pd) = pointer_device
+                            && ev.device == *pd
+                        {
+                            pointer_resumed = true;
                         }
-                        if let (Some(td), Some(kd), Some(pd)) = (&touch_device, &keyboard_device, &pointer_device) {
-                            if touch_resumed && keyboard_resumed && pointer_resumed {
+                        if let (Some(td), Some(kd), Some(pd)) = (&touch_device, &keyboard_device, &pointer_device)
+                            && touch_resumed && keyboard_resumed && pointer_resumed
+                        {
                                 let touchscreen = td.interface::<ei::Touchscreen>()?;
                                 let keyboard = kd.interface::<ei::Keyboard>()?;
                                 let pointer = pd.interface::<ei::Pointer>()?;
@@ -319,7 +317,6 @@ async fn wait_for_devices(
                                 let same_device = td == kd && kd == pd;
                                 log(format!("EIS: devices ready (all same device: {same_device})"));
                                 return Some((td.clone(), kd.clone(), pd.clone(), touchscreen, keyboard, pointer, button, scroll));
-                            }
                         }
                     }
                     Some(Ok(EiEvent::Disconnected(d))) => {
