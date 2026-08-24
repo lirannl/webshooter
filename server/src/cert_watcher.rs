@@ -7,9 +7,16 @@ use std::{
 };
 use x509_parser::prelude::*;
 
-/// Watches cert and key PEM files on disk and yields a new [`RustlsConfig`]
-/// whenever either file changes. The initial item is emitted immediately so
-/// the TLS listener can start accepting connections right away.
+/// Watches the directory containing the cert and key PEM files and yields a
+/// new [`RustlsConfig`] whenever either file changes. The initial item is
+/// emitted immediately so the TLS listener can start accepting connections
+/// right away.
+///
+/// The PARENT DIRECTORY is watched rather than the files themselves: bundles
+/// are replaced atomically (temp file + rename), which swaps inodes under the
+/// same path. An inotify watch bound to the old inode dies with that first
+/// replacement and would never fire again; a directory watch survives renames
+/// within it.
 ///
 /// Subsequent updates are debounced so that atomic writes (temp + rename)
 /// don't cause redundant reloads.
@@ -21,25 +28,46 @@ pub fn watch_cert_files(
 
     let watch_cert = cert_path.clone();
     let watch_key = key_path.clone();
+    let filter_cert = watch_cert.clone();
+    let filter_key = watch_key.clone();
     std::thread::Builder::new()
         .name("cert-watcher".into())
         .spawn(move || {
-            let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_)) {
-                        let _ = tx.clone().try_send(());
+            let mut watcher =
+                notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res {
+                        // Only renames/writes landing on our two target paths
+                        // matter; ignore unrelated directory traffic and the
+                        // Remove noise from replaced inodes.
+                        let relevant = matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_)
+                        ) && event
+                            .paths
+                            .iter()
+                            .any(|p| p == &filter_cert || p == &filter_key);
+                        if relevant {
+                            let _ = tx.clone().try_send(());
+                        }
                     }
-                }
-            })
-            .expect("failed to create cert file watcher");
+                })
+                .expect("failed to create cert file watcher");
 
-            if let Err(e) = watcher.watch(&watch_cert, notify::RecursiveMode::NonRecursive) {
-                eprintln!("cert watcher: failed to watch {watch_cert:?}: {e}");
-                return;
+            // Watch the containing directories instead of the files (see doc
+            // comment). Cert and key normally share a directory; handle them
+            // separately in case they don't.
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            for target in [&watch_cert, &watch_key] {
+                let dir = target.parent().map(Path::to_path_buf).unwrap_or_else(|| target.clone());
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
             }
-            if let Err(e) = watcher.watch(&watch_key, notify::RecursiveMode::NonRecursive) {
-                eprintln!("cert watcher: failed to watch {watch_key:?}: {e}");
-                return;
+            for dir in &dirs {
+                if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+                    eprintln!("cert watcher: failed to watch {dir:?}: {e}");
+                    return;
+                }
             }
 
             // Keep the OS thread (and watcher) alive for the process lifetime.
