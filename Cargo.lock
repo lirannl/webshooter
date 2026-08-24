@@ -3422,6 +3422,7 @@ dependencies = [
 [[package]]
 name = "ssl_controller"
 version = "0.1.0"
+source = "git+https://github.com/lirannl/ssl_controller.git?rev=af26514#af26514fcc4eb515d01e7e71b1b9cc898d764fba"
 dependencies = [
  "base64 0.23.0",
  "event-listener 2.5.3",

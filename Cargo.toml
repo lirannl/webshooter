@@ -35,7 +35,7 @@ p384 = "0.14"
 pipewire = "^0.9"
 poem = "3.1"
 rand = "0.10"
-ssl_controller = { path = "../ssl_controller", features = ["serde"] }
+ssl_controller = { git = "https://github.com/lirannl/ssl_controller.git", rev = "af26514", features = ["serde"] }
 regex = "1.13"
 reis = "0.7"
 reqwest = "0.13"
