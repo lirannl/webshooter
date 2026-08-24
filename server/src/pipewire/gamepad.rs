@@ -39,7 +39,10 @@ impl GamepadManager {
         rt: i16,
         motion: Option<GamepadMotion>,
     ) {
-        self.gamepads.entry(id).or_insert_with(|| Self::create(id));
+        if !self.gamepads.contains_key(&id) {
+            let joypad = Self::create(id);
+            self.gamepads.insert(id, joypad);
+        }
 
         let joypad = self.gamepads.get(&id).expect("gamepad just inserted");
         // Buttons are delivered as a full snapshot; inputtino diffs internally.

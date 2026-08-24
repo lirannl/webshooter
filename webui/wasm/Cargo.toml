@@ -80,3 +80,4 @@ web-sys = { workspace = true, features = [
     "Text",
 ] }
 shared.workspace = true
+log.workspace = true

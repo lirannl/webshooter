@@ -4,14 +4,11 @@
 /// Create a single `PortalAuthKb` at the start of the capture session,
 /// then call `accept_dialog` for each portal dialog.  The keyboard is
 /// destroyed when it goes out of scope.
-use anyhow::Result;
-use std::future::Future;
-use std::ops::Deref;
-use std::path::PathBuf;
-use std::sync::LazyLock;
+use anyhow::{Result, anyhow};
+use std::{future::Future, ops::Deref, path::PathBuf, sync::LazyLock};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, timeout};
 
 use crate::config::CONFIG_DIR;
 use crate::keyboard::{self, Keyboard};
@@ -60,7 +57,7 @@ pub async fn accept_dialog<T>(
     tokio::pin!(portal_fut);
 
     // Give the dialog 300ms to appear and gain keyboard focus, then
-    // press Enter once.  If the portal completes before the timeout
+    // start pressing Enter.  If the portal completes before the timeout
     // (e.g. the call doesn't show a dialog) we return immediately
     // without injecting anything.
     tokio::select! {
@@ -71,14 +68,32 @@ pub async fn accept_dialog<T>(
         _ = sleep(Duration::from_millis(300)) => {},
     }
 
-    println!("[portal_auth] pressing Enter once");
-    if let Some(k) = kb.as_mut() {
-        k.press_key(keyboard::ENTER);
-        sleep(Duration::from_millis(50)).await;
-        k.release_key(keyboard::ENTER);
-    }
-
-    let result = portal_fut.await;
-    println!("[portal_auth] portal call completed");
-    result
+    timeout(
+        Duration::from_secs(30),
+        // Press and release Enter every ~150 ms until the dialog is accepted,
+        // so a dialog that is slow to appear or gain focus is still caught.
+        // Give up (and exit) after 30s rather than blocking startup forever.
+        async {
+            loop {
+                println!("[portal_auth] pressing Enter");
+                if let Some(k) = kb.as_mut() {
+                    k.press_key(keyboard::ENTER);
+                    sleep(Duration::from_millis(50)).await;
+                    k.release_key(keyboard::ENTER);
+                }
+                tokio::select! {
+                    result = portal_fut.as_mut() => {
+                        println!("[portal_auth] portal call completed");
+                        return result;
+                    }
+                    _ = sleep(Duration::from_millis(100)) => {},
+                }
+            }
+        },
+    )
+    .await
+    .unwrap_or_else(|err| {
+        eprintln!("[portal_auth] timed out waiting for portal approval");
+        Err(anyhow!(err))
+    })
 }

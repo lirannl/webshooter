@@ -227,15 +227,11 @@ impl AudioPlayer {
         let arr = js_sys::Uint8Array::from(&assembled[..]);
         let init = EncodedAudioChunkInit::new(
             arr.unchecked_ref::<js_sys::Object>(),
-            ts as i32,
+            ts as f64,
             EncodedAudioChunkType::Key,
         );
         match EncodedAudioChunk::new(&init) {
-            Ok(chunk) => {
-                if let Err(e) = self.decoder.decode(&chunk) {
-                    log(format!("audio: decode failed: {e:?}"));
-                }
-            }
+            Ok(chunk) => self.decoder.decode(&chunk),
             Err(e) => log(format!("audio: EncodedAudioChunk::new failed: {e:?}")),
         }
     }

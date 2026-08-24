@@ -111,10 +111,9 @@ mod ipc_funcs {
 
     use super::IPCConnection;
 
-    type IpcPayload = Option<(IPCMessage, IPCConnection)>;
     static IPC: OnceLock<(
-        async_channel::Sender<IpcPayload>,
-        async_channel::Receiver<IpcPayload>,
+        async_channel::Sender<Option<(IPCMessage, IPCConnection)>>,
+        async_channel::Receiver<Option<(IPCMessage, IPCConnection)>>,
     )> = Default::default();
 
     pub async fn ipc_init() -> () {
@@ -223,7 +222,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
 
                 let mut buf = Vec::new();
                 conn.read_buf(&mut buf).await?;
-                let message = serde_json::from_slice(&buf)?;
+                let message = serde_json::from_slice(&mut buf)?;
 
                 let response = match message {
                     IPCMessage::Authorise(_) => {
@@ -241,7 +240,6 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                     IPCMessage::ReleaseMouse => None,
                     IPCMessage::FullscreenToggle(_) => None,
                 };
-                #[allow(clippy::collapsible_if)]
                 if let Some(message) = response {
                     conn.write(message.as_bytes()).await?;
                 } else {

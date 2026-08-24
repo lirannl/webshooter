@@ -1,37 +1,19 @@
 use anyhow::{Result, anyhow};
 use data_encoding::BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
+use ssl_controller::{AsyncFilesystemMode, CertKeyPaths, GenerationMethod, SslControllerConfiguration};
 use std::{
     collections::HashSet,
     fmt::Display,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     ops::Deref,
     path::{Path, PathBuf},
     str::FromStr,
     sync::OnceLock,
+    time::Duration,
 };
 
 pub static CONFIG_DIR: OnceLock<PathBuf> = Default::default();
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SslConfig {
-    pub key: PathBuf,
-    pub certificate: PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HttpConfig {
-    pub host: IpAddr,
-    pub port: u16,
-    #[serde(flatten)]
-    pub ssl_conf: SslConfig,
-}
-
-impl From<&HttpConfig> for SocketAddr {
-    fn from(c: &HttpConfig) -> SocketAddr {
-        SocketAddr::new(c.host, c.port)
-    }
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -41,20 +23,14 @@ pub struct Config {
     version: String,
     #[serde(default)]
     pub authorised_keys: HashSet<Bytes64>,
+    pub host: IpAddr,
+    pub port: u16,
     #[serde(flatten)]
-    pub http_config: HttpConfig,
+    pub ssl: SslControllerConfiguration<AsyncFilesystemMode>,
     #[serde(default)]
     pub auth_timeout: Option<u64>,
     #[serde(default)]
     pub rate_limit: Option<u32>,
-    #[serde(default = "default_settings::permitted_domains")]
-    pub webtransport_permitted_domains: Vec<String>,
-}
-
-mod default_settings {
-    pub fn permitted_domains() -> Vec<String> {
-        ["localhost", "127.0.0.1"].map(str::to_string).to_vec()
-    }
 }
 
 fn default_version() -> String {
@@ -66,18 +42,23 @@ impl Config {
         let parent = path
             .parent()
             .ok_or(anyhow!("The config path must be a file"))?;
+        let host = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         Ok(Self {
             path: path.to_owned(),
             version: default_version(),
-            http_config: HttpConfig {
-                host: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                port: 443,
-                ssl_conf: SslConfig {
+            host,
+            port: 443,
+            ssl: SslControllerConfiguration::new(
+                CertKeyPaths {
+                    cert: parent.join("cert.pem"),
                     key: parent.join("key.pem"),
-                    certificate: parent.join("cert.pem"),
                 },
-            },
-            webtransport_permitted_domains: default_settings::permitted_domains(),
+                GenerationMethod::SelfSigned {
+                    sans: vec!["localhost".to_string(), host.to_string()],
+                    ttl: Duration::from_secs(365 * 24 * 3600),
+                },
+                0.25,
+            ),
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
             rate_limit: Default::default(),
@@ -103,9 +84,9 @@ impl<B: Deref<Target = [u8]>> Deref for Bytes64<B> {
     }
 }
 
-impl<B: Deref<Target = [u8]>> From<Bytes64<B>> for Vec<u8> {
-    fn from(b: Bytes64<B>) -> Vec<u8> {
-        b.0.to_vec()
+impl<B: Deref<Target = [u8]>> Into<Vec<u8>> for Bytes64<B> {
+    fn into(self) -> Vec<u8> {
+        self.0.to_vec()
     }
 }
 
@@ -177,6 +158,6 @@ impl<'de> Deserialize<'de> for Bytes64 {
         let str = deserialiser.deserialize_string(StringVisitor {})?;
         let bytes =
             Bytes64::from_str(&str).map_err(|err| serde::de::Error::custom(err.to_string()))?;
-        Ok(bytes)
+        Ok(bytes.into())
     }
 }

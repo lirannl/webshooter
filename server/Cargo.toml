@@ -18,9 +18,9 @@ ashpd = { workspace = true, features = [
     "remote_desktop",
     "screencast",
 ] }
+rust-embed = { workspace = true, features = ["poem", "mime-guess"] }
 aes.workspace = true
 anyhow.workspace = true
-salvo-http3 = "0.7"
 bitflags.workspace = true
 libc.workspace = true
 async-channel.workspace = true
@@ -35,12 +35,16 @@ http-bytes = { workspace = true, default-features = false, features = [
 mime_guess.workspace = true
 notify.workspace = true
 p384.workspace = true
+poem = { workspace = true, features = [
+    "rustls",
+    "tokio-rustls",
+    "static-files",
+] }
 rand.workspace = true
+ssl_controller.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
-salvo.workspace = true
-rust-embed = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -55,6 +59,8 @@ tokio = { workspace = true, features = [
 toml.workspace = true
 ts-rs.workspace = true
 untrusted.workspace = true
+wtransport.workspace = true
+x509-parser.workspace = true
 ring.workspace = true
 interprocess = { workspace = true, features = ["tokio"] }
 rmp-serde.workspace = true
@@ -62,9 +68,8 @@ pipewire.workspace = true
 shared.workspace = true
 tokio-scoped.workspace = true
 tokio-util.workspace = true
-tokio-stream.workspace = true
-x509-parser.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true
 gstreamer-video.workspace = true
 reis = { workspace = true, features = ["tokio"] }
+log.workspace = true

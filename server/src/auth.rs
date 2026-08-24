@@ -1,81 +1,65 @@
 use crate::config::Bytes64;
-use crate::error::WebshooterError;
-use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
-use crate::{get_config, update_config};
-use data_encoding::{BASE64, BASE64URL};
+use data_encoding::BASE64;
 use ecdsa::signature::Verifier;
+use http::StatusCode;
 use p384::{NistP384, pkcs8::DecodePublicKey};
-use salvo::http::{StatusCode as SalvoStatusCode, header::SET_COOKIE};
-use salvo::{Request, Response, handler};
+use poem::web::{Data, Json};
+use poem::{Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result, handler};
+use rand::{RngExt, rng};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::{error::Elapsed, timeout};
-
-use rand::{RngExt, rng};
-use serde::Deserialize;
 use ts_rs::TS;
+use wtransport::tls::Sha256Digest;
+
+use crate::error::WebshooterError;
+use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
+use crate::{get_config, update_config};
 
 pub static AUTH_SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::default();
-
-/// SHA-256 (raw bytes) of the leaf TLS certificate, kept in sync with the live
-/// [`salvo::conn::rustls::RustlsConfig`] by `cert_watch`. The WebTransport
-/// negotiation endpoint hands this to clients so the browser can pin the
-/// self-signed certificate. Must stay as raw bytes — the browser expects the
-/// `serverCertificateHashes[].value` field to be the 32-byte digest.
-pub static CERT_HASH: LazyLock<Mutex<Vec<u8>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 const CHALLENGE_SIZE: usize = 256;
 
 const COOKIE_SIZE: usize = 1024;
 const COOKIE_TTL: Duration = Duration::from_hours(24);
 
-fn extract_identity(req: &Request) -> Result<Bytes64, WebshooterError> {
-    req.headers()
-        .get("id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|s| Bytes64::from_str(s).ok())
-        .ok_or(WebshooterError::NoAuthentication)
-}
+struct Identity(Bytes64);
 
-#[handler]
-pub async fn check_identity(req: &mut Request, res: &mut Response) {
-    let id = match extract_identity(req) {
-        Ok(id) => id,
-        Err(_) => {
-            res.status_code(SalvoStatusCode::UNAUTHORIZED);
-            return;
-        }
-    };
-    if get_config().await.authorised_keys.contains(&id) {
-        res.status_code(SalvoStatusCode::OK);
-    } else {
-        res.status_code(SalvoStatusCode::FORBIDDEN);
+impl<'a> FromRequest<'a> for Identity {
+    async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
+        let identity = req
+            .headers()
+            .get("id")
+            .and_then(|value| Bytes64::from_str(value.to_str().ok()?).ok())
+            .ok_or(WebshooterError::NoAuthentication)?;
+        Ok(Identity(identity))
     }
 }
 
 #[handler]
-pub async fn get_challenge(req: &mut Request, res: &mut Response) {
-    let id = match extract_identity(req) {
-        Ok(id) => id,
-        Err(_) => {
-            res.status_code(SalvoStatusCode::UNAUTHORIZED);
-            return;
-        }
-    };
+pub async fn check_identity(Identity(id): Identity) -> Result<impl IntoResponse> {
+    if get_config().await.authorised_keys.contains(&id) {
+        Ok(Response::default())
+    } else {
+        Err(WebshooterError::NotAuthorized.into())
+    }
+}
+
+#[handler]
+pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> {
     let _id = id.to_string();
-    let mut challenge = [0_u8; CHALLENGE_SIZE];
+    let mut challenge = [0 as u8; CHALLENGE_SIZE];
     rng().fill(&mut challenge);
     {
         let mut sessions = AUTH_SESSIONS.lock().await;
         sessions.insert(id.into(), Session::Challenged(challenge.to_vec()));
     }
-    res.status_code(SalvoStatusCode::OK);
-    res.body(challenge.to_vec());
+    poem::Result::Ok(Response::builder().body(challenge.to_vec()))
 }
 
 pub enum Session {
@@ -112,7 +96,7 @@ impl LoginParams {
     pub fn into_id(self) -> Bytes64 {
         match self {
             LoginParams::IdOnly { id } => id,
-            LoginParams::Signature { id, .. } => id,
+            LoginParams::Signature { id, .. } => id.into(),
         }
     }
 }
@@ -187,12 +171,14 @@ fn client_ip(req: &Request) -> std::net::IpAddr {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok())
         })
-            .unwrap_or_else(|| {
+        .unwrap_or_else(|| {
             req.remote_addr()
-                .ip()
+                .as_socket_addr()
+                .map(|addr| addr.ip())
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         })
 }
+// const BYTES_TO_SHOW: Range<usize> = 24..8;
 
 fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
     Bytes64(&id[24..24 + 8])
@@ -202,55 +188,39 @@ fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
 }
 
 #[handler]
-pub async fn login(req: &mut Request, res: &mut Response) {
-    let params = match req.parse_json::<LoginParams>().await {
-        Ok(params) => params,
-        Err(err) => {
-            res.status_code(SalvoStatusCode::BAD_REQUEST);
-            res.render(format!("Invalid request body: {err}"));
-            return;
-        }
-    };
-
+pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<impl IntoResponse> {
     let ip = client_ip(req);
     let rate_limit = get_config().await.rate_limit.unwrap_or(10);
     if !check_rate_limit(ip, rate_limit).await {
-        res.status_code(SalvoStatusCode::TOO_MANY_REQUESTS);
-        res.render("Rate limit exceeded");
-        return;
+        return Err(Error::from_string(
+            "Rate limit exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+        ));
     }
 
     match login_inner(params).await {
         Ok(cookie) => {
             reset_rate_limit(ip).await;
-            res.status_code(SalvoStatusCode::OK);
-            if res
-                .add_header(
-                    SET_COOKIE,
+            Ok(Response::builder()
+                .header(
+                    "set-cookie",
                     format!(
                         "token={}; HttpOnly; Secure; SameSite=Strict",
                         BASE64.encode(&cookie),
                     ),
-                    true,
                 )
-                .is_err()
-            {
-                res.status_code(SalvoStatusCode::INTERNAL_SERVER_ERROR);
-                res.render(WebshooterError::InternalServerError.to_string());
-                return;
-            }
+                .finish())
         }
         Err(err) => {
             let status = err.status();
             let msg = err.to_string();
             record_rate_limit_failure(ip).await;
-            res.status_code(status);
-            res.render(msg);
+            Err(Error::from_string(msg, status))
         }
     }
 }
 
-async fn login_inner(params: LoginParams) -> Result<Bytes64, WebshooterError> {
+async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     let mut config = get_config().await;
 
     let (id, signature) = match &params {
@@ -315,8 +285,11 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64, WebshooterError> {
         .await
         .unwrap_or_else(|err| Err(anyhow::Error::from(err)))
         .map_err(|err| match err.downcast::<Elapsed>() {
-            Ok(_) => WebshooterError::NotAuthorized,
-            Err(err) => WebshooterError::InvalidConfig(PathBuf::new(), err),
+            Ok(elapsed) => Error::from_string(
+                format!("Did not authorise within {}", elapsed),
+                StatusCode::FORBIDDEN,
+            ),
+            Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
         })?;
     }
     let sessions = AUTH_SESSIONS.lock().await;
@@ -331,11 +304,11 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64, WebshooterError> {
         .map_err(|_| WebshooterError::InvalidLogin)?;
     let verification = key.verify(
         &challenge,
-        &ecdsa::Signature::from_slice(signature).map_err(|_| WebshooterError::InvalidLogin)?,
+        &ecdsa::Signature::from_slice(&signature).map_err(|_| WebshooterError::InvalidLogin)?,
     );
     verification.map_err(|_| WebshooterError::ChallengeFailed)?;
 
-    let mut cookie = [0_u8; COOKIE_SIZE];
+    let mut cookie = [0 as u8; COOKIE_SIZE];
     rng().fill(&mut cookie);
 
     {
@@ -352,25 +325,23 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64, WebshooterError> {
     let _str = serde_json::to_string(&config).ok();
     update_config(config)
         .await
-        .map_err(|err| WebshooterError::InvalidConfig(PathBuf::new(), err))?;
+        .map_err(|err| Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
     Ok(Bytes64(cookie.to_vec()))
 }
 
 pub struct Authenticated {
-    #[allow(dead_code)]
     pub id: Bytes64,
 }
 
-impl Authenticated {
-    async fn extract(req: &Request) -> Result<Self, WebshooterError> {
+// Implements a token extractor
+impl<'a> FromRequest<'a> for Authenticated {
+    async fn from_request(req: &'a Request, _: &mut RequestBody) -> Result<Self> {
         let token = req
             .headers()
             .get_all("Cookie")
             .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(';'))
-            .filter_map(|cookie| cookie.trim().split_once("="))
+            .filter_map(|value| value.to_str().ok()?.split_once("="))
             .find_map(|(k, v)| if k == "token" { Some(v) } else { None })
             .ok_or(WebshooterError::NoAuthentication)?;
         let current_sessions = AUTH_SESSIONS
@@ -396,6 +367,19 @@ impl Authenticated {
             id: Bytes64(id.clone()),
         })
     }
+}
+
+pub use onetime::OnetimeToken;
+#[handler]
+pub async fn negotiate_wt(
+    Data(cert_hash): Data<&Sha256Digest>,
+    Authenticated { .. }: Authenticated,
+) -> Result<impl IntoResponse> {
+    let token = OnetimeToken::new().await.to_vec();
+    let token = Bytes64(token).to_string();
+    Ok(poem::Response::builder()
+        .header("token", token)
+        .body(cert_hash.as_ref().to_vec()))
 }
 
 mod onetime {
@@ -432,7 +416,8 @@ mod onetime {
         }
         pub async fn check(self) -> bool {
             let hash_set = &mut ONETIME_AUTHORISATIONS.lock().await;
-            hash_set.remove(&self)
+            let token_was_present = hash_set.remove(&self);
+            token_was_present
         }
     }
     impl<B: Deref<Target = [u8]>> TryFrom<Bytes64<B>> for OnetimeToken {
@@ -458,36 +443,4 @@ mod onetime {
             &self.0
         }
     }
-}
-
-pub use onetime::OnetimeToken;
-
-#[handler]
-pub async fn negotiate_wt(req: &mut Request, res: &mut Response) {
-    if Authenticated::extract(req).await.is_err() {
-        res.status_code(SalvoStatusCode::FORBIDDEN);
-        res.render(WebshooterError::NotAuthorized.to_string());
-        return;
-    }
-    let token = OnetimeToken::new().await;
-    let token = BASE64URL.encode(&token);
-    let cert_hash = CERT_HASH.lock().await.clone();
-    if res.add_header("token", token, true).is_err() {
-        res.status_code(SalvoStatusCode::INTERNAL_SERVER_ERROR);
-        res.render(WebshooterError::InternalServerError.to_string());
-        return;
-    }
-    res.status_code(SalvoStatusCode::OK);
-    res.body(cert_hash);
-}
-
-#[handler]
-pub async fn check_auth(req: &mut Request, res: &mut Response) {
-    if Authenticated::extract(req).await.is_err() {
-        res.status_code(SalvoStatusCode::FORBIDDEN);
-        res.render(WebshooterError::NotAuthorized.to_string());
-        return;
-    }
-    res.status_code(SalvoStatusCode::OK);
-    res.render("Authenticated");
 }
