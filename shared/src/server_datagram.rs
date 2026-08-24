@@ -1,4 +1,5 @@
 use crate::codec::Codec;
+use log::LevelFilter;
 use anyhow::Result;
 use named_constants::named_constants;
 
@@ -45,6 +46,11 @@ pub enum ServerDatagram {
     },
     ReleaseMouse,
     ToggleFullscreen,
+    /// Announces the server's configured maximum log level so the client
+    /// stops generating (and forwarding) records below that severity.
+    LogLevel {
+        level: LevelFilter,
+    },
     AudioFrame {
         frame_id: u16,
         frag_idx: u16,
@@ -100,6 +106,10 @@ impl ServerDatagram {
             }
             Self::ReleaseMouse => vec![ServerDatagramVariants::RELEASE_MOUSE.0],
             Self::ToggleFullscreen => vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
+            Self::LogLevel { level } => vec![
+                ServerDatagramVariants::LOG_LEVEL.0,
+                crate::log_level::filter_to_byte(*level),
+            ],
             Self::AudioFrame {
                 frame_id,
                 frag_idx,
@@ -149,6 +159,14 @@ impl ServerDatagram {
             }
             ServerDatagramVariants::RELEASE_MOUSE => Ok(Self::ReleaseMouse),
             ServerDatagramVariants::TOGGLE_FULLSCREEN => Ok(Self::ToggleFullscreen),
+            ServerDatagramVariants::LOG_LEVEL => {
+                if bytes.len() < 2 {
+                    anyhow::bail!("LogLevel datagram too short: {} bytes", bytes.len());
+                }
+                Ok(Self::LogLevel {
+                    level: crate::log_level::filter_from_byte(bytes[1])?,
+                })
+            }
             ServerDatagramVariants::AUDIO_FRAME => {
                 // 1 discriminant + 2*3 frame metadata + 1 channels + 4 rate + 1 format
                 const H: usize = 13;

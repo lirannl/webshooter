@@ -10,7 +10,6 @@ use tokio::sync::{broadcast::Receiver, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::logging::log;
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram::ServerDatagram;
 
@@ -173,7 +172,7 @@ async fn eis_main(
     let context = match ei::Context::new(stream) {
         Ok(c) => c,
         Err(e) => {
-            log(format!("EIS: failed to create context: {e}"));
+            log::error!("EIS: failed to create context: {e}");
             return;
         }
     };
@@ -184,12 +183,12 @@ async fn eis_main(
     {
         Ok(pair) => pair,
         Err(e) => {
-            log(format!("EIS: handshake failed: {e}"));
+            log::error!("EIS: handshake failed: {e}");
             return;
         }
     };
     if let Err(e) = connection.flush() {
-        log(format!("EIS: initial flush failed: {e}"));
+        log::error!("EIS: initial flush failed: {e}");
         return;
     }
 
@@ -214,12 +213,12 @@ async fn eis_main(
                         wait_for_resume(&mut eis_stream, &cancel).await;
                     }
                     Some(Ok(EiEvent::Disconnected(d))) => {
-                        log(format!("EIS: disconnected: {:?}", d.reason));
+                        log::warn!("EIS: disconnected: {:?}", d.reason);
                         break;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        log(format!("EIS: event error: {e}"));
+                        log::warn!("EIS: event error: {e}");
                         break;
                     }
                     None => break,
@@ -279,7 +278,7 @@ async fn wait_for_devices(
                     Some(Ok(EiEvent::SeatAdded(ev))) => {
                         ev.seat.bind_capabilities((DeviceCapability::Touch | DeviceCapability::Keyboard | DeviceCapability::Pointer | DeviceCapability::Button | DeviceCapability::Scroll).into());
                         if let Err(e) = connection.flush() {
-                            log(format!("EIS: seat bind flush: {e}"));
+                            log::error!("EIS: seat bind flush: {e}");
                         }
                     }
                     Some(Ok(EiEvent::DeviceAdded(ev))) => {
@@ -317,18 +316,18 @@ async fn wait_for_devices(
                                 let button = pd.interface::<ei::Button>()?;
                                 let scroll = pd.interface::<ei::Scroll>()?;
                                 let same_device = td == kd && kd == pd;
-                                log(format!("EIS: devices ready (all same device: {same_device})"));
+                                log::info!("EIS: devices ready (all same device: {same_device})");
                                 return Some((td.clone(), kd.clone(), pd.clone(), touchscreen, keyboard, pointer, button, scroll));
                             }
                         }
                     }
                     Some(Ok(EiEvent::Disconnected(d))) => {
-                        log(format!("EIS: disconnected: {:?}", d.reason));
+                        log::warn!("EIS: disconnected: {:?}", d.reason);
                         return None;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        log(format!("EIS: event error during setup: {e}"));
+                        log::warn!("EIS: event error during setup: {e}");
                         return None;
                     }
                     None => return None,

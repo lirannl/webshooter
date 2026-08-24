@@ -21,7 +21,6 @@ use config::Config;
 use error::WebshooterError;
 use futures_util::TryFutureExt;
 use ipc::setup_ipc;
-use logging::log;
 use poem::{
     EndpointExt, IntoResponse, Response, Route, Server, get, handler,
     listener::{Listener, TcpListener},
@@ -76,6 +75,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
+    logging::init();
+
     #[cfg(target_os = "linux")]
     {
         ensure_xdg_runtime_dir()?;
@@ -102,6 +103,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     loop {
         let config = get_config().await;
+        logging::set_level(config.log_level);
 
         setup_ipc(config.clone()).await?;
 
@@ -141,12 +143,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .at("/*", frontend::frontend);
 
         let handle_0 = tokio::spawn(Server::new(listener).run(app).or_else(async |err| {
-            log(err);
+            log::error!("{err:#?}");
             reset_app();
             Ok::<_, anyhow::Error>(())
         }));
         let handle_1 = tokio::spawn(setup_wt(config.clone(), identity).or_else(async |err| {
-            log(err);
+            log::error!("{err:#?}");
             reset_app();
             Ok::<_, anyhow::Error>(())
         }));

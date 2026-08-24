@@ -15,7 +15,7 @@ use web_sys::{
     WebTransportOptions, WritableStreamDefaultWriter,
 };
 
-use crate::log::log;
+use crate::log::init as init_log;
 
 // ---------------------------------------------------------------------------
 // Global WebTransport handle
@@ -33,15 +33,19 @@ thread_local! {
     static GLOBAL_WT: RefCell<Option<GlobalWt>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn send_error(msg: &str) {
-    let bytes = ClientDatagram::Error {
-        message: msg.to_string(),
-    }
-    .to_bytes();
-    let buf = Uint8Array::from(&bytes[..]);
-    with_wt(|gwt| {
-        let _ = gwt.writer.write_with_chunk(buf.as_ref());
-    });
+/// Try to forward an error message to the server over the WebTransport
+/// error channel, tagged with its severity. Returns `false` when the
+/// transport is not initialised (e.g. before connection setup or after it
+/// was torn down).
+pub(crate) fn try_send_error(level: ::log::Level, msg: &str) -> bool {
+    let buf = crate::log::encode_error(level, msg);
+    GLOBAL_WT.with(|cell| match cell.borrow_mut().as_mut() {
+        Some(gwt) => {
+            let _ = gwt.writer.write_with_chunk(buf.as_ref());
+            true
+        }
+        None => false,
+    })
 }
 
 pub(crate) fn with_wt<F, R>(f: F) -> R
@@ -90,6 +94,7 @@ fn show_connection_lost() -> Option<()> {
 
 #[wasm_bindgen]
 pub async fn start() -> Result<(), JsValue> {
+    init_log();
     let window = web_sys::window().ok_or("no window")?;
     let location = window.location();
     let href = location.href()?;
@@ -159,11 +164,13 @@ pub async fn start() -> Result<(), JsValue> {
         keepalive.forget();
 
         // 7. Advertise decoder capabilities.
-        video::send_decoder_capabilities().unwrap_or_else(|err| log(err));
+        video::send_decoder_capabilities()
+        .unwrap_or_else(|err| ::log::warn!("decoder capabilities not sent: {err:#?}"));
 
         // 8. Canvas + video
         let canvas = video::setup_canvas();
-        video::send_initial_resize(&canvas).unwrap_or_else(|err| log(err));
+        video::send_initial_resize(&canvas)
+        .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
         let pending_fullscreen = video::setup_resize_prompt(&canvas);
 
         // 9. Render loop
@@ -179,7 +186,7 @@ pub async fn start() -> Result<(), JsValue> {
 
         // 10. Wait for render loop to finish (signals connection closed).
         if let Err(e) = render_loop.await {
-            send_error(&format!("render_loop error: {e:?}"));
+            ::log::error!("render_loop error: {e:?}");
             show_connection_lost();
         }
 
@@ -189,7 +196,7 @@ pub async fn start() -> Result<(), JsValue> {
     .await;
 
     if let Err(e) = result {
-        send_error(&format!("start error after transport ready: {e:?}"));
+        ::log::error!("start error after transport ready: {e:?}");
         show_connection_lost();
     }
     Ok(())

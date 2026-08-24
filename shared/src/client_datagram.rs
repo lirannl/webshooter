@@ -1,5 +1,6 @@
 use crate::codec::Codec;
 use anyhow::Result;
+use log::Level;
 use named_constants::named_constants;
 
 bitflags::bitflags! {
@@ -128,6 +129,7 @@ pub enum ClientDatagram {
         id: u8,
     },
     Error {
+        level: Level,
         message: String,
     },
     DecoderCapabilities {
@@ -221,17 +223,23 @@ impl ClientDatagram {
                     Some(m) => {
                         buf.push(1);
                         let ax = (m.accel_x as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         let ay = (m.accel_y as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         let az = (m.accel_z as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         let gx = (m.gyro_x as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         let gy = (m.gyro_y as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         let gz = (m.gyro_z as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+                            .clamp(i16::MIN as f64, i16::MAX as f64)
+                            as i16;
                         buf.extend_from_slice(&ax.to_be_bytes());
                         buf.extend_from_slice(&ay.to_be_bytes());
                         buf.extend_from_slice(&az.to_be_bytes());
@@ -245,9 +253,10 @@ impl ClientDatagram {
             Self::GamepadDisconnect { id } => {
                 vec![ClientDatagramVariants::GAMEPAD_DISCONNECT.0, *id]
             }
-            Self::Error { message } => {
-                let mut buf = Vec::with_capacity(message.len() + 1);
+            Self::Error { level, message } => {
+                let mut buf = Vec::with_capacity(2 + message.len());
                 buf.push(ClientDatagramVariants::ERROR.0);
+                buf.push(crate::log_level::level_to_byte(*level));
                 buf.extend_from_slice(message.as_bytes());
                 buf
             }
@@ -330,12 +339,18 @@ impl ClientDatagram {
                 let lt = i16::from_be_bytes([bytes[14], bytes[15]]);
                 let rt = i16::from_be_bytes([bytes[16], bytes[17]]);
                 let motion = if bytes.len() >= 33 && bytes[18] != 0 {
-                    let accel_x = i16::from_be_bytes([bytes[19], bytes[20]]) as f64 / MOTION_ACCEL_SCALE;
-                    let accel_y = i16::from_be_bytes([bytes[21], bytes[22]]) as f64 / MOTION_ACCEL_SCALE;
-                    let accel_z = i16::from_be_bytes([bytes[23], bytes[24]]) as f64 / MOTION_ACCEL_SCALE;
-                    let gyro_x = i16::from_be_bytes([bytes[25], bytes[26]]) as f64 / MOTION_GYRO_SCALE;
-                    let gyro_y = i16::from_be_bytes([bytes[27], bytes[28]]) as f64 / MOTION_GYRO_SCALE;
-                    let gyro_z = i16::from_be_bytes([bytes[29], bytes[30]]) as f64 / MOTION_GYRO_SCALE;
+                    let accel_x =
+                        i16::from_be_bytes([bytes[19], bytes[20]]) as f64 / MOTION_ACCEL_SCALE;
+                    let accel_y =
+                        i16::from_be_bytes([bytes[21], bytes[22]]) as f64 / MOTION_ACCEL_SCALE;
+                    let accel_z =
+                        i16::from_be_bytes([bytes[23], bytes[24]]) as f64 / MOTION_ACCEL_SCALE;
+                    let gyro_x =
+                        i16::from_be_bytes([bytes[25], bytes[26]]) as f64 / MOTION_GYRO_SCALE;
+                    let gyro_y =
+                        i16::from_be_bytes([bytes[27], bytes[28]]) as f64 / MOTION_GYRO_SCALE;
+                    let gyro_z =
+                        i16::from_be_bytes([bytes[29], bytes[30]]) as f64 / MOTION_GYRO_SCALE;
                     Some(GamepadMotion {
                         accel_x: accel_x as f32,
                         accel_y: accel_y as f32,
@@ -363,9 +378,15 @@ impl ClientDatagram {
                 let id = bytes[1];
                 Self::GamepadDisconnect { id }
             }
-            ClientDatagramVariants::ERROR => Self::Error {
-                message: String::from_utf8_lossy(&bytes[1..]).into_owned(),
-            },
+            ClientDatagramVariants::ERROR => {
+                if bytes.len() < 2 {
+                    anyhow::bail!("Error datagram too short: {} bytes", bytes.len());
+                }
+                Self::Error {
+                    level: crate::log_level::level_from_byte(bytes[1])?,
+                    message: String::from_utf8_lossy(&bytes[2..]).into_owned(),
+                }
+            }
             ClientDatagramVariants::DECODER_CAPABILITIES => {
                 let len = bytes[1] as usize;
                 let decoders = (0..len)

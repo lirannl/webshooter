@@ -5,7 +5,6 @@ use reis::event as reis_event;
 
 use shared::client_datagram::Modifiers;
 
-use crate::logging::log;
 
 use super::eis::timestamp_us;
 
@@ -348,7 +347,7 @@ pub fn send_keyboard_key(
     device.device().stop_emulating(serial);
 
     if let Err(e) = connection.flush() {
-        crate::logging::log(format!("EIS: keyboard flush error: {e}"));
+        log::error!("EIS: keyboard flush error: {e}");
     }
 }
 
@@ -394,7 +393,7 @@ impl KeyboardState {
             events.push(EisKeyboardEvent { key, press: true });
             events.push(EisKeyboardEvent { key, press: false });
         } else {
-            log(format!("EIS keyboard: unmapped keycode: {keycode}"));
+            log::debug!("EIS keyboard: unmapped keycode: {keycode}");
         }
 
         events

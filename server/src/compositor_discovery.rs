@@ -2,7 +2,6 @@ use std::{env, os::unix::fs::FileTypeExt, path::Path};
 
 use anyhow::{Context, Result};
 
-use crate::logging::log;
 
 /// Return the id of the first logind session belonging to `uid` that has a
 /// seat assigned (i.e. a graphical session). Used to discover session-derived
@@ -66,9 +65,9 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
             unsafe {
                 env::set_var("XDG_RUNTIME_DIR", &dir);
             }
-            log(format!(
+            log::info!(
                 "Discovered XDG_RUNTIME_DIR={dir} from session {session_id}"
-            ));
+            );
             Ok(())
         }
         Ok(None) => anyhow::bail!(
@@ -82,9 +81,9 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
                 unsafe {
                     env::set_var("XDG_RUNTIME_DIR", &dir);
                 }
-                log(format!(
+                log::info!(
                     "Set XDG_RUNTIME_DIR={dir} by convention (no logind available)"
-                ));
+                );
                 Ok(())
             } else {
                 anyhow::bail!(
@@ -126,9 +125,9 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
                         unsafe {
                             env::set_var("XDG_CURRENT_DESKTOP", desktop);
                         }
-                        log(format!(
+                        log::info!(
                             "Discovered XDG_CURRENT_DESKTOP={desktop} from session {session_id}"
-                        ));
+                        );
                         return Ok(());
                     }
                 }
@@ -142,9 +141,9 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
         unsafe {
             env::set_var("XDG_CURRENT_DESKTOP", &desktop);
         }
-        log(format!(
+        log::info!(
             "Inferred XDG_CURRENT_DESKTOP={desktop} from running compositor"
-        ));
+        );
         return Ok(());
     }
 
@@ -156,9 +155,9 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
             unsafe {
                 env::set_var("XDG_CURRENT_DESKTOP", &desktop);
             }
-            log(format!(
+            log::info!(
                 "Using DESKTOP_SESSION={desktop} for XDG_CURRENT_DESKTOP"
-            ));
+            );
             return Ok(());
         }
     }
@@ -246,9 +245,9 @@ pub(super) fn ensure_wayland_display() -> Result<()> {
             unsafe {
                 env::set_var("WAYLAND_DISPLAY", &display);
             }
-            log(format!(
+            log::info!(
                 "Discovered WAYLAND_DISPLAY={display} in {runtime_dir:?}"
-            ));
+            );
         }
         None => {
             // No socket found: fall back to the conventional default.
@@ -256,7 +255,7 @@ pub(super) fn ensure_wayland_display() -> Result<()> {
             unsafe {
                 env::set_var("WAYLAND_DISPLAY", "wayland-0");
             }
-            log("No Wayland socket found; defaulting WAYLAND_DISPLAY=wayland-0");
+            log::warn!("No Wayland socket found; defaulting WAYLAND_DISPLAY=wayland-0");
         }
     }
     Ok(())

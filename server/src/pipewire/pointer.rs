@@ -1,7 +1,6 @@
 use reis::ei;
 use reis::ei::button::ButtonState;
 
-use crate::logging::log;
 
 use super::eis::timestamp_us;
 
@@ -103,7 +102,7 @@ pub(crate) fn send_pointer_motion(
     device.device().stop_emulating(serial);
 
     if let Err(e) = connection.flush() {
-        log(format!("EIS: pointer flush error: {e}"));
+        log::error!("EIS: pointer flush error: {e}");
     }
 }
 
@@ -132,7 +131,7 @@ pub(crate) fn send_button_event(
     device.device().stop_emulating(serial);
 
     if let Err(e) = connection.flush() {
-        log(format!("EIS: button flush error: {e}"));
+        log::error!("EIS: button flush error: {e}");
     }
 }
 
@@ -156,6 +155,6 @@ pub(crate) fn send_scroll_event(
     device.device().stop_emulating(serial);
 
     if let Err(e) = connection.flush() {
-        log(format!("EIS: scroll flush error: {e}"));
+        log::error!("EIS: scroll flush error: {e}");
     }
 }

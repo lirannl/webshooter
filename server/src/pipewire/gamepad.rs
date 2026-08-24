@@ -6,7 +6,6 @@ use inputtino::{
 
 use shared::client_datagram::{gamepad_client_buttons_to_inputtino, GamepadMotion};
 
-use crate::logging::log;
 
 /// Manages the set of virtual gamepads we expose to the host.
 ///
@@ -74,7 +73,7 @@ impl GamepadManager {
     /// Remove and drop the virtual device for `id`, if present.
     pub fn remove(&mut self, id: u8) {
         if self.gamepads.remove(&id).is_some() {
-            log(format!("Gamepad: removed virtual device {id}"));
+            log::info!("Gamepad: removed virtual device {id}");
         }
     }
 
@@ -85,10 +84,10 @@ impl GamepadManager {
             Joypad::PS5(PS5Joypad::new(&def).expect("failed to create virtual gamepad"));
         if let Joypad::PS5(inner) = &joypad {
             match inner.get_nodes() {
-                Ok(nodes) => log(format!(
+                Ok(nodes) => log::info!(
                     "Gamepad: created virtual device {id} at {nodes:?}"
-                )),
-                Err(e) => log(format!("Gamepad: created device {id} (nodes unknown: {e})")),
+                ),
+                Err(e) => log::info!("Gamepad: created device {id} (nodes unknown: {e})"),
             }
         }
         joypad

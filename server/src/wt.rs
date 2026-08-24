@@ -2,10 +2,10 @@ use crate::{
     auth::OnetimeToken,
     config::{Bytes64, Config},
     error::WebshooterError,
-    logging::log,
     pipewire::video,
 };
 use anyhow::Result;
+use log::LevelFilter;
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram;
 use std::{
@@ -36,6 +36,7 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
 
     let server = Endpoint::server(server_config)?;
 
+    let max_log_level = config.log_level;
     let mut active: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
@@ -49,10 +50,10 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
 
         active = Some(tokio::spawn(async move {
             match webtransport_auth(session).await {
-                Ok(connection) => handle_wt_connection(connection)
+                Ok(connection) => handle_wt_connection(connection, max_log_level)
                     .await
-                    .unwrap_or_else(|err| log(err)),
-                Err(err) => log(err),
+                    .unwrap_or_else(|err| log::error!("{err:#?}")),
+                Err(err) => log::error!("{err:#?}"),
             }
         }));
     }
@@ -90,8 +91,18 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 
 pub async fn handle_wt_connection(
     connection: Connection,
+    max_log_level: LevelFilter,
 ) -> Result<()> {
     let _connection = Arc::new(connection);
+
+    // Tell the client how verbose we are so it stops generating records we
+    // would discard anyway.
+    let _ = _connection.send_datagram(
+        &shared::server_datagram::ServerDatagram::LogLevel {
+            level: max_log_level,
+        }
+        .to_bytes(),
+    );
 
     let (_broadcaster, _client_rx) = broadcast::channel(256);
     let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
@@ -104,7 +115,9 @@ pub async fn handle_wt_connection(
         spawn(async move {
             loop {
                 match client_rx.recv().await {
-                    Ok(ClientDatagram::Error { message }) => log(&message),
+                    Ok(ClientDatagram::Error { level, message }) => {
+                        log::log!(target: "webshooter::client", level, "{message}");
+                    }
                     Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
                         *decoder_caps.lock().unwrap() = Some(decoders);
                     }
@@ -126,18 +139,18 @@ pub async fn handle_wt_connection(
         // while waiting for the initial resize doesn't leave a zombie capture.
         let (frame_rx, server_msg_rx, handle) = tokio::select! {
             r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r?,
-            _ = &mut datagrams  => { log("Datagrams closed");              break; }
-            _ = &mut unistreams => { log("Unidirectional streams closed");  break; }
-            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
+            _ = &mut datagrams  => { log::info!("Datagrams closed");              break; }
+            _ = &mut unistreams => { log::info!("Unidirectional streams closed");  break; }
+            _ = _connection.closed() => { log::info!("WebTransport connection closed by peer"); break; }
         };
         capture_handle = Some(handle);
         let frame_forwarder = frame_forwarder(frame_rx, server_msg_rx, _connection.clone());
 
         tokio::select! {
-            _ = datagrams => { log("Datagrams closed"); break; }
-            _ = unistreams => { log("Unidirectional streams closed");  break; }
-            _ = frame_forwarder => { log("capture pipeline stopped");  break; }
-            _ = _connection.closed() => { log("WebTransport connection closed by peer"); break; }
+            _ = datagrams => { log::info!("Datagrams closed"); break; }
+            _ = unistreams => { log::info!("Unidirectional streams closed");  break; }
+            _ = frame_forwarder => { log::info!("capture pipeline stopped");  break; }
+            _ = _connection.closed() => { log::info!("WebTransport connection closed by peer"); break; }
         }
     }
 
@@ -220,7 +233,7 @@ fn frame_forwarder(
                             chunk,
                         );
                         if wt.send_datagram(&dgram).is_err() {
-                            log("send_datagram failed: connection closed");
+                            log::warn!("send_datagram failed: connection closed");
                             send_ok = false;
                             break;
                         }
@@ -234,7 +247,7 @@ fn frame_forwarder(
                     let Some(dgram) = msg else { break };
                     let bytes = dgram.to_bytes();
                     if wt.send_datagram(&bytes).is_err() {
-                        log("send_datagram (control) failed: connection closed");
+                        log::warn!("send_datagram (control) failed: connection closed");
                         break;
                     }
                 }

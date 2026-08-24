@@ -2,7 +2,6 @@ use std::collections::HashSet;
 
 use reis::ei;
 
-use crate::logging::log;
 
 use super::eis::timestamp_us;
 
@@ -90,6 +89,6 @@ pub(crate) fn send_touch_event(
     device.device().stop_emulating(serial);
 
     if let Err(e) = connection.flush() {
-        log(format!("EIS: flush error: {e}"));
+        log::error!("EIS: flush error: {e}");
     }
 }

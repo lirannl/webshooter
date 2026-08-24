@@ -6,7 +6,6 @@ use js_sys::Float32Array;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::log::log;
 use web_sys::{
     AudioBuffer, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder, AudioDecoderConfig,
     AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
@@ -55,11 +54,11 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     pub fn new() -> Option<AudioPlayer> {
         let ctx = web_sys::AudioContext::new().ok()?;
-        log(format!(
+        log::debug!(
             "audio: AudioContext created, state={:?} sampleRate={}",
             ctx.state(),
             ctx.sample_rate()
-        ));
+        );
 
         let state = Rc::new(RefCell::new(PlaybackState {
             ctx: ctx.clone(),
@@ -81,9 +80,9 @@ impl AudioPlayer {
                     let st = report_state.borrow();
                     (st.peak_max.get(), st.frame_count.get(), st.ctx.state())
                 };
-                log(format!(
+                log::debug!(
                     "audio: levels report peak={peak:.4} frames_in_window={frames} ctx={ctx_state:?}"
-                ));
+                );
                 report_state.borrow().peak_max.set(0.0);
                 report_state.borrow().frame_count.set(0);
             }) as Box<dyn FnMut()>);
@@ -102,7 +101,7 @@ impl AudioPlayer {
         }) as Box<dyn FnMut(AudioData)>);
         let error_cb = Closure::wrap(Box::new(move |err: JsValue| {
             web_sys::console::error_1(&format!("AudioDecoder error: {:?}", err).into());
-            log(format!("audio: AudioDecoder error: {err:?}"));
+            log::error!("audio: AudioDecoder error: {err:?}");
         }) as Box<dyn FnMut(JsValue)>);
 
         let init = js_sys::Object::new();
@@ -141,7 +140,7 @@ impl AudioPlayer {
             {
                 ready_state.borrow().audio_ready.set(true);
                 crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady);
-                log("audio: AudioContext Running — sent AudioReady to server");
+                log::info!("audio: AudioContext Running — sent AudioReady to server");
             }
         }) as Box<dyn FnMut()>);
         ctx.set_onstatechange(Some(ready_cb.as_ref().unchecked_ref()));
@@ -151,10 +150,10 @@ impl AudioPlayer {
         if ctx.state() == web_sys::AudioContextState::Running && !state.borrow().audio_ready.get() {
             state.borrow().audio_ready.set(true);
             crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady);
-            log("audio: AudioContext Running — sent AudioReady to server");
+            log::info!("audio: AudioContext Running — sent AudioReady to server");
         }
 
-        log("audio: AudioPlayer created");
+        log::info!("audio: AudioPlayer created");
         Some(AudioPlayer {
             decoder,
             pending: RefCell::new(HashMap::new()),
@@ -232,7 +231,7 @@ impl AudioPlayer {
         );
         match EncodedAudioChunk::new(&init) {
             Ok(chunk) => self.decoder.decode(&chunk),
-            Err(e) => log(format!("audio: EncodedAudioChunk::new failed: {e:?}")),
+            Err(e) => log::error!("audio: EncodedAudioChunk::new failed: {e:?}"),
         }
     }
 }
@@ -241,15 +240,15 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
     static ENTERED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let e = ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if e < 3 {
-        log(format!("audio: output callback fired (#{e})"));
+        log::debug!("audio: output callback fired (#{e})");
     }
     let channels = data.number_of_channels();
     let frames = data.number_of_frames();
     let sample_rate = data.sample_rate();
     if channels == 0 || frames == 0 {
-        log(format!(
+        log::debug!(
             "audio: empty AudioData dropped (channels={channels} frames={frames})"
-        ));
+        );
         data.close();
         return;
     }
@@ -267,7 +266,7 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
     let buffer: AudioBuffer = match ctx.create_buffer(channels, frames, sample_rate) {
         Ok(b) => b,
         Err(e) => {
-            log(format!("audio: create_buffer failed: {e:?}"));
+            log::error!("audio: create_buffer failed: {e:?}");
             data.close();
             return;
         }
@@ -287,9 +286,9 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
             static PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = PEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
-                log(format!(
+                log::debug!(
                     "audio: pcm ch0 peak={peak:.4} frames={frames} rate={sample_rate}"
-                ));
+                );
             }
         }
         let _ = buffer.copy_to_channel(&vec, ch as i32);
@@ -331,17 +330,17 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
         static FIRST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = FIRST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 3 {
-            log(format!(
+            log::debug!(
                 "audio: play frames={frames} rate={sample_rate} dur={duration:.3}s when={when:.3}s now={:.3} ctx={:?}",
                 ctx.current_time(),
                 ctx.state()
-            ));
+            );
         }
         if ctx.state() == web_sys::AudioContextState::Suspended {
             static WARN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if WARN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-                log(
-                    "audio: WARNING scheduling while AudioContext is SUSPENDED — no sound until resumed by a gesture",
+                log::warn!(
+                    "audio: scheduling while AudioContext is SUSPENDED — no sound until resumed by a gesture",
                 );
             }
         }
@@ -352,7 +351,7 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
         let _ = src.connect_with_audio_node(&ctx.destination());
         let _ = src.start_with_when(when);
     } else {
-        log("audio: create_buffer_source failed");
+        log::error!("audio: create_buffer_source failed");
     }
 
     // Report timeline discontinuities (gaps/overlaps) that cause choppiness.
@@ -374,9 +373,9 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Throttle: log every anomaly but cap the burst.
                 if n < 200 {
-                    log(format!(
+                    log::debug!(
                         "audio: timeline {a} (when={when:.3} prev_end={prev_end:.3} dur={duration:.3})"
-                    ));
+                    );
                 }
             }
         }

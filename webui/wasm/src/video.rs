@@ -1,5 +1,5 @@
 use crate::audio::AudioPlayer;
-use crate::{log::log, with_wt};
+use crate::with_wt;
 use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
 use shared::server_datagram::ServerDatagram;
@@ -95,7 +95,7 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
     };
 
     let resize_cb = Closure::wrap(Box::new(move || {
-        send_resize().unwrap_or_else(|err| log(err));
+        send_resize().unwrap_or_else(|err| log::error!("{err:#?}"));
     }) as Box<dyn FnMut()>);
 
     let ro = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref::<js_sys::Function>())
@@ -197,7 +197,7 @@ pub fn send_decoder_capabilities() -> Result<(), JsError> {
     with_wt(|gwt| {
         let _ = gwt.writer.write_with_chunk(buf.as_ref());
     });
-    log(&format!("sent decoder capabilities"));
+    log::info!("sent decoder capabilities");
     Ok(())
 }
 
@@ -231,7 +231,7 @@ fn probe_codecs() -> Vec<Codec> {
         supported.push(Codec::Av1);
         supported.push(Codec::H264);
     }
-    log(&format!("probed codecs: {supported:?}"));
+    log::info!("probed codecs: {supported:?}");
     supported
 }
 
@@ -297,7 +297,7 @@ pub async fn render_loop(
     let decoder = match decoder {
         Some(d) => d,
         None => {
-            log("VideoDecoder creation failed");
+            log::error!("VideoDecoder creation failed");
             return Err(JsValue::from_str("VideoDecoder creation failed"));
         }
     };
@@ -322,7 +322,7 @@ pub async fn render_loop(
     // Opus AudioDecoder, in which case AudioFrames are ignored.
     let audio = AudioPlayer::new();
     if audio.is_none() {
-        crate::log::log("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
+        log::error!("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
     }
 
     loop {
@@ -333,7 +333,7 @@ pub async fn render_loop(
         let data: Vec<u8> = match result {
             Ok(val) => {
                 if val.is_undefined() || val.is_null() {
-                    log("render_loop: stream ended (null/undefined)");
+                    log::info!("render_loop: stream ended (null/undefined)");
                     return Err(JsValue::from_str("stream ended"));
                 }
                 let done = js_sys::Reflect::get(&val, &"done".into())
@@ -341,13 +341,13 @@ pub async fn render_loop(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if done {
-                    log("render_loop: stream done");
+                    log::info!("render_loop: stream done");
                     return Err(JsValue::from_str("stream done"));
                 }
                 let value = match js_sys::Reflect::get(&val, &"value".into()) {
                     Ok(v) if !v.is_undefined() && !v.is_null() => v,
                     _ => {
-                        log("render_loop: missing value");
+                        log::warn!("render_loop: missing value");
                         return Err(JsValue::from_str("missing value"));
                     }
                 };
@@ -357,7 +357,7 @@ pub async fn render_loop(
                 buf
             }
             Err(e) => {
-                log(&format!("render_loop: read error: {e:?}"));
+                log::error!("render_loop: read error: {e:?}");
                 return Err(e);
             }
         };
@@ -383,6 +383,10 @@ pub async fn render_loop(
                 continue;
             }
             ServerDatagram::VideoFrame { .. } => {}
+            ServerDatagram::LogLevel { level } => {
+                crate::log::apply_server_level(level);
+                continue;
+            }
             ServerDatagram::ReleaseMouse => {
                 release_flag.set(true);
                 continue;
@@ -534,7 +538,7 @@ pub async fn render_loop(
         {
             let mut cur = current_codec.borrow_mut();
             if *cur != Some(codec) {
-                log(&format!("codec changed: {cur:?} -> {codec:?}"));
+                log::info!("codec changed: {cur:?} -> {codec:?}");
                 let config = js_sys::Object::new();
                 js_sys::Reflect::set(&config, &"codec".into(), &codec.web_codec_string().into())
                     .ok();
@@ -572,7 +576,7 @@ pub async fn render_loop(
                 }
             }
             Err(e) => {
-                log(&format!("EncodedVideoChunk creation failed: {e:?}"));
+                log::error!("EncodedVideoChunk creation failed: {e:?}");
             }
         }
     }

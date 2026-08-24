@@ -6,7 +6,6 @@ use js_sys::Uint8Array;
 use shared::server_datagram::ServerDatagram;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::log::log;
 use crate::with_wt;
 
 type SubId = usize;
@@ -111,6 +110,6 @@ pub fn spawn_reader(receiver: Receiver, closed: Rc<std::cell::Cell<bool>>) {
             }
         }
         closed.set(true);
-        log("reader: stream ended");
+        log::info!("reader: stream ended");
     });
 }

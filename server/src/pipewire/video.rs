@@ -1,7 +1,7 @@
 use crate::keyboard::Keyboard;
 use crate::pipewire::audio::AudioSink;
 use crate::pipewire::portal_auth::{accept_dialog, get_portal_token, set_portal_token};
-use crate::{extensions::CancellationTokenExt, logging::log, pipewire::eis::eis_task};
+use crate::{extensions::CancellationTokenExt, pipewire::eis::eis_task};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -137,7 +137,11 @@ impl CaptureHandle {
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
-) -> Result<(mpsc::Receiver<EncodedFrame>, mpsc::Receiver<ServerDatagram>, CaptureHandle)> {
+) -> Result<(
+    mpsc::Receiver<EncodedFrame>,
+    mpsc::Receiver<ServerDatagram>,
+    CaptureHandle,
+)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
     let (server_msg_tx, server_msg_rx) = mpsc::channel::<ServerDatagram>(8);
     let cancel = CancellationToken::new();
@@ -225,7 +229,7 @@ pub async fn capture(
                 )
                 .await
                 {
-                    log(format!("Capture error: {:#?}", e));
+                    log::error!("Capture error: {:#?}", e);
                 }
             }
         }
@@ -481,7 +485,7 @@ async fn single_capture(
                                     || err_str.contains("vaapi")
                                     || err_str.contains("amf")
                                 {
-                                    log(format!("GPU context loss detected: {err_str}"));
+                                    log::error!("GPU context loss detected: {err_str}");
                                     let _ = pipeline_restart.send(());
                                 }
                             }
@@ -531,7 +535,14 @@ async fn single_capture(
             }
         };
 
-        let touch_task = eis_task(eis_fd, stream_pos, client_rx, &server_msg_tx, cursor_rx, cancel);
+        let touch_task = eis_task(
+            eis_fd,
+            stream_pos,
+            client_rx,
+            &server_msg_tx,
+            cursor_rx,
+            cancel,
+        );
 
         // Wait for the next resize (or cancellation or GPU loss) before tearing
         // down.  virtual_monitor must stay alive here — dropping it kills krfb.
@@ -540,7 +551,7 @@ async fn single_capture(
                 biased;
                 _ = cancel.cancelled() => break None,
                 _ = pipeline_restart_watcher.changed() => {
-                    log("GPU context lost, restarting capture pipeline");
+                    log::warn!("GPU context lost, restarting capture pipeline");
                     break Some((width, height, index));
                 },
                 msg = client_rx.recv() => match msg {

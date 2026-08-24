@@ -81,3 +81,6 @@ web-sys = { workspace = true, features = [
 ] }
 shared.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true

@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use log::LevelFilter;
 use data_encoding::BASE64;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
 use ssl_controller::{AsyncFilesystemMode, CertKeyPaths, GenerationMethod, SslControllerConfiguration};
@@ -31,10 +32,18 @@ pub struct Config {
     pub auth_timeout: Option<u64>,
     #[serde(default)]
     pub rate_limit: Option<u32>,
+    /// Maximum verbosity for server logs, announced to clients so they stop
+    /// generating records the server would discard anyway.
+    #[serde(default = "default_log_level")]
+    pub log_level: LevelFilter,
 }
 
 fn default_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn default_log_level() -> LevelFilter {
+    LevelFilter::Info
 }
 
 impl Config {
@@ -62,6 +71,7 @@ impl Config {
             authorised_keys: Default::default(),
             auth_timeout: Default::default(),
             rate_limit: Default::default(),
+            log_level: default_log_level(),
         })
     }
 }
