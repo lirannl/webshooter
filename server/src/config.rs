@@ -1,11 +1,15 @@
 use anyhow::{Result, anyhow};
-use log::LevelFilter;
 use data_encoding::BASE64;
+use log::LevelFilter;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Visitor};
-use ssl_controller::{AsyncFilesystemMode, CertKeyPaths, GenerationMethod, SslControllerConfiguration};
+use ssl_controller::{
+    AsyncFilesystemMode, CertKeyPaths, GenerationMethod, SslControllerConfiguration,
+};
 use std::{
     collections::HashSet,
     fmt::Display,
+    hash::Hash,
+    iter::zip,
     net::{IpAddr, Ipv4Addr},
     ops::Deref,
     path::{Path, PathBuf},
@@ -13,6 +17,8 @@ use std::{
     sync::OnceLock,
     time::Duration,
 };
+
+use crate::auth::User;
 
 pub static CONFIG_DIR: OnceLock<PathBuf> = Default::default();
 
@@ -23,7 +29,7 @@ pub struct Config {
     #[serde(default = "default_version")]
     version: String,
     #[serde(default)]
-    pub authorised_keys: HashSet<Bytes64>,
+    pub users: HashSet<User>,
     pub host: IpAddr,
     pub port: u16,
     #[serde(flatten)]
@@ -68,7 +74,7 @@ impl Config {
                 },
                 0.25,
             ),
-            authorised_keys: Default::default(),
+            users: Default::default(),
             auth_timeout: Default::default(),
             rate_limit: Default::default(),
             log_level: default_log_level(),
@@ -82,7 +88,10 @@ pub struct Bytes64<B: Deref<Target = [u8]> = Vec<u8>>(pub B);
 
 impl<B: Deref<Target = [u8]>, B2: Deref<Target = [u8]>> PartialEq<Bytes64<B2>> for Bytes64<B> {
     fn eq(&self, other: &Bytes64<B2>) -> bool {
-        self.0.iter().zip(other.0.iter()).all(|(b1, b2)| *b1 == *b2)
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        zip(self.0.iter(), other.0.iter()).all(|(b1, b2)| *b1 == *b2)
     }
 }
 
@@ -104,13 +113,6 @@ impl FromStr for Bytes64<Vec<u8>> {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // let s = s
-        //     .chars()
-        //     .filter(|c| {
-        //         let blacklist = &['='];
-        //         !blacklist.contains(c)
-        //     })
-        //     .collect::<String>();
         let vec = BASE64.decode(s.as_bytes());
         Ok(Bytes64(vec?))
     }

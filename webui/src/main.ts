@@ -1,4 +1,4 @@
-import { checkCookie, checkIdentity, genKeyPair, getCookie } from "./auth";
+import { checkCookie, checkIdentity, genKeyPair, getCookie, register } from "./auth";
 import "./style.css";
 
 import init, { log, start } from "../wasm/pkg/webshooter_wasm";
@@ -23,20 +23,34 @@ const authenticated = await new Promise<boolean>(async (resolve, reject) => {
       await getCookie(keyPair).catch(reject);
       resolve(true);
     } else {
+      const displayNameInput = document.createElement("input");
+      displayNameInput.type = "text";
+      displayNameInput.placeholder = "Display name";
+      displayNameInput.id = "displayNameInput";
+      root.appendChild(displayNameInput);
+
       const button = document.createElement("button");
-      button.innerText = "Login";
+      button.innerText = "Register";
       button.className = "secondary";
-      button.id = "loginButton";
+      button.id = "registerButton";
       root.appendChild(button);
       button.addEventListener("click", async (ev) => {
         ev.preventDefault();
+        const displayName = displayNameInput.value.trim();
+        if (!displayName) {
+          displayNameInput.focus();
+          return;
+        }
+        button.disabled = true;
         try {
-          await getCookie(keyPair);
+          await register(keyPair, displayName);
+          displayNameInput.remove();
           button.remove();
           resolve(true);
         } catch (err) {
           if (err instanceof Error) log(err, "error");
           else console.log(err);
+          button.disabled = false;
           resolve(false);
         }
       });

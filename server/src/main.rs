@@ -1,9 +1,9 @@
-#![feature(extend_one, cfg_eval, const_default, const_trait_impl)]
+#![feature(cfg_eval, const_default, const_trait_impl)]
 
 mod auth;
+mod cert_watcher;
 #[cfg(target_os = "linux")]
 mod compositor_discovery;
-mod cert_watcher;
 mod config;
 mod config_watch;
 mod error;
@@ -46,7 +46,7 @@ use wt::setup_wt;
 use wtransport::Identity;
 
 use crate::{
-    auth::{Authenticated, check_identity, get_challenge, login},
+    auth::{Authenticated, check_identity, get_challenge, login, register},
     compositor_discovery::{
         ensure_wayland_display, ensure_xdg_current_desktop, ensure_xdg_runtime_dir,
     },
@@ -121,11 +121,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             config.host, config.port
         );
 
-        let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))
-        .rustls(cert_watcher::watch_cert_files(
-            config.ssl.paths.cert.clone(),
-            config.ssl.paths.key.clone(),
-        ));
+        let listener = TcpListener::bind(format!("{}:{}", config.host, config.port)).rustls(
+            cert_watcher::watch_cert_files(
+                config.ssl.paths.cert.clone(),
+                config.ssl.paths.key.clone(),
+            ),
+        );
 
         watch_config(&config.path).await;
 
@@ -140,6 +141,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 get(negotiate_wt).data(identity.certificate_chain().as_slice()[0].hash()),
             )
             .at("/login", post(login))
+            .at("/register", post(register))
             .at("/*", frontend::frontend);
 
         let handle_0 = tokio::spawn(Server::new(listener).run(app).or_else(async |err| {
@@ -246,6 +248,6 @@ pub async fn get_config() -> Config {
 }
 
 #[handler]
-fn check_auth(Authenticated { id }: Authenticated) -> impl IntoResponse {
-    Response::builder().body(format!("Authenticated as: {id}"))
+fn check_auth(Authenticated(user): Authenticated) -> impl IntoResponse {
+    Response::builder().body(format!("Authenticated as: {}", user.display_name))
 }

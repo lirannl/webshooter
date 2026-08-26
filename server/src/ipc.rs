@@ -2,7 +2,9 @@ use crate::config::Config;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use shared::server_datagram::ServerDatagram;
-use std::{env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr, sync::OnceLock};
+use std::{
+    env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr, sync::OnceLock,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
 use tokio::sync::broadcast;
 
@@ -302,7 +304,7 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
                     sessions
                         .iter()
                         .enumerate()
-                        .map(|(n, s)| format!("{n}: {}", format_id(s)))
+                        .map(|(n, s)| format!("{n}: {}", format_id(&s)))
                         .collect::<Vec<_>>()
                         .join("\n")
                 ))
@@ -313,13 +315,12 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
     };
     let short = format_id(&id);
     let mut config = crate::get_config().await;
-    let key = crate::config::Bytes64(id);
-    if config.authorised_keys.remove(&key) {
+    if let Some(doomed) = config.users.extract_if(|user| id == *user).last() {
         crate::update_config(config).await?;
-        conn.write(&format!("Deauthorised {short}")).await?;
-    } else {
-        conn.write(&format!("Key {short} not found in authorised_keys"))
+        conn.write(&format!("Deauthorised \"{}\"", doomed.display_name))
             .await?;
+    } else {
+        conn.write(&format!("No user matching key {short}")).await?;
     }
     Ok(())
 }

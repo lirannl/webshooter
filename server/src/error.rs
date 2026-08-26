@@ -18,6 +18,8 @@ pub enum WebshooterError {
     ChallengeFailed,
     #[error("Cookie not permitted")]
     NotAuthorized,
+    #[error("Cookie not associated with user")]
+    NoAssociatedUser,
     #[error("Webshooter isn't prepared to accept IPC connections yet")]
     IPCNotAvailable,
     #[error("Missing authentication")]

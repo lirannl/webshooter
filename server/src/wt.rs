@@ -1,5 +1,5 @@
 use crate::{
-    auth::OnetimeToken,
+    auth::{OnetimeToken, UserId},
     config::{Bytes64, Config},
     error::WebshooterError,
     pipewire::video,
@@ -37,25 +37,20 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server = Endpoint::server(server_config)?;
 
     let max_log_level = config.log_level;
-    let mut active: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         let session = server.accept().await;
 
-        // A new client arrived — tear down any existing session immediately
-        // rather than waiting for the QUIC idle timeout to fire.
-        if let Some(prev) = active.take() {
-            prev.abort();
-        }
-
-        active = Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             match webtransport_auth(session).await {
-                Ok(connection) => handle_wt_connection(connection, max_log_level)
-                    .await
-                    .unwrap_or_else(|err| log::error!("{err:#?}")),
+                Ok((user_id, connection)) => {
+                    handle_wt_connection(connection, user_id, max_log_level)
+                        .await
+                        .unwrap_or_else(|err| log::error!("{err:#?}"))
+                }
                 Err(err) => log::error!("{err:#?}"),
             }
-        }));
+        });
     }
 }
 
@@ -63,7 +58,7 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
 // Authentication
 // ---------------------------------------------------------------------------
 
-async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
+async fn webtransport_auth(session: IncomingSession) -> Result<(UserId, Connection)> {
     let request = session.await?;
     let token = request
         .path()
@@ -76,9 +71,9 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
         })
         .ok_or(WebshooterError::NoAuthentication)?;
     let token = Bytes64::from_str(token)?;
-    if OnetimeToken::try_from(token)?.check().await {
+    if let Some(user_id) = OnetimeToken::try_from(token)?.check().await {
         let connection = request.accept().await?;
-        Ok(connection)
+        Ok((user_id, connection))
     } else {
         request.forbidden().await;
         Err(WebshooterError::NotAuthorized.into())
@@ -91,6 +86,7 @@ async fn webtransport_auth(session: IncomingSession) -> Result<Connection> {
 
 pub async fn handle_wt_connection(
     connection: Connection,
+    user_id: UserId,
     max_log_level: LevelFilter,
 ) -> Result<()> {
     let _connection = Arc::new(connection);

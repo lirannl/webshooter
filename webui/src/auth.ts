@@ -1,4 +1,5 @@
 import { LoginParams } from "$rs/LoginParams";
+import { RegisterParams } from "$rs/RegisterParams";
 import { bytesToBase64DataUrl, dataUrlToBytes } from "./base64";
 
 export const subtle = crypto.subtle;
@@ -96,6 +97,52 @@ export const getCookie = async (keypair: CryptoKeyPair) => {
                     id,
                 }
             } as LoginParams)
+        });
+    } catch (err) {
+        if (err instanceof Object && "message" in err) {
+            console.log(err.message);
+            div.innerText = `${err.message}`;
+        }
+
+    }
+    clearInterval(loading);
+    div.remove();
+}
+
+export const register = async (keypair: CryptoKeyPair, displayName: string) => {
+    const pubKey = await subtle.exportKey("spki", keypair.publicKey);
+    const id = await toRawBase64(pubKey);
+    const challenge = await fetch("challenge", {
+        headers: { id }
+    });
+    const challengeBlob = await ((await challenge.blob())).arrayBuffer();
+    const signature = await subtle.sign(ecdsaAlgo, keypair.privateKey, challengeBlob);
+    const indicatorId = "authorisation-wait-indicator";
+    let div = document.getElementById(indicatorId);
+    if (!div) {
+        div = document.createElement("div");
+        div.id = indicatorId;
+    }
+
+    div.className = "secondary";
+    const authWait = `Awaiting authorisation (identity: ${id.slice(32).slice(undefined, 10)}). Please enter "authorise"`;
+    div.innerText = authWait;
+    document.body.appendChild(div)
+    let wait = 1;
+    const loading = setInterval(() => {
+        div.innerText = `${authWait}\n${wait} seconds`;
+        wait += 1;
+    }, 1000);
+    try {
+        await fetch("/register", {
+            method: "POST", headers: {
+                credentials: "same-origin",
+                "content-type": "application/json"
+            }, body: JSON.stringify({
+                id,
+                signature: await toRawBase64(signature),
+                display_name: displayName,
+            } as RegisterParams)
         });
     } catch (err) {
         if (err instanceof Object && "message" in err) {

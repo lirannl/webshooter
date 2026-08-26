@@ -6,8 +6,9 @@ use p384::{NistP384, pkcs8::DecodePublicKey};
 use poem::web::{Data, Json};
 use poem::{Error, FromRequest, IntoResponse, Request, RequestBody, Response, Result, handler};
 use rand::{RngExt, rng};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -21,14 +22,14 @@ use crate::error::WebshooterError;
 use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
 use crate::{get_config, update_config};
 
-pub static AUTH_SESSIONS: LazyLock<Mutex<HashMap<Vec<u8>, Session>>> = Default::default();
+pub static AUTH_SESSIONS: LazyLock<Mutex<HashMap<UserId, Session>>> = Default::default();
 
 const CHALLENGE_SIZE: usize = 256;
 
 const COOKIE_SIZE: usize = 1024;
 const COOKIE_TTL: Duration = Duration::from_hours(24);
 
-struct Identity(Bytes64);
+struct Identity(UserId);
 
 impl<'a> FromRequest<'a> for Identity {
     async fn from_request(req: &'a Request, _body: &mut RequestBody) -> Result<Self> {
@@ -37,13 +38,13 @@ impl<'a> FromRequest<'a> for Identity {
             .get("id")
             .and_then(|value| Bytes64::from_str(value.to_str().ok()?).ok())
             .ok_or(WebshooterError::NoAuthentication)?;
-        Ok(Identity(identity))
+        Ok(Identity(UserId(identity)))
     }
 }
 
 #[handler]
 pub async fn check_identity(Identity(id): Identity) -> Result<impl IntoResponse> {
-    if get_config().await.authorised_keys.contains(&id) {
+    if get_config().await.users.iter().any(|user| id == *user) {
         Ok(Response::default())
     } else {
         Err(WebshooterError::NotAuthorized.into())
@@ -52,12 +53,11 @@ pub async fn check_identity(Identity(id): Identity) -> Result<impl IntoResponse>
 
 #[handler]
 pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> {
-    let _id = id.to_string();
     let mut challenge = [0 as u8; CHALLENGE_SIZE];
     rng().fill(&mut challenge);
     {
         let mut sessions = AUTH_SESSIONS.lock().await;
-        sessions.insert(id.into(), Session::Challenged(challenge.to_vec()));
+        sessions.insert(id, Session::Challenged(challenge.to_vec()));
     }
     poem::Result::Ok(Response::builder().body(challenge.to_vec()))
 }
@@ -93,15 +93,9 @@ impl LoginParams {
             LoginParams::Signature { id, .. } => Bytes64(&id[..]),
         }
     }
-    pub fn into_id(self) -> Bytes64 {
-        match self {
-            LoginParams::IdOnly { id } => id,
-            LoginParams::Signature { id, .. } => id.into(),
-        }
-    }
 }
 
-pub async fn get_challenged_sessions() -> Vec<Vec<u8>> {
+pub async fn get_challenged_sessions() -> Vec<UserId> {
     let sessions_lock = AUTH_SESSIONS.lock().await;
     sessions_lock
         .iter()
@@ -221,79 +215,18 @@ pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<imp
 }
 
 async fn login_inner(params: LoginParams) -> Result<Bytes64> {
-    let mut config = get_config().await;
+    let config = get_config().await;
 
     let (id, signature) = match &params {
         LoginParams::Signature { id, signature } => Ok((id, signature)),
         _ => Err(WebshooterError::InvalidLogin),
     }?;
-    let id = id.to_owned();
-    if !config.authorised_keys.contains(&Bytes64(id.to_vec())) {
-        let timeout_secs = config.auth_timeout.unwrap_or(30);
-        timeout(Duration::from_secs(timeout_secs), async {
-            loop {
-                let (message, mut connection) = ipc_recv().await?;
-                match (message, get_challenged_sessions().await.as_slice()) {
-                    (IPCMessage::Authorise(None), [_]) => {
-                        connection
-                            .write(&format!("Authorised {}", format_id(&id)))
-                            .await?;
-                        break Ok::<_, anyhow::Error>(());
-                    }
-                    (IPCMessage::Authorise(None), sessions) => {
-                        connection
-                            .write(&format!(
-                                "Please select a session:\n{}",
-                                sessions
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(n, session_id)| {
-                                        format!("{n}: {}", format_id(session_id))
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ))
-                            .await?;
-                    }
-                    (message, sessions) if let IPCMessage::Authorise(Some(n)) = message => {
-                        if let Some((_, id)) =
-                            sessions.iter().enumerate().find(|(idx, session_id)| {
-                                *idx == n
-                                    && id
-                                        .iter()
-                                        .zip(session_id.iter())
-                                        .all(|(id, session_id)| *id == *session_id)
-                            })
-                        {
-                            connection
-                                .write(&format!("Authorised {}", format_id(id)))
-                                .await?;
-                            break Ok(());
-                        } else {
-                            // Yield
-                            ipc_send(message, connection)?;
-                        }
-                    }
-                    (message, _) => {
-                        connection
-                            .write(&format!("Invalid message: {message:#?}"))
-                            .await?;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|err| Err(anyhow::Error::from(err)))
-        .map_err(|err| match err.downcast::<Elapsed>() {
-            Ok(elapsed) => Error::from_string(
-                format!("Did not authorise within {}", elapsed),
-                StatusCode::FORBIDDEN,
-            ),
-            Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
-        })?;
+    let id = UserId(id.to_owned());
+    if !config.users.iter().any(|user| id == *user) {
+        return Err(WebshooterError::NotAuthorized.into());
     }
     let sessions = AUTH_SESSIONS.lock().await;
-    let challenge = match sessions.get(id.deref()) {
+    let challenge = match sessions.get(&id) {
         Some(Session::Challenged(challenge)) => Ok(challenge),
         _ => Err(WebshooterError::NotChallenged),
     }?
@@ -314,14 +247,173 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     {
         let mut sessions = AUTH_SESSIONS.lock().await;
         sessions.insert(
-            params.into_id().into(),
+            id,
             Session::Approved {
                 cookie: cookie.to_vec(),
                 created_at: Instant::now(),
             },
         );
     }
-    config.authorised_keys.extend_one(id.clone());
+    Ok(Bytes64(cookie.to_vec()))
+}
+
+#[derive(Deserialize, TS)]
+#[cfg_attr(feature = "debug", derive(Debug))]
+#[ts(export)]
+struct RegisterParams {
+    #[ts(type = "string")]
+    id: Bytes64,
+    #[ts(type = "string")]
+    signature: Bytes64,
+    #[ts(type = "string")]
+    display_name: String,
+}
+
+#[handler]
+pub async fn register(
+    req: &Request,
+    Json(params): Json<RegisterParams>,
+) -> Result<impl IntoResponse> {
+    let ip = client_ip(req);
+    let rate_limit = get_config().await.rate_limit.unwrap_or(10);
+    if !check_rate_limit(ip, rate_limit).await {
+        return Err(Error::from_string(
+            "Rate limit exceeded",
+            StatusCode::TOO_MANY_REQUESTS,
+        ));
+    }
+
+    match register_inner(params).await {
+        Ok(cookie) => {
+            reset_rate_limit(ip).await;
+            Ok(Response::builder()
+                .header(
+                    "set-cookie",
+                    format!(
+                        "token={}; HttpOnly; Secure; SameSite=Strict",
+                        BASE64.encode(&cookie),
+                    ),
+                )
+                .finish())
+        }
+        Err(err) => {
+            let status = err.status();
+            let msg = err.to_string();
+            record_rate_limit_failure(ip).await;
+            Err(Error::from_string(msg, status))
+        }
+    }
+}
+
+async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
+    let mut config = get_config().await;
+
+    let id = UserId(params.id.clone());
+    if config.users.iter().any(|user| id == *user) {
+        return Err(WebshooterError::InvalidLogin.into());
+    }
+
+    let display_name = params.display_name.clone();
+    let timeout_secs = config.auth_timeout.unwrap_or(30);
+    timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            let (message, mut connection) = ipc_recv().await?;
+            match (message, get_challenged_sessions().await.as_slice()) {
+                (IPCMessage::Authorise(None), [_]) => {
+                    connection
+                        .write(&format!(
+                            "Authorised {} ({})",
+                            display_name,
+                            format_id(&id.0)
+                        ))
+                        .await?;
+                    break Ok::<_, anyhow::Error>(());
+                }
+                (IPCMessage::Authorise(None), sessions) => {
+                    connection
+                        .write(&format!(
+                            "Please select a session:\n{}",
+                            sessions
+                                .iter()
+                                .enumerate()
+                                .map(|(n, session_id)| {
+                                    format!("{n}: {}", format_id(&session_id.0))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ))
+                        .await?;
+                }
+                (message, sessions) if let IPCMessage::Authorise(Some(n)) = message => {
+                    if let Some((_, session_id)) = sessions
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, session_id)| *idx == n && id == **session_id)
+                    {
+                        connection
+                            .write(&format!(
+                                "Authorised {} ({})",
+                                display_name,
+                                format_id(&session_id.0)
+                            ))
+                            .await?;
+                        break Ok(());
+                    } else {
+                        ipc_send(message, connection)?;
+                    }
+                }
+                (message, _) => {
+                    connection
+                        .write(&format!("Invalid message: {message:#?}"))
+                        .await?;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|err| Err(anyhow::Error::from(err)))
+    .map_err(|err| match err.downcast::<Elapsed>() {
+        Ok(elapsed) => Error::from_string(
+            format!("Did not authorise within {}", elapsed),
+            StatusCode::FORBIDDEN,
+        ),
+        Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    })?;
+
+    let sessions = AUTH_SESSIONS.lock().await;
+    let challenge = match sessions.get(&id) {
+        Some(Session::Challenged(challenge)) => Ok(challenge),
+        _ => Err(WebshooterError::NotChallenged),
+    }?
+    .to_vec();
+    drop(sessions);
+
+    let key = ecdsa::VerifyingKey::<NistP384>::from_public_key_der(params.id.as_ref())
+        .map_err(|_| WebshooterError::InvalidLogin)?;
+    let verification = key.verify(
+        &challenge,
+        &ecdsa::Signature::from_slice(&params.signature)
+            .map_err(|_| WebshooterError::InvalidLogin)?,
+    );
+    verification.map_err(|_| WebshooterError::ChallengeFailed)?;
+
+    let mut cookie = [0 as u8; COOKIE_SIZE];
+    rng().fill(&mut cookie);
+
+    {
+        let mut sessions = AUTH_SESSIONS.lock().await;
+        sessions.insert(
+            id.clone(),
+            Session::Approved {
+                cookie: cookie.to_vec(),
+                created_at: Instant::now(),
+            },
+        );
+    }
+    config.users.insert(User {
+        verification_key: params.id,
+        display_name,
+    });
     let _str = serde_json::to_string(&config).ok();
     update_config(config)
         .await
@@ -330,9 +422,7 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     Ok(Bytes64(cookie.to_vec()))
 }
 
-pub struct Authenticated {
-    pub id: Bytes64,
-}
+pub struct Authenticated(pub User);
 
 // Implements a token extractor
 impl<'a> FromRequest<'a> for Authenticated {
@@ -363,9 +453,15 @@ impl<'a> FromRequest<'a> for Authenticated {
             .get(token)
             .ok_or(WebshooterError::NotAuthorized)?;
 
-        Ok(Authenticated {
-            id: Bytes64(id.clone()),
-        })
+        let user = get_config()
+            .await
+            .users
+            .iter()
+            .find(|user| id == *user)
+            .ok_or(WebshooterError::NoAssociatedUser)?
+            .clone();
+
+        Ok(Authenticated(user))
     }
 }
 
@@ -373,9 +469,9 @@ pub use onetime::OnetimeToken;
 #[handler]
 pub async fn negotiate_wt(
     Data(cert_hash): Data<&Sha256Digest>,
-    Authenticated { .. }: Authenticated,
+    Authenticated(user): Authenticated,
 ) -> Result<impl IntoResponse> {
-    let token = OnetimeToken::new().await.to_vec();
+    let token = OnetimeToken::new(&user).await.to_vec();
     let token = Bytes64(token).to_string();
     Ok(poem::Response::builder()
         .header("token", token)
@@ -384,10 +480,10 @@ pub async fn negotiate_wt(
 
 mod onetime {
     use rand::{RngExt, rng};
-    use std::{collections::HashSet, ops::Deref, sync::LazyLock, time::Duration};
+    use std::{collections::HashMap, ops::Deref, sync::LazyLock, time::Duration};
     use tokio::{spawn, sync::Mutex, time::sleep};
 
-    use crate::{config::Bytes64, error::WebshooterError};
+    use crate::{auth::UserId, config::Bytes64, error::WebshooterError};
 
     #[cfg(debug_assertions)]
     const ONETIME_DURATION: Duration = Duration::from_mins(5);
@@ -397,14 +493,18 @@ mod onetime {
 
     #[derive(Hash, PartialEq, Eq, Clone, Debug)]
     pub struct OnetimeToken([u8; ONETIME_LENGTH]);
-    static ONETIME_AUTHORISATIONS: LazyLock<Mutex<HashSet<OnetimeToken>>> = Default::default();
+    static ONETIME_AUTHORISATIONS: LazyLock<Mutex<HashMap<OnetimeToken, UserId>>> =
+        Default::default();
 
     impl OnetimeToken {
-        pub async fn new() -> Self {
+        pub async fn new(user: impl Into<UserId>) -> Self {
             let mut token = [0; ONETIME_LENGTH];
             rng().fill(&mut token);
             let token = Self(token);
-            ONETIME_AUTHORISATIONS.lock().await.insert(token.clone());
+            ONETIME_AUTHORISATIONS
+                .lock()
+                .await
+                .insert(token.clone(), user.into());
             {
                 let token = token.clone();
                 spawn(async move {
@@ -414,10 +514,11 @@ mod onetime {
             }
             token
         }
-        pub async fn check(self) -> bool {
-            let hash_set = &mut ONETIME_AUTHORISATIONS.lock().await;
-            let token_was_present = hash_set.remove(&self);
-            token_was_present
+        pub async fn check(self) -> Option<UserId> {
+            let mut hash_set = ONETIME_AUTHORISATIONS.lock().await;
+            let user_id = hash_set.remove(&self);
+            drop(hash_set);
+            user_id
         }
     }
     impl<B: Deref<Target = [u8]>> TryFrom<Bytes64<B>> for OnetimeToken {
@@ -442,5 +543,44 @@ mod onetime {
         fn deref(&self) -> &Self::Target {
             &self.0
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Eq)]
+pub struct User {
+    verification_key: Bytes64,
+    pub display_name: String,
+}
+
+impl PartialEq<User> for User {
+    fn eq(&self, other: &User) -> bool {
+        self.verification_key == other.verification_key
+    }
+}
+impl Hash for User {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.verification_key.hash(state);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UserId(Bytes64);
+impl PartialEq<User> for UserId {
+    fn eq(&self, other: &User) -> bool {
+        self.0 == other.verification_key
+    }
+}
+
+impl From<&User> for UserId {
+    fn from(value: &User) -> Self {
+        UserId(value.verification_key.clone())
+    }
+}
+
+impl Deref for UserId {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
