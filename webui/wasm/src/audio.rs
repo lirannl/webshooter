@@ -5,6 +5,7 @@ use std::rc::Rc;
 use js_sys::Float32Array;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 
 use web_sys::{
     AudioBuffer, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder, AudioDecoderConfig,
@@ -25,8 +26,10 @@ struct PendingAudio {
 struct PlaybackState {
     ctx: AudioContext,
     next_time: f64,
-    /// Set once we've told the server the AudioContext is `Running`, so it can
-    /// create the PipeWire sink and start forwarding Opus. Sent only once.
+    /// Set while we've told the server the AudioContext is `Running`, so it can
+    /// create the PipeWire sink and start forwarding Opus. Cleared if the
+    /// context ever suspends again, so each return to Running re-notifies the
+    /// server rather than being a permanent once-only latch.
     audio_ready: Cell<bool>,
     /// Highest sample magnitude seen since the last periodic report.
     peak_max: Cell<f32>,
@@ -114,7 +117,53 @@ impl AudioPlayer {
         output_cb.forget();
         error_cb.forget();
 
-        // Browsers start the AudioContext suspended until a user gesture.
+        // Browsers start the AudioContext suspended until user interaction (or
+        // until playback is permitted by the environment). We deliberately do
+        // NOT detect why the context is allowed to run (PWA exemption, a kiosk
+        // launched with `--autoplay-policy=no-user-gesture-required`, a
+        // permissive webview, or a user gesture) — reason-agnostic by design.
+        // The only thing that matters is whether it is Running, because that is
+        // what tells the server to create the PipeWire sink and stream Opus.
+        //
+        // `statechange` is the central hook: it fires on every transition, so we
+        // auto-resume on pauses (blur/minimise — a permissive environment
+        // honours it immediately, a restrictive web page keeps it pending until
+        // a gesture) and re-notify the server on every return to Running (not
+        // strictly once-only). If the context is Running from the outset we
+        // notify immediately as well.
+        fn handle_audio_state(state: &Rc<RefCell<PlaybackState>>) {
+            let st = state.borrow();
+            match st.ctx.state() {
+                web_sys::AudioContextState::Running => {
+                    if !st.audio_ready.get() {
+                        let channels = st.ctx.destination().channel_count() as u8;
+                        let rate = st.ctx.sample_rate() as u32;
+                        st.audio_ready.set(true);
+                        crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady {
+                            channels,
+                            rate,
+                        });
+                        log::info!(
+                            "audio: AudioContext Running — sent AudioReady (channels={channels}, rate={rate}) to server"
+                        );
+                    }
+                }
+                web_sys::AudioContextState::Suspended => {
+                    // Auto-resume on any suspension (e.g. tab blur). Permissive
+                    // environments resume immediately; restrictive web pages
+                    // keep the promise pending until the first gesture, which
+                    // is expected. Clear the latch so a later Running notifies
+                    // the server again.
+                    st.audio_ready.set(false);
+                    let _ = st.ctx.resume();
+                }
+                _ => {}
+            }
+        }
+
+        // The gesture listeners are the fallback for restrictive web pages:
+        // each interaction attempts a resume, which also completes any resume
+        // promise left pending since construction.
         let resume_ctx = ctx.clone();
         if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             let resume_cb = Closure::wrap(Box::new(move || {
@@ -127,46 +176,27 @@ impl AudioPlayer {
             resume_cb.forget();
         }
 
-        // Tell the server (exactly once) as soon as the AudioContext is
-        // actually `Running`. This is what lets the server create the PipeWire
-        // sink and start streaming Opus — we must NOT wait for the first
-        // decoded frame, because the server won't send any until it has heard
-        // from us (chicken-and-egg). `statechange` fires when `resume()`
-        // completes the transition from Suspended -> Running.
+        // Drive `handle_audio_state` from every path the context can transition
+        // on: `statechange` events, the initial up-front `resume()` attempt
+        // resolving (permissive environments), and an already-Running
+        // construction. Keeping the resume promise alive from a spawned future
+        // avoids it being garbage-collected mid-flight.
         let ready_state = state.clone();
-        let ready_cb = Closure::wrap(Box::new(move || {
-            if ready_state.borrow().ctx.state() == web_sys::AudioContextState::Running
-                && !ready_state.borrow().audio_ready.get()
-            {
-                ready_state.borrow().audio_ready.set(true);
-                let ctx = ready_state.borrow().ctx.clone();
-                let channels = ctx.destination().channel_count() as u8;
-                let rate = ctx.sample_rate() as u32;
-                crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady {
-                    channels,
-                    rate,
-                });
-                log::info!(
-                    "audio: AudioContext Running — sent AudioReady (channels={channels}, rate={rate}) to server"
-                );
-            }
-        }) as Box<dyn FnMut()>);
+        let ready_cb =
+            Closure::wrap(Box::new(move || handle_audio_state(&ready_state)) as Box<dyn FnMut()>);
         ctx.set_onstatechange(Some(ready_cb.as_ref().unchecked_ref()));
         ready_cb.forget();
 
-        // In case it is already running (e.g. autoplay allowed).
-        if ctx.state() == web_sys::AudioContextState::Running && !state.borrow().audio_ready.get() {
-            state.borrow().audio_ready.set(true);
-            let channels = ctx.destination().channel_count() as u8;
-            let rate = ctx.sample_rate() as u32;
-            crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady {
-                channels,
-                rate,
+        if let Ok(promise) = ctx.resume() {
+            let state = state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = JsFuture::from(promise).await;
+                handle_audio_state(&state);
             });
-            log::info!(
-                "audio: AudioContext Running — sent AudioReady (channels={channels}, rate={rate}) to server"
-            );
         }
+
+        // In case it is already running from the outset (fully permissive).
+        handle_audio_state(&state);
 
         log::info!("audio: AudioPlayer created");
         Some(AudioPlayer {

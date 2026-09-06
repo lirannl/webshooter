@@ -24,7 +24,7 @@ futures-util = "0.3"
 gstreamer = "0.25"
 gstreamer-app = "0.25"
 gstreamer-video = "0.25"
-http = "1.4"
+http = "1.5"
 http-bytes = { version = "0.1.0", default-features = false }
 interprocess = "2.4"
 js-sys = "0.3"
