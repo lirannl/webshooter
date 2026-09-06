@@ -136,10 +136,16 @@ pub enum ClientDatagram {
         decoders: Vec<Codec>,
     },
     /// The client's AudioContext has entered the `Running` state (i.e. a user
-    /// gesture has occurred and audio can actually be played). The server
+    /// gesture has occurred) and audio can actually be played. The server
     /// should only create the PipeWire audio sink and forward Opus once this
     /// arrives, so we don't stream audio the browser cannot play yet.
-    AudioReady,
+    /// `channels`/`rate` are the client's AudioContext output capabilities, so
+    /// the server can build a PipeWire sink + Opus encoder that matches them
+    /// (mono, stereo, or more) instead of assuming a fixed layout.
+    AudioReady {
+        channels: u8,
+        rate: u32,
+    },
     MouseMove {
         dx: i16,
         dy: i16,
@@ -269,7 +275,13 @@ impl ClientDatagram {
                 }
                 buf
             }
-            Self::AudioReady => vec![ClientDatagramVariants::AUDIO_READY.0],
+            Self::AudioReady { channels, rate } => {
+                let mut buf = Vec::with_capacity(6);
+                buf.push(ClientDatagramVariants::AUDIO_READY.0);
+                buf.push(*channels);
+                buf.extend_from_slice(&rate.to_be_bytes());
+                buf
+            }
             Self::MouseMove { dx, dy } => {
                 let mut buf = Vec::with_capacity(5);
                 buf.push(ClientDatagramVariants::MOUSE_MOVE.0);
@@ -394,7 +406,14 @@ impl ClientDatagram {
                     .collect();
                 Self::DecoderCapabilities { decoders }
             }
-            ClientDatagramVariants::AUDIO_READY => Self::AudioReady,
+            ClientDatagramVariants::AUDIO_READY => {
+                if bytes.len() < 6 {
+                    anyhow::bail!("AudioReady datagram too short: {} bytes", bytes.len());
+                }
+                let channels = bytes[1];
+                let rate = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+                Self::AudioReady { channels, rate }
+            }
             ClientDatagramVariants::MOUSE_MOVE => {
                 let dx = i16::from_be_bytes([bytes[1], bytes[2]]);
                 let dy = i16::from_be_bytes([bytes[3], bytes[4]]);

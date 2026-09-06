@@ -1,6 +1,7 @@
 use crate::keyboard::Keyboard;
-use crate::pipewire::audio::AudioSink;
-use crate::pipewire::portal_auth::{accept_dialog, get_portal_token, set_portal_token};
+use crate::pipewire::portal_auth::{
+    PortalToken, accept_dialog, get_portal_token, load_persisted_portal_token, set_portal_token,
+};
 use crate::{extensions::CancellationTokenExt, pipewire::eis::eis_task};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
@@ -23,7 +24,9 @@ use shared::server_datagram::ServerDatagram;
 use std::{
     os::fd::IntoRawFd,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -38,6 +41,18 @@ use tokio_util::sync::CancellationToken;
 // Virtual monitor (KWin)
 // ---------------------------------------------------------------------------
 
+/// Build a unique, krfb-safe virtual-monitor name from the authorised user's
+/// name and this capture's id (e.g. `webshooter-alice-3`).  Non-alphanumeric
+/// characters in the username are replaced so the name stays valid as a
+/// monitor/PipeWire node identifier.
+pub fn virtual_monitor_name(user_name: &str, client_id: u64) -> String {
+    let safe: String = user_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("webshooter-{safe}-{client_id}")
+}
+
 fn is_kwin() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|d| d.to_ascii_lowercase().contains("kde"))
@@ -50,7 +65,7 @@ enum VirtualMonitor {
 }
 
 impl VirtualMonitor {
-    fn spawn(width: u16, height: u16, index: u8) -> Result<Self> {
+    fn spawn(width: u16, height: u16, name: String) -> Result<Self> {
         if is_kwin() {
             use std::os::unix::process::CommandExt;
             let mut cmd = Command::new("krfb-virtualmonitor");
@@ -58,7 +73,7 @@ impl VirtualMonitor {
                 "--resolution",
                 &format!("{width}x{height}"),
                 "--name",
-                &format!("webshooter-{}", index),
+                &name,
                 "--password",
                 "x",
                 "--port",
@@ -113,97 +128,32 @@ pub struct EncodedFrame {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub struct CaptureHandle {
-    cancel: CancellationToken,
-    task: JoinHandle<()>,
-    /// Held so the PipeWire audio sink stays alive for the capture's lifetime
-    /// and is torn down when the handle is dropped. `None` until the client
-    /// signals it is ready to play audio.
-    #[allow(dead_code)]
-    audio_sink: Arc<std::sync::Mutex<Option<AudioSink>>>,
-}
-
-impl CaptureHandle {
-    pub async fn close(self) {
-        self.cancel.cancel();
-        let _ = self.task.await;
-    }
-}
-
 /// Create the virtual keyboard at startup.
 #[cfg(target_os = "linux")]
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded frames into the returned channel.
+///
+/// `user_name` uniquely names this capture's virtual display / PipeWire sink so
+/// multiple simultaneous clients don't collide on the same node.  `client_id`
+/// is the registry id assigned by the WebTransport handler, used to route
+/// control datagrams back to this specific client and to name resources.
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
-) -> Result<(
-    mpsc::Receiver<EncodedFrame>,
-    mpsc::Receiver<ServerDatagram>,
-    CaptureHandle,
-)> {
+    user_name: String,
+    client_id: crate::ipc::ClientId,
+    cancel: CancellationToken,
+    server_msg_tx: mpsc::Sender<ServerDatagram>,
+) -> Result<(mpsc::Receiver<EncodedFrame>, JoinHandle<()>)> {
     let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
-    let (server_msg_tx, server_msg_rx) = mpsc::channel::<ServerDatagram>(8);
-    let cancel = CancellationToken::new();
 
-    // Defer creation of the application-owned PipeWire audio sink until the
-    // client tells us its AudioContext is actually `Running` (a user gesture
-    // has occurred). Before that the browser cannot play audio, so streaming
-    // Opus would just be wasted bandwidth/CPU. The sink is kept alive in the
-    // CaptureHandle so it is torn down when the capture ends.
-    let audio_sink: Arc<std::sync::Mutex<Option<AudioSink>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    {
-        let mut audio_ready_rx = client_rx.resubscribe();
-        let server_msg_tx = server_msg_tx.clone();
-        let cancel = cancel.clone();
-        let audio_sink = audio_sink.clone();
-        spawn(async move {
-            // Wait for the client's AudioReady signal, or for cancellation.
-            let recv = async {
-                loop {
-                    match audio_ready_rx.recv().await {
-                        Ok(ClientDatagram::AudioReady) => return true,
-                        Ok(_) => continue,
-                        Err(_) => return false,
-                    }
-                }
-            };
-            let cancel_fut = cancel.cancelled();
-            tokio::pin!(recv);
-            tokio::pin!(cancel_fut);
-            let ready = tokio::select! {
-                r = &mut recv => r,
-                _ = &mut cancel_fut => false,
-            };
-            if !ready || cancel.is_cancelled() {
-                return;
-            }
-            match crate::pipewire::audio::start_audio_sink(cancel.clone()).await {
-                Ok((sink, rx)) => {
-                    println!("[video] client ready — created PipeWire audio sink");
-                    spawn(async move {
-                        crate::pipewire::audio::forward_audio(rx, server_msg_tx).await;
-                    });
-                    *audio_sink.lock().unwrap() = Some(sink);
-                }
-                Err(e) => println!("[video] audio sink unavailable: {e:#}"),
-            }
-        });
-    }
+    // Per-capture portal token, seeded from the startup token so the
+    // first `select_devices` dialog is still skipped, but kept private to this
+    // capture so concurrent captures can't clobber each other.
+    let portal_token: PortalToken = load_persisted_portal_token().await;
 
-    // Forward IPC client-control commands (fullscreen toggle, mouse release)
-    // to the connected client.
-    if let Some(mut client_control_rx) = crate::ipc::subscribe_client_control() {
-        let server_msg_tx = server_msg_tx.clone();
-        spawn(async move {
-            while let Ok(dgram) = client_control_rx.recv().await {
-                if server_msg_tx.send(dgram).await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    // Control datagrams are routed to this specific client via the session's
+    // control channel, so no broadcast subscription is needed here.
 
     let remote_desktop = cancel.r(RemoteDesktop::new()).await?;
     let screencast = cancel.r(Screencast::new()).await?;
@@ -215,6 +165,10 @@ pub async fn capture(
     let task = spawn({
         let cancel = cancel.clone();
         let decoder_caps = decoder_caps.clone();
+        let user_name = user_name.clone();
+        let portal_token = portal_token.clone();
+        let client_id = client_id;
+        let server_msg_tx = server_msg_tx.clone();
         async move {
             while !cancel.is_cancelled() {
                 if let Err(e) = single_capture(
@@ -226,6 +180,9 @@ pub async fn capture(
                     &remote_desktop,
                     &screencast,
                     &decoder_caps,
+                    &user_name,
+                    client_id,
+                    &portal_token,
                 )
                 .await
                 {
@@ -235,15 +192,7 @@ pub async fn capture(
         }
     });
 
-    Ok((
-        frame_rx,
-        server_msg_rx,
-        CaptureHandle {
-            cancel,
-            task,
-            audio_sink,
-        },
-    ))
+    Ok((frame_rx, task))
 }
 
 async fn single_capture(
@@ -255,6 +204,9 @@ async fn single_capture(
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
+    user_name: &str,
+    client_id: u64,
+    portal_token: &PortalToken,
 ) -> Result<()> {
     loop {
         // --- Portal session -------------------------------------------------
@@ -283,7 +235,8 @@ async fn single_capture(
         // instead of hanging for another ResizeDisplay.
         last_dims.replace((width, height, index));
 
-        let virtual_monitor = VirtualMonitor::spawn(width, height, index)?;
+        let virtual_monitor =
+            VirtualMonitor::spawn(width, height, virtual_monitor_name(user_name, client_id))?;
 
         if let VirtualMonitor::ChildProcess(_) = virtual_monitor {
             cancel
@@ -307,7 +260,7 @@ async fn single_capture(
         // The restore token from the previous start() lets select_devices
         // restore the same device permissions without showing a dialog.
         let select_dev_opts = SelectDevicesOptions::default()
-            .set_restore_token(get_portal_token().await.as_deref())
+            .set_restore_token(get_portal_token(portal_token).as_deref())
             .set_devices(Some(BitFlags::from(
                 DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
             )))
@@ -343,7 +296,7 @@ async fn single_capture(
         // dialog.  Source selection and start() always show dialogs.
         let token = started.restore_token();
         if let Some(token) = token {
-            set_portal_token(token.to_owned()).await;
+            set_portal_token(portal_token, token.to_owned());
         }
 
         let stream = started

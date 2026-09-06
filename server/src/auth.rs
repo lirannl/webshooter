@@ -466,6 +466,18 @@ impl<'a> FromRequest<'a> for Authenticated {
 }
 
 pub use onetime::OnetimeToken;
+
+/// Resolve the full `User` (including `display_name`) for a `UserId`.  Used by
+/// the WebTransport handler to name per-client capture resources without
+/// bloating the short-lived `OnetimeToken` with the whole user record.
+pub async fn user_from_id(id: &UserId) -> Option<User> {
+    get_config()
+        .await
+        .users
+        .iter()
+        .find(|user| id.clone() == (**user))
+        .cloned()
+}
 #[handler]
 pub async fn negotiate_wt(
     Data(cert_hash): Data<&Sha256Digest>,

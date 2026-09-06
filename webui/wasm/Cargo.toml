@@ -15,6 +15,7 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = [
     "Window",
+    "MediaQueryList",
     "AddEventListenerOptions",
     "Document",
     "HtmlCanvasElement",

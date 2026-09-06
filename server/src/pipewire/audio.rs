@@ -24,8 +24,7 @@ pub struct AudioPacket {
 /// it is removed from the graph as soon as the owning connection closes.
 pub struct AudioSink {
     cancel: CancellationToken,
-    #[allow(dead_code)]
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     pipeline: gst::Pipeline,
     /// Handle to the sink's PipeWire main loop, used to wake/quit it from
@@ -49,29 +48,70 @@ impl Drop for AudioSink {
             pw::sys::pw_main_loop_quit(self.mainloop_ptr.0);
         }
         self.cancel.cancel();
+        // Wait for the sink's background thread to actually return so its
+        // PipeWire connection (and the `object.linger=false` sink node) is
+        // removed from the graph.  Without this, the thread is merely detached
+        // and the node can linger past the session that owned it.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
-/// Number of channels / sample rate the application-owned sink is created with
-/// and that Opus is encoded at.
-const SINK_CHANNELS: u32 = 2;
-const SINK_RATE: u32 = 48000;
+/// Defaults applied only when the client reports no channel/rate caps.
+const DEFAULT_CHANNELS: u8 = 2;
+const DEFAULT_RATE: u32 = 48000;
+
+/// Map a channel count to a PipeWire channel-map string. A proper named map
+/// (e.g. `FL,FR`) gives a real stereo sink instead of `aux0/aux1`; 1 channel is
+/// mono. Falls back to `auxN` for counts beyond the common layouts.
+fn channel_map(channels: u8) -> String {
+    match channels {
+        1 => "MONO".into(),
+        2 => "FL,FR".into(),
+        3 => "FL,FR,FC".into(),
+        4 => "FL,FR,RL,RR".into(),
+        5 => "FL,FR,FC,RL,RR".into(),
+        6 => "FL,FR,FC,LFE,RL,RR".into(),
+        7 => "FL,FR,FC,LFE,SL,SR,BC".into(),
+        8 => "FL,FR,FC,LFE,RL,RR,SL,SR".into(),
+        n => (0..n).map(|i| format!("AUX{i}")).collect::<Vec<_>>().join(","),
+    }
+}
 
 /// Create an application-owned PipeWire audio sink, then capture and Opus-
 /// encode everything played into it. Returns the sink handle (for
 /// lifetime/teardown) and a receiver of encoded audio chunks.
+///
+/// `name` uniquely identifies this sink (typically the session's base name,
+/// e.g. `webshooter-alice-1`); it is used to derive the PipeWire node name and
+/// the PulseAudio monitor source so each connected session owns a distinct sink.
 pub async fn start_audio_sink(
     cancel: CancellationToken,
+    name: String,
+    channels: u8,
+    rate: u32,
 ) -> Result<(AudioSink, mpsc::Receiver<AudioPacket>)> {
+    // Clamp to sane bounds and apply defaults when the client reports nothing.
+    let channels = if channels == 0 { DEFAULT_CHANNELS } else { channels.min(8) };
+    let rate = if rate == 0 { DEFAULT_RATE } else { rate };
+
     // The sink gets its own child token. Tearing the sink down on drop must not
-    // cancel the surrounding capture — only this audio subtree.
+    // cancel the surrounding session — only this audio subtree.
     let audio_cancel = cancel.child_token();
     let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(256);
     let (id_tx, id_rx) = tokio::sync::oneshot::channel::<(u32, MainLoopPtr)>();
 
-    let cancel_thread = audio_cancel.clone();
+    // The background thread is told to quit by watching the *parent* `cancel`
+    // token (not the child one): if this call bails out on cancellation before
+    // an `AudioSink` is ever constructed, there is no handle to wake the loop,
+    // so the thread would otherwise leak its PipeWire connection (and the
+    // `object.linger=false` sink node) forever.
+    let cancel_thread = cancel.clone();
+    let name_thread = name.clone();
+    let channels_thread = channels;
     let thread = std::thread::spawn(move || {
-        if let Err(e) = sink_thread(id_tx, cancel_thread) {
+        if let Err(e) = sink_thread(id_tx, cancel_thread, name_thread, channels_thread) {
             eprintln!("[audio] sink error: {e:#}");
         }
     });
@@ -79,18 +119,30 @@ pub async fn start_audio_sink(
     // Wait for the sink node to be created (or cancellation).
     let (_sink_id, mainloop_ptr) = tokio::select! {
         _ = cancel.cancelled() => {
+            // Cancelled before the sink was ready.  The sink thread watches the
+            // same parent token and will quit its loop (removing the node) on
+            // its own; reap the thread on a helper so returning doesn't block
+            // the tokio worker, and leave it a moment to wind down.
+            std::thread::spawn(move || { let _ = thread.join(); });
             return Err(anyhow!("audio cancelled before sink was ready"));
         }
         id = id_rx => id.map_err(|_| anyhow!("audio sink thread terminated"))?,
     };
 
     gst::init()?;
-    let pipeline = gst::parse::launch(
-        "pulsesrc device=webshooter-audio-sink.monitor client-name=webshooter-audio \
-         ! audioconvert \
+    let monitor_source = format!("{name}-audio-sink.monitor");
+    // Capture the monitored audio at the client's negotiated rate and channel
+    // count, converting to S16LE for `opusenc` (Opus's native integer input
+    // format). `audioconvert ! audioresample` normalise whatever the monitor
+    // produces (typically F32LE, PulseAudio's native format) into that caps.
+    let caps = format!("audio/x-raw,format=S16LE,rate={rate},channels={channels}");
+    let pipeline = gst::parse::launch(&format!(
+        "pulsesrc device={monitor_source} client-name={name} \
+         ! audioconvert ! audioresample \
+         ! capsfilter caps=\"{caps}\" \
          ! opusenc bitrate=128000 \
          ! appsink name=sink sync=false",
-    )?
+    ))?
     .downcast::<gst::Pipeline>()
     .map_err(|_| anyhow!("audio pipeline is not a pipeline"))?;
 
@@ -109,8 +161,8 @@ pub async fn start_audio_sink(
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 if tx
                     .try_send(AudioPacket {
-                        channels: SINK_CHANNELS as u8,
-                        rate: SINK_RATE,
+                        channels,
+                        rate,
                         format: AudioFormat::Opus,
                         data: map.to_vec(),
                     })
@@ -131,7 +183,7 @@ pub async fn start_audio_sink(
     Ok((
         AudioSink {
             cancel: audio_cancel,
-            thread,
+            thread: Some(thread),
             pipeline,
             mainloop_ptr,
         },
@@ -143,11 +195,13 @@ pub async fn start_audio_sink(
 /// connection and keep that connection alive until cancelled. Sends the sink's
 /// node id and main-loop handle back so `Drop` can wake the loop. The mixed
 /// audio we stream is captured by the GStreamer pipeline from the sink's
-/// PulseAudio `.monitor` source (`webshooter-audio-sink.monitor`), which
+/// PulseAudio `.monitor` source (`<name>-audio-sink.monitor`), which
 /// PipeWire's PulseAudio emulation exposes for every sink.
 fn sink_thread(
     id_tx: tokio::sync::oneshot::Sender<(u32, MainLoopPtr)>,
     cancel: CancellationToken,
+    name: String,
+    channels: u8,
 ) -> Result<()> {
     pw::init();
 
@@ -158,13 +212,15 @@ fn sink_thread(
     let mainloop_ptr = mainloop.as_raw_ptr();
 
     // `object.linger=false` means the node is removed when this client
-    // disconnects — i.e. it is owned by this application. The `FL,FR` channel
-    // map gives a proper stereo sink instead of the default `aux0/aux1`.
+    // disconnects — i.e. it is owned by this application. The channel map (e.g.
+    // `FL,FR` for stereo) gives a real sink instead of the default `aux0/aux1`,
+    // and is matched to the client's reported channel count.
+    let sink_name = format!("{name}-audio-sink");
     let sink_props = pw::properties::properties! {
         *pw::keys::FACTORY_NAME => "support.null-audio-sink",
-        *pw::keys::NODE_NAME => "webshooter-audio-sink",
+        *pw::keys::NODE_NAME => sink_name,
         *pw::keys::MEDIA_CLASS => "Audio/Sink",
-        *pw::keys::AUDIO_CHANNELS => "FL,FR",
+        *pw::keys::AUDIO_CHANNELS => channel_map(channels),
         *pw::keys::OBJECT_LINGER => "false",
     };
     let _sink = core

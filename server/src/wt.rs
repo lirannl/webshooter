@@ -1,13 +1,17 @@
 use crate::{
-    auth::{OnetimeToken, UserId},
+    auth::{OnetimeToken, UserId, user_from_id},
     config::{Bytes64, Config},
     error::WebshooterError,
+    ipc,
+    pipewire::audio::{AudioSink, forward_audio, start_audio_sink},
     pipewire::video,
 };
+use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 use log::LevelFilter;
 use shared::client_datagram::ClientDatagram;
 use shared::server_datagram;
+use shared::server_datagram::ServerDatagram;
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
@@ -19,7 +23,7 @@ use tokio::{
     sync::{broadcast, mpsc, mpsc::Receiver},
     time::{self},
 };
-use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt, endpoint::IncomingSession};
+use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
 
 // The client sends
 //  a KeepAlive datagram every 50 ms. 500 ms gives ~10
@@ -41,14 +45,38 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     loop {
         let session = server.accept().await;
 
+        let (user_id, connection) = match webtransport_auth(session).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                log::error!("{err:#?}");
+                continue;
+            }
+        };
+        let connection = Arc::new(connection);
+
+        // Resolve the display name and register the session into the collection
+        // *before* looping back to accept the next connection, so a session is
+        // always addressable the moment another one is taken.  The capture and
+        // forwarding work is then spawned and runs concurrently.
+        let display_name = user_from_id(&user_id)
+            .await
+            .map(|user| user.display_name)
+            .unwrap_or_default();
+        let (control_tx, control_rx) = mpsc::channel::<ServerDatagram>(8);
+        let disconnect = CancellationToken::new();
+        let session = ipc::register_session(
+            display_name,
+            control_tx,
+            disconnect,
+            connection.clone(),
+        );
+        let client_id = session.id;
+
         tokio::spawn(async move {
-            match webtransport_auth(session).await {
-                Ok((user_id, connection)) => {
-                    handle_wt_connection(connection, user_id, max_log_level)
-                        .await
-                        .unwrap_or_else(|err| log::error!("{err:#?}"))
-                }
-                Err(err) => log::error!("{err:#?}"),
+            if let Err(err) =
+                run_session(session, connection, client_id, control_rx, max_log_level).await
+            {
+                log::error!("{err:#?}");
             }
         });
     }
@@ -84,16 +112,16 @@ async fn webtransport_auth(session: IncomingSession) -> Result<(UserId, Connecti
 // Connection handler
 // ---------------------------------------------------------------------------
 
-pub async fn handle_wt_connection(
-    connection: Connection,
-    user_id: UserId,
+pub async fn run_session(
+    session: Arc<ipc::Session>,
+    connection: Arc<Connection>,
+    client_id: ipc::ClientId,
+    control_rx: mpsc::Receiver<ServerDatagram>,
     max_log_level: LevelFilter,
 ) -> Result<()> {
-    let _connection = Arc::new(connection);
-
     // Tell the client how verbose we are so it stops generating records we
     // would discard anyway.
-    let _ = _connection.send_datagram(
+    let _ = connection.send_datagram(
         &shared::server_datagram::ServerDatagram::LogLevel {
             level: max_log_level,
         }
@@ -101,14 +129,14 @@ pub async fn handle_wt_connection(
     );
 
     let (_broadcaster, _client_rx) = broadcast::channel(256);
-    let mut datagrams = broadcast_datagrams(_connection.clone(), _broadcaster.clone());
-    let mut unistreams = broadcast_unistreams(_connection.clone(), _broadcaster.clone());
+    let mut datagrams = broadcast_datagrams(connection.clone(), _broadcaster.clone());
+    let mut unistreams = broadcast_unistreams(connection.clone(), _broadcaster.clone());
 
     let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
     {
         let mut client_rx = _client_rx.resubscribe();
         let decoder_caps = decoder_caps.clone();
-        spawn(async move {
+        session.add_task(spawn(async move {
             loop {
                 match client_rx.recv().await {
                     Ok(ClientDatagram::Error { level, message }) => {
@@ -125,35 +153,108 @@ pub async fn handle_wt_connection(
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
 
-    let mut capture_handle: Option<video::CaptureHandle> = None;
-
-    loop {
-        // Race start_capture against connection closure so a refresh/disconnect
-        // while waiting for the initial resize doesn't leave a zombie capture.
-        let (frame_rx, server_msg_rx, handle) = tokio::select! {
-            r = video::capture(_client_rx.resubscribe(), decoder_caps.clone()) => r?,
-            _ = &mut datagrams  => { log::info!("Datagrams closed");              break; }
-            _ = &mut unistreams => { log::info!("Unidirectional streams closed");  break; }
-            _ = _connection.closed() => { log::info!("WebTransport connection closed by peer"); break; }
-        };
-        capture_handle = Some(handle);
-        let frame_forwarder = frame_forwarder(frame_rx, server_msg_rx, _connection.clone());
-
-        tokio::select! {
-            _ = datagrams => { log::info!("Datagrams closed"); break; }
-            _ = unistreams => { log::info!("Unidirectional streams closed");  break; }
-            _ = frame_forwarder => { log::info!("capture pipeline stopped");  break; }
-            _ = _connection.closed() => { log::info!("WebTransport connection closed by peer"); break; }
-        }
+    // Own the application audio sink at the *session* level (not inside the
+    // video capture), so video context resets / display resizes never disturb
+    // it.  It is created lazily once the client's AudioContext starts, named
+    // per this session (`webshooter-<user>-<id>-audio-sink`), and torn down
+    // when the session ends via the session's disconnect token.
+    let session_name = video::virtual_monitor_name(&session.display_name, client_id);
+    let audio_sink: Arc<Mutex<Option<AudioSink>>> = Arc::new(Mutex::new(None));
+    {
+        let mut audio_rx = _client_rx.resubscribe();
+        let audio_sink = audio_sink.clone();
+        let control_tx = session.control_tx();
+        let session_name = session_name.clone();
+        let audio_cancel = session.disconnect();
+        session.add_task(spawn(async move {
+            // Wait for the client's AudioReady signal (with its channel/rate
+            // caps), or for cancellation.
+            let recv = async {
+                loop {
+                    match audio_rx.recv().await {
+                        Ok(ClientDatagram::AudioReady { channels, rate }) => {
+                            return Some((channels, rate));
+                        }
+                        Ok(_) => continue,
+                        Err(_) => return None,
+                    }
+                }
+            };
+            let cancel_fut = audio_cancel.cancelled();
+            tokio::pin!(recv);
+            tokio::pin!(cancel_fut);
+            let ready = tokio::select! {
+                r = &mut recv => r,
+                _ = &mut cancel_fut => None,
+            };
+            let Some((channels, rate)) = ready else {
+                return;
+            };
+            if audio_cancel.is_cancelled() {
+                return;
+            }
+            match start_audio_sink(audio_cancel.clone(), session_name, channels, rate).await {
+                Ok((sink, rx)) => {
+                    println!("[audio] client ready — created PipeWire audio sink");
+                    spawn(async move {
+                        forward_audio(rx, control_tx).await;
+                    });
+                    *audio_sink.lock().unwrap() = Some(sink);
+                }
+                Err(e) => println!("[audio] audio sink unavailable: {e:#}"),
+            }
+        }));
     }
 
-    if let Some(h) = capture_handle {
-        h.close().await;
+    // Race start_capture against connection closure so a refresh/disconnect
+    // while waiting for the initial resize doesn't leave a zombie capture.
+    let cancel = session.disconnect();
+    let started = tokio::select! {
+        r = video::capture(
+            _client_rx.resubscribe(),
+            decoder_caps.clone(),
+            session.display_name.clone(),
+            client_id,
+            cancel.clone(),
+            session.control_tx(),
+        ) => r.map(Some)?,
+        _ = cancel.cancelled() => { log::info!("Disconnect requested"); None }
+        _ = &mut datagrams  => { log::info!("Datagrams closed");              None }
+        _ = &mut unistreams => { log::info!("Unidirectional streams closed");  None }
+        _ = connection.closed() => { log::info!("WebTransport connection closed by peer"); None }
+    };
+    let Some((frame_rx, capture_task)) = started else {
+        // Connection went away before a capture could start; removing the entry
+        // drops the registry's Arc and tears the session down.  Drop any audio
+        // sink that was being created so its PipeWire node doesn't outlive the
+        // session.
+        *audio_sink.lock().unwrap() = None;
+        ipc::remove_session(client_id);
+        return Ok(());
+    };
+    session.add_task(capture_task);
+    let mut frame_forwarder = frame_forwarder(frame_rx, control_rx, connection.clone());
+
+    tokio::select! {
+        _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
+        _ = &mut datagrams => { log::info!("Datagrams closed"); }
+        _ = &mut unistreams => { log::info!("Unidirectional streams closed");  }
+        _ = &mut frame_forwarder => { log::info!("capture pipeline stopped");  }
+        _ = connection.closed() => { log::info!("WebTransport connection closed by peer"); }
     }
-    _connection.close(VarInt::from_u32(0), b"done");
+
+    session.add_task(datagrams);
+    session.add_task(unistreams);
+    session.add_task(frame_forwarder);
+    // Tear down the application-owned audio sink before deregistering the
+    // session: dropping it stops the capture pipeline and joins the sink's
+    // background thread so the `object.linger=false` PipeWire node is removed,
+    // rather than persisting after the session that owned it has ended.
+    *audio_sink.lock().unwrap() = None;
+    ipc::remove_session(client_id);
     Ok(())
 }
 

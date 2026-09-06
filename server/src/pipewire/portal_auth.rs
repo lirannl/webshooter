@@ -5,7 +5,12 @@
 /// then call `accept_dialog` for each portal dialog.  The keyboard is
 /// destroyed when it goes out of scope.
 use anyhow::{Result, anyhow};
-use std::{future::Future, ops::Deref, path::PathBuf, sync::LazyLock};
+use std::{
+    future::Future,
+    ops::Deref,
+    path::PathBuf,
+    sync::{Arc, LazyLock, Mutex},
+};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Duration, sleep, timeout};
@@ -16,16 +21,46 @@ use crate::keyboard::{self, Keyboard};
 static PORTAL_TOKEN_FILE: LazyLock<PathBuf> =
     LazyLock::new(|| CONFIG_DIR.get().unwrap().join("portal_token"));
 
-pub async fn set_portal_token(token: String) {
-    if let Ok(mut file) = File::create(PORTAL_TOKEN_FILE.deref()).await {
-        let _ = file.write_all(token.as_bytes()).await;
-    }
+/// Per-capture restore-token state.  Each concurrent capture owns its own
+/// `Arc<Mutex<Option<String>>>` so two clients can't clobber each other's
+/// portal session token (the previous implementation shared a single global
+/// file, so a second client would overwrite the first's token mid-session).
+pub type PortalToken = Arc<Mutex<Option<String>>>;
+
+/// Seed a fresh per-capture token state from the on-disk token written by
+/// `setup_pipewire` at startup, so the very first `select_devices` dialog is
+/// still skipped.  Each capture then maintains its own copy in memory.
+pub async fn load_persisted_portal_token() -> PortalToken {
+    PortalToken::new(Mutex::new(get_persisted_portal_token().await))
 }
-pub async fn get_portal_token() -> Option<String> {
+
+pub fn get_portal_token(state: &PortalToken) -> Option<String> {
+    state.lock().unwrap().clone()
+}
+
+pub fn set_portal_token(state: &PortalToken, token: String) {
+    *state.lock().unwrap() = Some(token);
+}
+
+async fn get_persisted_portal_token() -> Option<String> {
     let file = File::open(PORTAL_TOKEN_FILE.deref()).await.ok()?;
     let mut string = String::default();
     let _ = BufReader::new(file).read_to_string(&mut string).await;
     Some(string)
+}
+
+/// Read the startup auth token from disk (without wrapping it in capture
+/// state).  Used by `setup_pipewire` to seed its own `select_devices` call.
+pub async fn read_persisted_portal_token() -> Option<String> {
+    get_persisted_portal_token().await
+}
+
+/// Persist the startup auth token to disk so subsequent launches (and the
+/// initial seed of every capture) can skip the first `select_devices` dialog.
+pub async fn persist_portal_token(token: String) {
+    if let Ok(mut file) = File::create(PORTAL_TOKEN_FILE.deref()).await {
+        let _ = file.write_all(token.as_bytes()).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

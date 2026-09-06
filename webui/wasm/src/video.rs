@@ -185,6 +185,18 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
     pending_fullscreen
 }
 
+/// True when the page is running as an installed PWA in standalone display
+/// mode. In that case browsers permit `requestFullscreen()` without a fresh
+/// user gesture, so we can honour a fullscreen toggle immediately.
+fn is_installed_pwa(window: &web_sys::Window) -> bool {
+    window
+        .match_media("(display-mode: standalone)")
+        .ok()
+        .flatten()
+        .map(|m| m.matches())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Codec capability probing
 // ---------------------------------------------------------------------------
@@ -397,8 +409,12 @@ pub async fn render_loop(
                 if document.fullscreen_element().is_some() {
                     // Exiting fullscreen is allowed without a user gesture.
                     let _ = document.exit_fullscreen();
+                } else if is_installed_pwa(&window) {
+                    // Installed PWAs (standalone display mode) are granted
+                    // fullscreen without a fresh user gesture — do it now.
+                    let _ = canvas.request_fullscreen();
                 } else {
-                    // Entering requires a gesture; defer to the next pointerdown.
+                    // In-browser tabs require a gesture; defer to the next pointerdown.
                     pending_fullscreen.set(true);
                 }
                 continue;

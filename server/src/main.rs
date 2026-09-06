@@ -14,6 +14,7 @@ mod keyboard;
 mod logging;
 #[cfg(target_os = "linux")]
 mod pipewire;
+mod tray;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;
@@ -98,10 +99,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let _ = CONFIG_DIR.set(setup_config_dir().await?);
     setup_config(CONFIG_DIR.get().unwrap()).await?;
 
-    let (tx, mut rx) = mpsc::channel::<()>(1);
-    RESET_TRIGGER.lock().await.replace(tx);
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+        RESET_TRIGGER.lock().await.replace(tx);
 
-    loop {
+        // Desktop tray (Linux only): menu to toggle fullscreen / release mouse.
+        tray::setup_tray();
+
+        loop {
         let config = get_config().await;
         logging::set_level(config.log_level);
 

@@ -7,6 +7,8 @@ use poem::{
 };
 #[cfg(debug_assertions)]
 use poem::{ResponseParts, error::NotFound};
+#[cfg(debug_assertions)]
+use std::time::Duration;
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
@@ -15,12 +17,23 @@ use rust_embed::RustEmbed;
 #[cfg_attr(debug_assertions, allow_missing = true)]
 pub struct Assets;
 
+#[cfg(debug_assertions)]
+fn vite_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap()
+}
+
 #[poem::handler]
 pub async fn frontend(path: Option<Path<String>>) -> impl IntoResult<Response> {
     let Path(path) = path.unwrap_or(Path("index.html".to_string()));
     #[cfg(debug_assertions)]
     {
-        if let Ok(response) = reqwest::get(format!("http://localhost:5173/{path}")).await
+        if let Ok(response) = vite_client()
+            .get(format!("http://localhost:5173/{path}"))
+            .send()
+            .await
             && response.status().is_success()
         {
             let parts = ResponseParts {

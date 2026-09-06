@@ -9,10 +9,10 @@ use portal_auth::accept_dialog;
 
 use crate::{
     keyboard::Keyboard,
-    pipewire::portal_auth::{get_portal_token, set_portal_token},
+    pipewire::portal_auth::{persist_portal_token, read_persisted_portal_token},
 };
 
-mod audio;
+pub(crate) mod audio;
 mod eis;
 mod eis_keyboard;
 pub(crate) mod gamepad;
@@ -25,7 +25,7 @@ pub async fn setup_pipewire() {
     pipewire::init();
 
     match create_auth_token().await {
-        Ok(string) => set_portal_token(string).await,
+        Ok(string) => persist_portal_token(string).await,
         Err(err) => {
             eprintln!("Failed to create portal auth token: {err:#}");
             eprintln!("Cannot run without portal auto-approval. Exiting.");
@@ -47,7 +47,7 @@ async fn create_auth_token() -> Result<String, anyhow::Error> {
         .set_devices(Some(BitFlags::from(
             DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
         )))
-        .set_restore_token(get_portal_token().await.as_deref())
+        .set_restore_token(read_persisted_portal_token().await.as_deref())
         .set_persist_mode(PersistMode::ExplicitlyRevoked);
 
     accept_dialog(&mut kb, async {

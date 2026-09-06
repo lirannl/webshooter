@@ -3,10 +3,14 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use shared::server_datagram::ServerDatagram;
 use std::{
-    env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr, sync::OnceLock,
+    collections::HashMap,
+    env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr,
+    sync::{Arc, LazyLock, Mutex},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum IPCMessage {
@@ -77,30 +81,164 @@ impl IPCConnection {
 }
 
 // ---------------------------------------------------------------------------
-// Client-control broadcast
+// Connected-client session registry
 //
-// IPC commands that target the connected client (fullscreen toggle, mouse
-// release) are published here and forwarded to the active capture session's
-// server_msg channel, which ultimately reaches the WebTransport client.
+// Every live WebTransport client is represented by a `Session` stored in a
+// single map keyed by `ClientId`.  A `Session` owns everything needed to tear
+// the connection down: the control channel, a `CancellationToken` for a
+// forced-disconnect, the `Connection` itself, and the `JoinHandle`s of the
+// tasks that drive it.  Dropping a `Session` — which happens automatically
+// when it is removed from the map — cancels its tasks and closes the
+// connection, so removing a client from the registry cleanly disconnects it.
+//
+// Client ids are globally unique across all connected sessions: each new
+// session gets the lowest id not currently in use, so no two live sessions
+// ever share a map key (and thus never overwrite each other).
 // ---------------------------------------------------------------------------
 
-static CLIENT_CONTROL: OnceLock<broadcast::Sender<ServerDatagram>> = OnceLock::new();
+pub type ClientId = u64;
 
-pub fn client_control_init() {
-    let (tx, _rx) = broadcast::channel(16);
-    let _ = CLIENT_CONTROL.set(tx);
+pub struct Session {
+    pub id: ClientId,
+    pub display_name: String,
+    control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
+    disconnect: CancellationToken,
+    connection: Arc<wtransport::Connection>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Subscribe to client-control datagrams routed from IPC commands.
-pub fn subscribe_client_control() -> Option<broadcast::Receiver<ServerDatagram>> {
-    CLIENT_CONTROL.get().map(|tx| tx.subscribe())
-}
-
-/// Publish a control datagram to all connected clients.
-pub fn send_client_control(msg: ServerDatagram) {
-    if let Some(tx) = CLIENT_CONTROL.get() {
-        let _ = tx.send(msg);
+impl Session {
+    /// A clone of the control channel used to route `ServerDatagram`s to this
+    /// client (e.g. fullscreen toggles, mouse release).
+    pub fn control_tx(&self) -> tokio::sync::mpsc::Sender<ServerDatagram> {
+        self.control_tx.clone()
     }
+
+    /// A clone of the token that, when cancelled, tears this session down.
+    pub fn disconnect(&self) -> CancellationToken {
+        self.disconnect.clone()
+    }
+
+    /// Track a task that belongs to this session so it is cancelled on drop.
+    pub fn add_task(&self, handle: JoinHandle<()>) {
+        self.tasks.lock().unwrap().push(handle);
+    }
+
+    /// Route a `ServerDatagram` into this session's control channel.
+    pub fn send(&self, msg: ServerDatagram) {
+        let _ = self.control_tx.try_send(msg);
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Cancel every task owned by this session (capture, forwarder, …).
+        self.disconnect.cancel();
+        // Close the connection so transport-level tasks also wind down.
+        let _ = self
+            .connection
+            .close(wtransport::VarInt::from_u32(0), b"done");
+    }
+}
+
+static REGISTRY: LazyLock<Mutex<HashMap<ClientId, Arc<Session>>>> =
+    LazyLock::new(Default::default);
+
+/// Bumped every time a session is registered or removed so subscribers (e.g.
+/// the desktop tray) know the connected-client list has changed and can
+/// re-render their menu.
+static REGISTRY_VERSION: LazyLock<watch::Sender<u64>> =
+    LazyLock::new(|| watch::channel(0).0);
+
+/// Subscribe to notifications about connected-client changes.  The value is a
+/// monotonically increasing revision; it changes whenever the registry does.
+pub fn subscribe_registry_changes() -> watch::Receiver<u64> {
+    REGISTRY_VERSION.subscribe()
+}
+
+fn notify_registry_changed() {
+    let _ = REGISTRY_VERSION.send_if_modified(|rev| {
+        *rev += 1;
+        true
+    });
+}
+
+/// Register a new session and assign it the lowest free id.
+///
+/// Ids must be globally unique across *all* sessions: the registry is keyed by
+/// the bare `ClientId`, so if two different users both got `id == 1` the second
+/// `insert` would overwrite the first session and hide it from the tray/menu
+/// (while its background tasks kept running, keeping its audio sink alive).
+pub fn register_session(
+    display_name: String,
+    control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
+    disconnect: CancellationToken,
+    connection: Arc<wtransport::Connection>,
+) -> Arc<Session> {
+    let mut registry = REGISTRY.lock().unwrap();
+    let mut id = 1u64;
+    while registry.contains_key(&id) {
+        id += 1;
+    }
+    let session = Arc::new(Session {
+        id,
+        display_name,
+        control_tx,
+        disconnect,
+        connection,
+        tasks: Mutex::new(Vec::new()),
+    });
+    registry.insert(id, Arc::clone(&session));
+    notify_registry_changed();
+    session
+}
+
+/// Remove a session from the registry.  Dropping the last `Arc<Session>`
+/// cancels its tasks and closes the connection.
+pub fn remove_session(id: ClientId) {
+    REGISTRY.lock().unwrap().remove(&id);
+    notify_registry_changed();
+}
+
+/// Snapshot of currently connected clients for UI (tray menu) rendering.
+pub fn list_clients() -> Vec<(ClientId, String)> {
+    REGISTRY
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, s)| (*id, s.display_name.clone()))
+        .collect()
+}
+
+/// Broadcast a control datagram to every connected client.
+pub fn send_client_control(msg: ServerDatagram) {
+    let registry = REGISTRY.lock().unwrap();
+    for session in registry.values() {
+        session.send(msg.clone());
+    }
+}
+
+/// Route a control datagram to a single client.
+pub fn send_client_control_to(id: ClientId, msg: ServerDatagram) {
+    let registry = REGISTRY.lock().unwrap();
+    if let Some(session) = registry.get(&id) {
+        session.send(msg);
+    }
+}
+
+/// Force a client to disconnect by cancelling its token and removing it from
+/// the registry.  Removing the entry drops the registry's `Arc<Session>`; the
+/// remaining `Arc` (held by the connection task) is released once the token
+/// cancellation winds the session down, which triggers `Session::drop` and
+/// closes the connection.  A disconnected session is therefore always removed
+/// from the collection — there is no way to disconnect while leaving a stale
+/// entry behind.
+pub fn disconnect_client(id: ClientId) {
+    let token = REGISTRY.lock().unwrap().get(&id).map(|s| s.disconnect());
+    if let Some(token) = token {
+        token.cancel();
+    }
+    remove_session(id);
 }
 
 mod ipc_funcs {
@@ -194,7 +332,6 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
     }?;
 
     ipc_funcs::ipc_init().await;
-    client_control_init();
     stdio_setup();
     tokio::spawn(async move {
         loop {
@@ -243,7 +380,7 @@ pub async fn setup_ipc(_config: Config) -> Result<()> {
                     IPCMessage::FullscreenToggle(_) => None,
                 };
                 if let Some(message) = response {
-                    conn.write(message.as_bytes()).await?;
+                    conn.write_all(message.as_bytes()).await?;
                 } else {
                     ipc_handler(message, IPCConnection::Unix(conn)).await?;
                 }

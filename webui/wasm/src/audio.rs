@@ -139,8 +139,16 @@ impl AudioPlayer {
                 && !ready_state.borrow().audio_ready.get()
             {
                 ready_state.borrow().audio_ready.set(true);
-                crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady);
-                log::info!("audio: AudioContext Running — sent AudioReady to server");
+                let ctx = ready_state.borrow().ctx.clone();
+                let channels = ctx.destination().channel_count() as u8;
+                let rate = ctx.sample_rate() as u32;
+                crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady {
+                    channels,
+                    rate,
+                });
+                log::info!(
+                    "audio: AudioContext Running — sent AudioReady (channels={channels}, rate={rate}) to server"
+                );
             }
         }) as Box<dyn FnMut()>);
         ctx.set_onstatechange(Some(ready_cb.as_ref().unchecked_ref()));
@@ -149,8 +157,15 @@ impl AudioPlayer {
         // In case it is already running (e.g. autoplay allowed).
         if ctx.state() == web_sys::AudioContextState::Running && !state.borrow().audio_ready.get() {
             state.borrow().audio_ready.set(true);
-            crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady);
-            log::info!("audio: AudioContext Running — sent AudioReady to server");
+            let channels = ctx.destination().channel_count() as u8;
+            let rate = ctx.sample_rate() as u32;
+            crate::send_datagram(shared::client_datagram::ClientDatagram::AudioReady {
+                channels,
+                rate,
+            });
+            log::info!(
+                "audio: AudioContext Running — sent AudioReady (channels={channels}, rate={rate}) to server"
+            );
         }
 
         log::info!("audio: AudioPlayer created");
