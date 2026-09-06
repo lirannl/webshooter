@@ -43,9 +43,9 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let max_log_level = config.log_level;
 
     loop {
-        let session = server.accept().await;
+        let incoming = server.accept().await;
 
-        let (user_id, connection) = match webtransport_auth(session).await {
+        let (user_id, connection) = match webtransport_auth(incoming).await {
             Ok(pair) => pair,
             Err(err) => {
                 log::error!("{err:#?}");
@@ -54,31 +54,96 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         };
         let connection = Arc::new(connection);
 
-        // Resolve the display name and register the session into the collection
-        // *before* looping back to accept the next connection, so a session is
-        // always addressable the moment another one is taken.  The capture and
-        // forwarding work is then spawned and runs concurrently.
+        // Resolve the display name and reserve the client id.  The id comes
+        // from the registry *before* anything is constructed: capture, audio
+        // and resource names all need it.
         let display_name = user_from_id(&user_id)
             .await
             .map(|user| user.display_name)
             .unwrap_or_default();
+        let client_id = ipc::next_client_id();
+
+        // Session-scoped channels and state, handed to the tasks below.
         let (control_tx, control_rx) = mpsc::channel::<ServerDatagram>(8);
         let disconnect = CancellationToken::new();
-        let session = ipc::register_session(
-            display_name,
-            control_tx,
-            disconnect,
-            connection.clone(),
-        );
-        let client_id = session.id;
+        let (client_tx, client_rx) = broadcast::channel::<ClientDatagram>(256);
+        let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
+        let audio_sink: Arc<Mutex<Option<AudioSink>>> = Arc::new(Mutex::new(None));
+        let session_name = video::virtual_monitor_name(&display_name, client_id);
 
-        tokio::spawn(async move {
-            if let Err(err) =
-                run_session(session, connection, client_id, control_rx, max_log_level).await
+        // Every long-lived task of this session is created up-front as a
+        // local; the supervisor below takes ownership of them all, so a
+        // registered session is always fully built.  The pumps forward the
+        // client's transport in and end the moment the peer is gone; the audio
+        // task waits for the client's AudioContext; the driver owns capture
+        // negotiation and the run loop.
+        let mut datagrams = broadcast_datagrams(connection.clone(), client_tx.clone());
+        let mut unistreams = broadcast_unistreams(connection.clone(), client_tx.clone());
+        let mut client_events = client_events_task(client_rx.resubscribe(), decoder_caps.clone());
+        let mut audio = audio_ready_task(
+            client_rx.resubscribe(),
+            session_name,
+            control_tx.clone(),
+            disconnect.clone(),
+            audio_sink.clone(),
+        );
+
+        // Capture negotiation, the frame forwarder and the run loop run in a
+        // driver task.  The driver owns the transport and closes it, drops the
+        // audio sink and deregisters as its *last* acts.  Pre-clone the values
+        // `register_session` also needs: spawning the driver moves the
+        // originals into its future.
+        let registered_name = display_name.clone();
+        let registered_control = control_tx.clone();
+        let registered_disconnect = disconnect.clone();
+        let driver_token = disconnect.clone();
+        let mut driver = tokio::spawn(async move {
+            if let Err(err) = run_session(
+                client_id,
+                display_name,
+                control_tx,
+                control_rx,
+                connection,
+                driver_token,
+                audio_sink,
+                client_rx,
+                decoder_caps,
+                max_log_level,
+            )
+            .await
             {
                 log::error!("{err:#?}");
             }
         });
+
+        // One supervisor per session: a race over every task that must keep
+        // running.  Whichever ends first has ended the session, so the
+        // supervisor cancels the session token — waking the driver into its
+        // teardown — and deregisters.  The removal is idempotent (the driver
+        // removes itself too), so it also covers a driver handle completing
+        // without a clean teardown.  `Session` stores only this handle: the
+        // session lives exactly as long as its supervisor.
+        let supervisor = tokio::spawn(async move {
+            tokio::select! {
+                _ = &mut datagrams => {}
+                _ = &mut unistreams => {}
+                _ = &mut client_events => {}
+                _ = &mut audio => {}
+                _ = &mut driver => {}
+            }
+            disconnect.cancel();
+            ipc::remove_session(client_id);
+        });
+
+        // Only once the session struct exists (holding the supervisor) and is
+        // registered do we loop back to accept a new connection.
+        ipc::register_session(
+            client_id,
+            registered_name,
+            registered_control,
+            registered_disconnect,
+            supervisor,
+        );
     }
 }
 
@@ -112,11 +177,19 @@ async fn webtransport_auth(session: IncomingSession) -> Result<(UserId, Connecti
 // Connection handler
 // ---------------------------------------------------------------------------
 
+// Each argument is a distinct session resource with its own owner; the
+// alternative to this many arguments is attributing state someone else owns.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session(
-    session: Arc<ipc::Session>,
-    connection: Arc<Connection>,
     client_id: ipc::ClientId,
+    display_name: String,
+    server_msg_tx: mpsc::Sender<ServerDatagram>,
     control_rx: mpsc::Receiver<ServerDatagram>,
+    connection: Arc<Connection>,
+    cancel: CancellationToken,
+    audio_sink: Arc<Mutex<Option<AudioSink>>>,
+    client_rx: broadcast::Receiver<ClientDatagram>,
+    decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>>,
     max_log_level: LevelFilter,
 ) -> Result<()> {
     // Tell the client how verbose we are so it stops generating records we
@@ -128,134 +201,139 @@ pub async fn run_session(
         .to_bytes(),
     );
 
-    let (_broadcaster, _client_rx) = broadcast::channel(256);
-    let mut datagrams = broadcast_datagrams(connection.clone(), _broadcaster.clone());
-    let mut unistreams = broadcast_unistreams(connection.clone(), _broadcaster.clone());
-
-    let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
-    {
-        let mut client_rx = _client_rx.resubscribe();
-        let decoder_caps = decoder_caps.clone();
-        session.add_task(spawn(async move {
-            loop {
-                match client_rx.recv().await {
-                    Ok(ClientDatagram::Error { level, message }) => {
-                        log::log!(target: "webshooter::client", level, "{message}");
-                    }
-                    Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
-                        *decoder_caps.lock().unwrap() = Some(decoders);
-                    }
-                    Ok(_) => {}
-                    // The broadcast channel is closed once the connection's
-                    // broadcaster is dropped; recv() then returns Err
-                    // immediately, so without this break the task would spin
-                    // at 100% of a core forever (one leaked task per session).
-                    Err(_) => break,
-                }
-            }
-        }));
-    }
-
     // Own the application audio sink at the *session* level (not inside the
     // video capture), so video context resets / display resizes never disturb
-    // it.  It is created lazily once the client's AudioContext starts, named
-    // per this session (`webshooter-<user>-<id>-audio-sink`), and torn down
-    // when the session ends via the session's disconnect token.
-    let session_name = video::virtual_monitor_name(&session.display_name, client_id);
-    let audio_sink: Arc<Mutex<Option<AudioSink>>> = Arc::new(Mutex::new(None));
-    {
-        let mut audio_rx = _client_rx.resubscribe();
-        let audio_sink = audio_sink.clone();
-        let control_tx = session.control_tx();
-        let session_name = session_name.clone();
-        let audio_cancel = session.disconnect();
-        session.add_task(spawn(async move {
-            // Wait for the client's AudioReady signal (with its channel/rate
-            // caps), or for cancellation.
-            let recv = async {
-                loop {
-                    match audio_rx.recv().await {
-                        Ok(ClientDatagram::AudioReady { channels, rate }) => {
-                            return Some((channels, rate));
-                        }
-                        Ok(_) => continue,
-                        Err(_) => return None,
-                    }
-                }
-            };
-            let cancel_fut = audio_cancel.cancelled();
-            tokio::pin!(recv);
-            tokio::pin!(cancel_fut);
-            let ready = tokio::select! {
-                r = &mut recv => r,
-                _ = &mut cancel_fut => None,
-            };
-            let Some((channels, rate)) = ready else {
-                return;
-            };
-            if audio_cancel.is_cancelled() {
-                return;
-            }
-            match start_audio_sink(audio_cancel.clone(), session_name, channels, rate).await {
-                Ok((sink, rx)) => {
-                    println!("[audio] client ready — created PipeWire audio sink");
-                    spawn(async move {
-                        forward_audio(rx, control_tx).await;
-                    });
-                    *audio_sink.lock().unwrap() = Some(sink);
-                }
-                Err(e) => println!("[audio] audio sink unavailable: {e:#}"),
-            }
-        }));
-    }
+    // it.  It is created lazily by session startup's audio task once the
+    // client's AudioContext starts, named per this session
+    // (`webshooter-<user>-<id>-audio-sink`), and torn down when the session
+    // ends via the session's disconnect token.
 
-    // Race start_capture against connection closure so a refresh/disconnect
-    // while waiting for the initial resize doesn't leave a zombie capture.
-    let cancel = session.disconnect();
+    // Race start_capture against session cancellation so a
+    // refresh/disconnect while waiting for the initial resize doesn't leave a
+    // zombie capture; a peer closure reaches this via the supervisor (a pump
+    // ends, which cancels the session token).  A capture error is logged
+    // rather than bailed: every exit still flows through the teardown below.
     let started = tokio::select! {
         r = video::capture(
-            _client_rx.resubscribe(),
+            client_rx,
             decoder_caps.clone(),
-            session.display_name.clone(),
+            display_name,
             client_id,
             cancel.clone(),
-            session.control_tx(),
-        ) => r.map(Some)?,
-        _ = cancel.cancelled() => { log::info!("Disconnect requested"); None }
-        _ = &mut datagrams  => { log::info!("Datagrams closed");              None }
-        _ = &mut unistreams => { log::info!("Unidirectional streams closed");  None }
-        _ = connection.closed() => { log::info!("WebTransport connection closed by peer"); None }
+            server_msg_tx,
+        ) => r.map(Some),
+        _ = cancel.cancelled() => { log::info!("Disconnect requested"); Ok(None) }
     };
-    let Some((frame_rx, capture_task)) = started else {
-        // Connection went away before a capture could start; removing the entry
-        // drops the registry's Arc and tears the session down.  Drop any audio
-        // sink that was being created so its PipeWire node doesn't outlive the
-        // session.
-        *audio_sink.lock().unwrap() = None;
-        ipc::remove_session(client_id);
-        return Ok(());
+    let started = match started {
+        Ok(started) => started,
+        Err(err) => {
+            log::error!("capture failed: {err:#?}");
+            None
+        }
     };
-    session.add_task(capture_task);
-    let mut frame_forwarder = frame_forwarder(frame_rx, control_rx, connection.clone());
-
-    tokio::select! {
-        _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
-        _ = &mut datagrams => { log::info!("Datagrams closed"); }
-        _ = &mut unistreams => { log::info!("Unidirectional streams closed");  }
-        _ = &mut frame_forwarder => { log::info!("capture pipeline stopped");  }
-        _ = connection.closed() => { log::info!("WebTransport connection closed by peer"); }
+    if let Some((frame_rx, _capture_task)) = started {
+        let mut frame_forwarder = frame_forwarder(frame_rx, control_rx, connection.clone());
+        tokio::select! {
+            _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
+            _ = &mut frame_forwarder => { log::info!("capture pipeline stopped"); }
+        }
     }
 
-    session.add_task(datagrams);
-    session.add_task(unistreams);
-    session.add_task(frame_forwarder);
-    // Tear down the application-owned audio sink before deregistering the
-    // session: dropping it stops the capture pipeline and joins the sink's
-    // background thread so the `object.linger=false` PipeWire node is removed,
-    // rather than persisting after the session that owned it has ended.
+    // The single teardown every exit path funnels through: tell the whole
+    // session to wind down, close the transport so the pumps error out, drop
+    // the application-owned audio sink (unregistering its PipeWire node rather
+    // than letting it outlive the session), and only then deregister.  The
+    // registry's drop of `Session` is a tripwire, not the mechanism — the
+    // cancellation happens first, so `Session::drop` can assert it instead of
+    // remediating from the destructor.
+    cancel.cancel();
+    connection.close(wtransport::VarInt::from_u32(0), b"done");
     *audio_sink.lock().unwrap() = None;
     ipc::remove_session(client_id);
     Ok(())
+}
+
+/// Subscribe to the client-message bus: forward client log records into the
+/// server log and stash decode caps for the capture pipeline.
+fn client_events_task(
+    mut client_rx: broadcast::Receiver<ClientDatagram>,
+    decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn(async move {
+        loop {
+            match client_rx.recv().await {
+                Ok(ClientDatagram::Error { level, message }) => {
+                    log::log!(target: "webshooter::client", level, "{message}");
+                }
+                Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
+                    *decoder_caps.lock().unwrap() = Some(decoders);
+                }
+                Ok(_) => {}
+                // The broadcast channel is closed once the connection's
+                // broadcaster is dropped; recv() then returns Err immediately,
+                // so without this break the task would spin at 100% of a core
+                // forever (one leaked task per session).
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Wait for the client's AudioReady signal (with its channel/rate caps), then
+/// create the PipeWire audio sink and forward packets to the client's control
+/// channel.
+fn audio_ready_task(
+    mut audio_rx: broadcast::Receiver<ClientDatagram>,
+    session_name: String,
+    control_tx: mpsc::Sender<ServerDatagram>,
+    audio_cancel: CancellationToken,
+    audio_sink: Arc<Mutex<Option<AudioSink>>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn(async move {
+        // Wait for the client's AudioReady signal (with its channel/rate
+        // caps), or for cancellation.
+        let recv = async {
+            loop {
+                match audio_rx.recv().await {
+                    Ok(ClientDatagram::AudioReady { channels, rate }) => {
+                        return Some((channels, rate));
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return None,
+                }
+            }
+        };
+        let cancel_fut = audio_cancel.cancelled();
+        tokio::pin!(recv);
+        tokio::pin!(cancel_fut);
+        let ready = tokio::select! {
+            r = &mut recv => r,
+            _ = &mut cancel_fut => None,
+        };
+        let Some((channels, rate)) = ready else {
+            return;
+        };
+        if audio_cancel.is_cancelled() {
+            return;
+        }
+        match start_audio_sink(audio_cancel.clone(), session_name, channels, rate).await {
+            Ok((sink, rx)) => {
+                println!("[audio] client ready — created PipeWire audio sink");
+                spawn(async move {
+                    forward_audio(rx, control_tx).await;
+                });
+                *audio_sink.lock().unwrap() = Some(sink);
+                // This task is one of the supervisor's race arms, so its
+                // handle completing is taken to mean the session is over.  The
+                // audio stage is a one-shot initialisation (create the sink,
+                // hand the forwarder its own spawned task), so once the sink
+                // exists the task must stay alive until cancelled rather than
+                // returning and tripping the supervisor.
+                audio_cancel.cancelled().await;
+            }
+            Err(e) => println!("[audio] audio sink unavailable: {e:#}"),
+        }
+    })
 }
 
 fn broadcast_unistreams(

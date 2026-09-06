@@ -53,6 +53,7 @@ use crate::{
     },
     config::CONFIG_DIR,
     config_watch::watch_config,
+    frontend::clear_icons_raster_cache,
 };
 
 pub static APP_CONFIG: LazyLock<Mutex<Option<Config>>> = Default::default();
@@ -69,6 +70,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(run());
+    // Sessions are torn down by explicit async cancellation; the registry is
+    // dropped for real at process exit, so drive that cancellation here or the
+    // tripwired `Session::drop` would fire against sessions we never signalled.
+    for (id, _) in ipc::list_clients() {
+        ipc::disconnect_client(id);
+    }
     // Bound shutdown: a wedged blocking-pool task (e.g. stalled DNS during a
     // failed certificate renewal) must not keep the process alive forever.
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
@@ -99,13 +106,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let _ = CONFIG_DIR.set(setup_config_dir().await?);
     setup_config(CONFIG_DIR.get().unwrap()).await?;
 
-        let (tx, mut rx) = mpsc::channel::<()>(1);
-        RESET_TRIGGER.lock().await.replace(tx);
+    let (tx, mut rx) = mpsc::channel::<()>(1);
+    RESET_TRIGGER.lock().await.replace(tx);
 
-        // Desktop tray (Linux only): menu to toggle fullscreen / release mouse.
-        tray::setup_tray();
+    // Desktop tray (Linux only): menu to toggle fullscreen / release mouse.
+    tray::setup_tray();
 
-        loop {
+    loop {
+        clear_icons_raster_cache();
         let config = get_config().await;
         logging::set_level(config.log_level);
 

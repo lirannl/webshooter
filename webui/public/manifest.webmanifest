@@ -2,7 +2,7 @@
   "name": "Webshooter",
   "short_name": "Webshooter",
   "description": "Remote access to machines using a web browser.",
-  "display": "standalone",
+  "display": "fullscreen",
   "background_color": "#101010",
   "theme_color": "#101010",
   "icons": [

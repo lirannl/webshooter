@@ -5,7 +5,7 @@ use shared::server_datagram::ServerDatagram;
 use std::{
     collections::HashMap,
     env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
 use tokio::sync::watch;
@@ -83,13 +83,31 @@ impl IPCConnection {
 // ---------------------------------------------------------------------------
 // Connected-client session registry
 //
-// Every live WebTransport client is represented by a `Session` stored in a
-// single map keyed by `ClientId`.  A `Session` owns everything needed to tear
-// the connection down: the control channel, a `CancellationToken` for a
-// forced-disconnect, the `Connection` itself, and the `JoinHandle`s of the
-// tasks that drive it.  Dropping a `Session` — which happens automatically
-// when it is removed from the map — cancels its tasks and closes the
-// connection, so removing a client from the registry cleanly disconnects it.
+// Every live WebTransport client is represented by a `Session`.  The live set
+// is the current value of a `watch` channel: readers take a brief read lock
+// (`borrow`), writers mutate in place through `send_if_modified`, which runs
+// the mutation under the channel's write lock and pokes subscribers in the
+// same step.  Connecting and disconnecting are rare, so serialising the whole
+// registry for the duration of a mutation is the right trade: this code is
+// about concurrency, not parallelism.
+//
+// Subscribers (the desktop tray) are *poked*, not given data: the watch
+// carries the registry itself, and a notification means "the registry changed
+// — re-read it".  Pokes are emitted as part of the store, and each read takes
+// a fresh owned snapshot, so a wake can never observe a pre-change registry.
+// Rapid changes coalesce into a single wake, which is harmless: the next
+// render reflects the latest snapshot, not a per-event delta.
+//
+// A `Session` owns everything needed to tear the connection down: the control
+// channel, a `CancellationToken` for a forced-disconnect, and the `JoinHandle`
+// of the supervisor that races every task driving the session (the driver
+// itself holds the transport).  Teardown is initiated by async cancellation —
+// a task finishing, a forced disconnect, or the transport dying — and the
+// driver closes the transport, drops the audio sink and deregisters as its
+// *last* act (the supervisor's deregistration is idempotent with it).
+// `Session::drop` therefore never remediates: it asserts that the token was
+// already cancelled, so removing a client from the registry can only ever be
+// the final step of a wind-down it was already told to do.
 //
 // Client ids are globally unique across all connected sessions: each new
 // session gets the lowest id not currently in use, so no two live sessions
@@ -98,30 +116,33 @@ impl IPCConnection {
 
 pub type ClientId = u64;
 
+/// A connected client, plus the supervisor racing the tasks driving its
+/// session.
+///
+/// Session startup creates every long-lived task up-front — `datagrams` /
+/// `unistreams` feed the client's transport in, `client_events` and `audio`
+/// react to messages on the broadcast bus, `driver` owns capture negotiation,
+/// the frame forwarder and the run loop — and hands them to a supervisor that
+/// races them all.  The first task to end has ended the session: the
+/// supervisor cancels the session token and deregisters.  A registered session
+/// is therefore always complete, and `Session` holds exactly one task: the
+/// supervisor.
 pub struct Session {
     pub id: ClientId,
     pub display_name: String,
     control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
     disconnect: CancellationToken,
-    connection: Arc<wtransport::Connection>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    // Held so the supervisor lives exactly as long as this session; teardown
+    // is driven by the disconnect token, so the supervisor is never joined or
+    // aborted from here.
+    #[expect(dead_code)]
+    supervisor: JoinHandle<()>,
 }
 
 impl Session {
-    /// A clone of the control channel used to route `ServerDatagram`s to this
-    /// client (e.g. fullscreen toggles, mouse release).
-    pub fn control_tx(&self) -> tokio::sync::mpsc::Sender<ServerDatagram> {
-        self.control_tx.clone()
-    }
-
     /// A clone of the token that, when cancelled, tears this session down.
     pub fn disconnect(&self) -> CancellationToken {
         self.disconnect.clone()
-    }
-
-    /// Track a task that belongs to this session so it is cancelled on drop.
-    pub fn add_task(&self, handle: JoinHandle<()>) {
-        self.tasks.lock().unwrap().push(handle);
     }
 
     /// Route a `ServerDatagram` into this session's control channel.
@@ -132,87 +153,110 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Cancel every task owned by this session (capture, forwarder, …).
-        self.disconnect.cancel();
-        // Close the connection so transport-level tasks also wind down.
-        let _ = self
-            .connection
-            .close(wtransport::VarInt::from_u32(0), b"done");
+        // A tripwire, not a net: teardown is driven by explicit async
+        // cancellation (the driver's run loop) and the token is cancelled
+        // before this ever runs.  An un-cancelled drop here is a bug — an
+        // authorisation path skipped its teardown — so make it loud instead of
+        // silently remediating by cancelling from the destructor.
+        if !self.disconnect.is_cancelled() {
+            log::error!("session {} dropped without the cancel token cancelled", self.id);
+            debug_assert!(
+                self.disconnect.is_cancelled(),
+                "session {} dropped without async cancellation",
+                self.id
+            );
+        }
     }
 }
 
-static REGISTRY: LazyLock<Mutex<HashMap<ClientId, Arc<Session>>>> =
-    LazyLock::new(Default::default);
+/// The connected-client registry.  The state is the watch channel's current
+/// value: writers mutate it in place via `send_if_modified` and readers take
+/// momentary `borrow()` read locks.  A single object therefore provides the
+/// snapshot, serialises mutations, and notifies subscribers in one place.
+type RegistrySnapshot = HashMap<ClientId, Arc<Session>>;
+static REGISTRY: LazyLock<watch::Sender<RegistrySnapshot>> =
+    LazyLock::new(|| watch::Sender::new(HashMap::new()));
 
-/// Bumped every time a session is registered or removed so subscribers (e.g.
-/// the desktop tray) know the connected-client list has changed and can
-/// re-render their menu.
-static REGISTRY_VERSION: LazyLock<watch::Sender<u64>> =
-    LazyLock::new(|| watch::channel(0).0);
-
-/// Subscribe to notifications about connected-client changes.  The value is a
-/// monotonically increasing revision; it changes whenever the registry does.
-pub fn subscribe_registry_changes() -> watch::Receiver<u64> {
-    REGISTRY_VERSION.subscribe()
+/// Subscribe to connected-client change notifications.  The value carried is
+/// the registry itself; the current state is always re-read from it afterwards
+/// via [`list_clients`].
+pub fn subscribe_registry_changes() -> watch::Receiver<RegistrySnapshot> {
+    REGISTRY.subscribe()
 }
 
-fn notify_registry_changed() {
-    let _ = REGISTRY_VERSION.send_if_modified(|rev| {
-        *rev += 1;
+/// Mutate the registry: the mutation runs under the watch's write lock and the
+/// change notification is sent in the same step, so a wake can never observe a
+/// pre-change registry.
+fn mutate_registry(mutate: impl FnOnce(&mut RegistrySnapshot)) {
+    REGISTRY.send_if_modified(|registry| {
+        mutate(registry);
         true
     });
 }
 
-/// Register a new session and assign it the lowest free id.
-///
-/// Ids must be globally unique across *all* sessions: the registry is keyed by
-/// the bare `ClientId`, so if two different users both got `id == 1` the second
-/// `insert` would overwrite the first session and hide it from the tray/menu
-/// (while its background tasks kept running, keeping its audio sink alive).
-pub fn register_session(
-    display_name: String,
-    control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
-    disconnect: CancellationToken,
-    connection: Arc<wtransport::Connection>,
-) -> Arc<Session> {
-    let mut registry = REGISTRY.lock().unwrap();
+/// Reserve the lowest id not currently in use for a session still being
+/// constructed.  Only the accept loop allocates ids, so between reservation
+/// and [`register_session`] the id cannot be taken again — removals only ever
+/// *free* ids, and only registration occupies them.
+pub fn next_client_id() -> ClientId {
+    let registry = REGISTRY.borrow();
     let mut id = 1u64;
     while registry.contains_key(&id) {
         id += 1;
     }
+    id
+}
+
+/// Register a fully-constructed session.
+///
+/// The id must come from [`next_client_id`]: the lowest id not currently in
+/// use, and because only the accept loop registers, no other session can be
+/// allocated that id in between.  The session (including its supervisor,
+/// racing every task that must keep running) is created before registration
+/// and inserted atomically, so the moment the registry holds it, the client is
+/// live and addressable.
+pub fn register_session(
+    id: ClientId,
+    display_name: String,
+    control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
+    disconnect: CancellationToken,
+    supervisor: JoinHandle<()>,
+) {
     let session = Arc::new(Session {
         id,
         display_name,
         control_tx,
         disconnect,
-        connection,
-        tasks: Mutex::new(Vec::new()),
+        supervisor,
     });
-    registry.insert(id, Arc::clone(&session));
-    notify_registry_changed();
-    session
+    REGISTRY.send_if_modified(|registry| {
+        debug_assert!(!registry.contains_key(&id), "client id {id} already in use");
+        registry.insert(id, Arc::clone(&session));
+        true
+    });
 }
 
-/// Remove a session from the registry.  Dropping the last `Arc<Session>`
-/// cancels its tasks and closes the connection.
+/// Remove a session from the registry.  Callers must already have cancelled the
+/// session's token and torn the connection down; this is the *last* step of a
+/// wind-down.  `Session::drop` asserts that cancellation happened.
 pub fn remove_session(id: ClientId) {
-    REGISTRY.lock().unwrap().remove(&id);
-    notify_registry_changed();
+    mutate_registry(|registry| {
+        registry.remove(&id);
+    });
 }
 
 /// Snapshot of currently connected clients for UI (tray menu) rendering.
 pub fn list_clients() -> Vec<(ClientId, String)> {
     REGISTRY
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(id, s)| (*id, s.display_name.clone()))
+        .borrow()
+        .values()
+        .map(|s| (s.id, s.display_name.clone()))
         .collect()
 }
 
 /// Broadcast a control datagram to every connected client.
 pub fn send_client_control(msg: ServerDatagram) {
-    let registry = REGISTRY.lock().unwrap();
+    let registry = REGISTRY.borrow();
     for session in registry.values() {
         session.send(msg.clone());
     }
@@ -220,21 +264,22 @@ pub fn send_client_control(msg: ServerDatagram) {
 
 /// Route a control datagram to a single client.
 pub fn send_client_control_to(id: ClientId, msg: ServerDatagram) {
-    let registry = REGISTRY.lock().unwrap();
+    let registry = REGISTRY.borrow();
     if let Some(session) = registry.get(&id) {
         session.send(msg);
     }
 }
 
 /// Force a client to disconnect by cancelling its token and removing it from
-/// the registry.  Removing the entry drops the registry's `Arc<Session>`; the
-/// remaining `Arc` (held by the connection task) is released once the token
-/// cancellation winds the session down, which triggers `Session::drop` and
-/// closes the connection.  A disconnected session is therefore always removed
-/// from the collection — there is no way to disconnect while leaving a stale
-/// entry behind.
+/// the registry.  The registry is the only `Arc<Session>` holder: removing the
+/// entry drops it, and `Session::drop` asserts the token is already cancelled.
+/// The driver task wakes on the cancellation and finishes the wind-down
+/// (transport close, audio-sink teardown); its own `remove_session()` call is
+/// then a no-op.  A disconnected session is therefore always removed from the
+/// collection — there is no way to disconnect while leaving a stale entry
+/// behind.
 pub fn disconnect_client(id: ClientId) {
-    let token = REGISTRY.lock().unwrap().get(&id).map(|s| s.disconnect());
+    let token = REGISTRY.borrow().get(&id).map(|s| s.disconnect());
     if let Some(token) = token {
         token.cancel();
     }
