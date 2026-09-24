@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use reis::ei;
 
 
-use super::eis::timestamp_us;
+use super::eis::with_emulation;
 
 pub enum EisTouchEvent {
     Down { x: u16, y: u16, index: u8 },
@@ -70,11 +70,7 @@ pub(crate) fn send_touch_event(
     sequence: &mut u32,
     event: EisTouchEvent,
 ) {
-    let serial = connection.serial();
-    *sequence = sequence.wrapping_add(1);
-
-    device.device().start_emulating(serial, *sequence);
-    match event {
+    with_emulation(connection, device, sequence, "touchscreen", || match event {
         EisTouchEvent::Down { x, y, index } => {
             touchscreen.down(index as u32, x as f32, y as f32);
         }
@@ -84,11 +80,5 @@ pub(crate) fn send_touch_event(
         EisTouchEvent::Up { index } => {
             touchscreen.up(index as u32);
         }
-    }
-    device.device().frame(serial, timestamp_us());
-    device.device().stop_emulating(serial);
-
-    if let Err(e) = connection.flush() {
-        log::error!("EIS: flush error: {e}");
-    }
+    });
 }

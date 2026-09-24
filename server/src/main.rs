@@ -20,7 +20,6 @@ use anyhow::Result;
 use auth::negotiate_wt;
 use config::Config;
 use error::WebshooterError;
-use futures_util::TryFutureExt;
 use ipc::setup_ipc;
 use poem::{
     EndpointExt, IntoResponse, Response, Route, Server, get, handler,
@@ -156,20 +155,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .at("/register", post(register))
             .at("/*", frontend::frontend);
 
-        let handle_0 = tokio::spawn(Server::new(listener).run(app).or_else(async |err| {
-            log::error!("{err:#?}");
-            reset_app();
-            Ok::<_, anyhow::Error>(())
-        }));
-        let handle_1 = tokio::spawn(setup_wt(config.clone(), identity).or_else(async |err| {
-            log::error!("{err:#?}");
-            reset_app();
-            Ok::<_, anyhow::Error>(())
-        }));
+        let handle_0 = tokio::spawn(restart_on_error(Server::new(listener).run(app)));
+        let handle_1 = tokio::spawn(restart_on_error(setup_wt(
+            config.clone(),
+            identity,
+        )));
         // Wait for a reset signal
         rx.recv().await;
         handle_0.abort();
         handle_1.abort();
+    }
+}
+
+/// Run a task; if it fails (server, transport, certificate renewal…) log the
+/// error and trigger a full restart of the config/serve loop.
+async fn restart_on_error<F, T, E>(fut: F)
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    if let Err(err) = fut.await {
+        log::error!("{err:#?}");
+        reset_app();
     }
 }
 
@@ -192,9 +199,8 @@ async fn setup_config(config_dir: &Path) -> Result<()> {
         if config.trim() == "" {
             update_config(Config::initialise_at(&config_path)?).await?;
         } else {
-            let mut config: Config = serde_json::from_str(&config)
-                .or_else(|_| toml::from_str(&config))
-                .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err.into()))?;
+            let mut config = config::parse_config(&config_path, &config)
+                .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err))?;
             config.path = config_path.to_owned();
             *APP_CONFIG.lock().await = Some(config);
         }
@@ -205,12 +211,11 @@ async fn setup_config(config_dir: &Path) -> Result<()> {
 }
 
 pub async fn setup_config_dir() -> Result<PathBuf> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let args = args.iter().map(|x| x.as_str()).collect::<Vec<_>>();
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
     let config_dir = match args.as_slice() {
-        [_, "-c", path] => PathBuf::from_str(path),
-        [_, "--config", path] => PathBuf::from_str(path),
-        [_, "--config-path", path] => PathBuf::from_str(path),
+        [flag, path] if ["-c", "--config", "--config-path"].contains(&flag.as_str()) => {
+            PathBuf::from_str(path)
+        }
         _ => {
             #[cfg(target_os = "linux")]
             let config_dir = format!("{}/.config/webshooter", env::var("HOME")?);

@@ -81,18 +81,26 @@ fn base_path(req: &Request) -> String {
 #[cfg(debug_assertions)]
 const VITE_DEV_SERVER: &str = "http://localhost:5173";
 
+/// Fetch `path` from the Vite dev server (debug builds only). Returns the
+/// response when the server is up and serves the asset successfully, `None`
+/// otherwise (so callers fall through to the embedded bundle).
+#[cfg(debug_assertions)]
+async fn dev_fetch(path: &str) -> Option<reqwest::Response> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let response = client.get(format!("{VITE_DEV_SERVER}/{path}")).send().await.ok()?;
+    response.status().is_success().then_some(response)
+}
+
 /// Resolve a frontend asset through the same sources as the static route: the
 /// Vite dev server when a built bundle isn't embedded, then the embedded
 /// bundle.
 async fn asset_bytes(path: &str) -> Option<Vec<u8>> {
     #[cfg(debug_assertions)]
     {
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            && let Ok(response) = client.get(format!("{VITE_DEV_SERVER}/{path}")).send().await
-            && response.status().is_success()
-        {
+        if let Some(response) = dev_fetch(path).await {
             return response.bytes().await.ok().map(|bytes| bytes.to_vec());
         }
     }
@@ -123,15 +131,7 @@ pub async fn frontend(req: &Request, path: Option<Path<String>>) -> impl IntoRes
 
     #[cfg(debug_assertions)]
     {
-        if let Ok(response) = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .map_err(NotFound)?
-            .get(format!("{VITE_DEV_SERVER}/{path}"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
+        if let Some(response) = dev_fetch(&path).await {
             let parts = ResponseParts {
                 status: response.status(),
                 version: Version::default(),
@@ -204,14 +204,11 @@ fn icon_response(size: u32, svg: &[u8]) -> Response {
 /// the app can be served from any mount point behind a proxy and the web
 /// manifest still points at the installation/base of *that* installation.
 fn manifest_response(req: &Request, base_manifest: Option<Vec<u8>>) -> Response {
-    let base = match base_manifest {
-        Some(data) => serde_json::from_slice(&data).unwrap_or_else(|_| json!({})),
-        None => json!({}),
-    };
-    let mut manifest = match base {
-        serde_json::Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
+    let mut manifest = base_manifest
+        .and_then(|data| {
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&data).ok()
+        })
+        .unwrap_or_default();
     let base = base_path(req);
     manifest.insert("start_url".into(), json!(format!("{base}/")));
     manifest.insert("scope".into(), json!(format!("{base}/")));

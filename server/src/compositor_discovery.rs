@@ -2,6 +2,16 @@ use std::{env, os::unix::fs::FileTypeExt, path::Path};
 
 use anyhow::{Context, Result};
 
+/// Set an environment variable during startup and log why it was needed.
+/// `env::set_var` is the only unsafe part and is sound here: startup is
+/// single-threaded and nothing reads these variables before we set them.
+fn set_env(name: &str, value: &str, why: &str) {
+    unsafe {
+        env::set_var(name, value);
+    }
+    log::info!("Set {name}={value} ({why})");
+}
+
 
 /// Return the id of the first logind session belonging to `uid` that has a
 /// seat assigned (i.e. a graphical session). Used to discover session-derived
@@ -61,13 +71,7 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
 
     match seat_session_for_uid(uid) {
         Ok(Some(session_id)) => {
-            // Safe: single-threaded startup, set before any other code reads it.
-            unsafe {
-                env::set_var("XDG_RUNTIME_DIR", &dir);
-            }
-            log::info!(
-                "Discovered XDG_RUNTIME_DIR={dir} from session {session_id}"
-            );
+            set_env("XDG_RUNTIME_DIR", &dir, &format!("from session {session_id}"));
             Ok(())
         }
         Ok(None) => anyhow::bail!(
@@ -77,13 +81,7 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
         Err(_) => {
             // logind unavailable: fall back to the convention if the dir exists.
             if Path::new(&dir).is_dir() {
-                // Safe: single-threaded startup.
-                unsafe {
-                    env::set_var("XDG_RUNTIME_DIR", &dir);
-                }
-                log::info!(
-                    "Set XDG_RUNTIME_DIR={dir} by convention (no logind available)"
-                );
+                set_env("XDG_RUNTIME_DIR", &dir, "by convention (no logind available)");
                 Ok(())
             } else {
                 anyhow::bail!(
@@ -121,12 +119,10 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
                 {
                     let desktop = desktop.trim();
                     if !desktop.is_empty() {
-                        // Safe: single-threaded startup.
-                        unsafe {
-                            env::set_var("XDG_CURRENT_DESKTOP", desktop);
-                        }
-                        log::info!(
-                            "Discovered XDG_CURRENT_DESKTOP={desktop} from session {session_id}"
+                        set_env(
+                            "XDG_CURRENT_DESKTOP",
+                            desktop,
+                            &format!("from session {session_id}"),
                         );
                         return Ok(());
                     }
@@ -137,13 +133,7 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
 
     // 2. Infer from the running compositor.
     if let Some(desktop) = desktop_from_compositor() {
-        // Safe: single-threaded startup.
-        unsafe {
-            env::set_var("XDG_CURRENT_DESKTOP", &desktop);
-        }
-        log::info!(
-            "Inferred XDG_CURRENT_DESKTOP={desktop} from running compositor"
-        );
+        set_env("XDG_CURRENT_DESKTOP", &desktop, "from running compositor");
         return Ok(());
     }
 
@@ -151,13 +141,7 @@ pub(super) fn ensure_xdg_current_desktop() -> Result<()> {
     if let Some(desktop) = env::var_os("DESKTOP_SESSION") {
         if !desktop.is_empty() {
             let desktop = desktop.to_string_lossy().into_owned();
-            // Safe: single-threaded startup.
-            unsafe {
-                env::set_var("XDG_CURRENT_DESKTOP", &desktop);
-            }
-            log::info!(
-                "Using DESKTOP_SESSION={desktop} for XDG_CURRENT_DESKTOP"
-            );
+            set_env("XDG_CURRENT_DESKTOP", &desktop, "from DESKTOP_SESSION");
             return Ok(());
         }
     }
@@ -241,21 +225,15 @@ pub(super) fn ensure_wayland_display() -> Result<()> {
 
     match candidates.into_iter().next() {
         Some((_, display)) => {
-            // Safe: single-threaded startup.
-            unsafe {
-                env::set_var("WAYLAND_DISPLAY", &display);
-            }
-            log::info!(
-                "Discovered WAYLAND_DISPLAY={display} in {runtime_dir:?}"
+            set_env(
+                "WAYLAND_DISPLAY",
+                &display,
+                &format!("discovered in {runtime_dir:?}"),
             );
         }
         None => {
-            // No socket found: fall back to the conventional default.
-            // Safe: single-threaded startup.
-            unsafe {
-                env::set_var("WAYLAND_DISPLAY", "wayland-0");
-            }
             log::warn!("No Wayland socket found; defaulting WAYLAND_DISPLAY=wayland-0");
+            set_env("WAYLAND_DISPLAY", "wayland-0", "no Wayland socket found");
         }
     }
     Ok(())

@@ -53,13 +53,13 @@ pub async fn check_identity(Identity(id): Identity) -> Result<impl IntoResponse>
 
 #[handler]
 pub async fn get_challenge(Identity(id): Identity) -> Result<impl IntoResponse> {
-    let mut challenge = [0 as u8; CHALLENGE_SIZE];
+    let mut challenge = [0; CHALLENGE_SIZE];
     rng().fill(&mut challenge);
     {
         let mut sessions = AUTH_SESSIONS.lock().await;
         sessions.insert(id, Session::Challenged(challenge.to_vec()));
     }
-    poem::Result::Ok(Response::builder().body(challenge.to_vec()))
+    Ok(Response::builder().body(challenge.to_vec()))
 }
 
 pub enum Session {
@@ -172,17 +172,48 @@ fn client_ip(req: &Request) -> std::net::IpAddr {
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         })
 }
-// const BYTES_TO_SHOW: Range<usize> = 24..8;
-
-fn format_id(id: &dyn Deref<Target = [u8]>) -> String {
-    Bytes64(&id[24..24 + 8])
-        .to_string()
-        .trim_matches('=')
-        .to_string()
+pub(crate) fn format_id(id: &[u8]) -> String {
+    if id.len() >= 32 {
+        BASE64.encode(&id[24..32]).trim_matches('=').to_string()
+    } else {
+        BASE64.encode(id).trim_matches('=').to_string()
+    }
 }
 
-#[handler]
-pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<impl IntoResponse> {
+/// Numbered session-picker prompt shown over the IPC channel when more than
+/// one session is awaiting authorisation.
+pub(crate) fn session_menu(sessions: &[UserId]) -> String {
+    format!(
+        "Please select a session:\n{}",
+        sessions
+            .iter()
+            .enumerate()
+            .map(|(n, session_id)| format!("{n}: {}", format_id(&session_id.0)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn cookie_response(cookie: &Bytes64) -> Response {
+    Response::builder()
+        .header(
+            "set-cookie",
+            format!(
+                "token={}; HttpOnly; Secure; SameSite=Strict",
+                BASE64.encode(cookie),
+            ),
+        )
+        .finish()
+}
+
+/// Wrap a login/register inner handler in the shared per-IP rate limit:
+/// reject with 429 when over quota, reset the quota on success, and record a
+/// failed attempt on error.
+async fn rate_limited<F, Fut>(req: &Request, inner: F) -> Result<impl IntoResponse>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Bytes64>>,
+{
     let ip = client_ip(req);
     let rate_limit = get_config().await.rate_limit.unwrap_or(10);
     if !check_rate_limit(ip, rate_limit).await {
@@ -191,19 +222,10 @@ pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<imp
             StatusCode::TOO_MANY_REQUESTS,
         ));
     }
-
-    match login_inner(params).await {
+    match inner().await {
         Ok(cookie) => {
             reset_rate_limit(ip).await;
-            Ok(Response::builder()
-                .header(
-                    "set-cookie",
-                    format!(
-                        "token={}; HttpOnly; Secure; SameSite=Strict",
-                        BASE64.encode(&cookie),
-                    ),
-                )
-                .finish())
+            Ok(cookie_response(&cookie))
         }
         Err(err) => {
             let status = err.status();
@@ -214,17 +236,13 @@ pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<imp
     }
 }
 
-async fn login_inner(params: LoginParams) -> Result<Bytes64> {
-    let config = get_config().await;
-
-    let (id, signature) = match &params {
-        LoginParams::Signature { id, signature } => Ok((id, signature)),
-        _ => Err(WebshooterError::InvalidLogin),
-    }?;
-    let id = UserId(id.to_owned());
-    if !config.users.iter().any(|user| id == *user) {
-        return Err(WebshooterError::NotAuthorized.into());
-    }
+/// Verify the signed challenge for `id` and record an approved session with a
+/// freshly generated cookie on success.
+async fn verify_challenge_and_issue_cookie(
+    id: UserId,
+    public_key: &[u8],
+    signature: &[u8],
+) -> Result<Bytes64> {
     let sessions = AUTH_SESSIONS.lock().await;
     let challenge = match sessions.get(&id) {
         Some(Session::Challenged(challenge)) => Ok(challenge),
@@ -233,15 +251,15 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
     .to_vec();
     drop(sessions);
 
-    let key = ecdsa::VerifyingKey::<NistP384>::from_public_key_der(&params.id())
+    let key = ecdsa::VerifyingKey::<NistP384>::from_public_key_der(public_key)
         .map_err(|_| WebshooterError::InvalidLogin)?;
     let verification = key.verify(
         &challenge,
-        &ecdsa::Signature::from_slice(&signature).map_err(|_| WebshooterError::InvalidLogin)?,
+        &ecdsa::Signature::from_slice(signature).map_err(|_| WebshooterError::InvalidLogin)?,
     );
     verification.map_err(|_| WebshooterError::ChallengeFailed)?;
 
-    let mut cookie = [0 as u8; COOKIE_SIZE];
+    let mut cookie = [0; COOKIE_SIZE];
     rng().fill(&mut cookie);
 
     {
@@ -255,6 +273,25 @@ async fn login_inner(params: LoginParams) -> Result<Bytes64> {
         );
     }
     Ok(Bytes64(cookie.to_vec()))
+}
+
+#[handler]
+pub async fn login(req: &Request, Json(params): Json<LoginParams>) -> Result<impl IntoResponse> {
+    rate_limited(req, || login_inner(params)).await
+}
+
+async fn login_inner(params: LoginParams) -> Result<Bytes64> {
+    let config = get_config().await;
+
+    let (id, signature) = match &params {
+        LoginParams::Signature { id, signature } => Ok((id, signature)),
+        _ => Err(WebshooterError::InvalidLogin),
+    }?;
+    let id = UserId(id.to_owned());
+    if !config.users.iter().any(|user| id == *user) {
+        return Err(WebshooterError::NotAuthorized.into());
+    }
+    verify_challenge_and_issue_cookie(id, &params.id(), signature).await
 }
 
 #[derive(Deserialize, TS)]
@@ -274,35 +311,7 @@ pub async fn register(
     req: &Request,
     Json(params): Json<RegisterParams>,
 ) -> Result<impl IntoResponse> {
-    let ip = client_ip(req);
-    let rate_limit = get_config().await.rate_limit.unwrap_or(10);
-    if !check_rate_limit(ip, rate_limit).await {
-        return Err(Error::from_string(
-            "Rate limit exceeded",
-            StatusCode::TOO_MANY_REQUESTS,
-        ));
-    }
-
-    match register_inner(params).await {
-        Ok(cookie) => {
-            reset_rate_limit(ip).await;
-            Ok(Response::builder()
-                .header(
-                    "set-cookie",
-                    format!(
-                        "token={}; HttpOnly; Secure; SameSite=Strict",
-                        BASE64.encode(&cookie),
-                    ),
-                )
-                .finish())
-        }
-        Err(err) => {
-            let status = err.status();
-            let msg = err.to_string();
-            record_rate_limit_failure(ip).await;
-            Err(Error::from_string(msg, status))
-        }
-    }
+    rate_limited(req, || register_inner(params)).await
 }
 
 async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
@@ -330,19 +339,7 @@ async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
                     break Ok::<_, anyhow::Error>(());
                 }
                 (IPCMessage::Authorise(None), sessions) => {
-                    connection
-                        .write(&format!(
-                            "Please select a session:\n{}",
-                            sessions
-                                .iter()
-                                .enumerate()
-                                .map(|(n, session_id)| {
-                                    format!("{n}: {}", format_id(&session_id.0))
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ))
-                        .await?;
+                    connection.write(&session_menu(sessions)).await?;
                 }
                 (message, sessions) if let IPCMessage::Authorise(Some(n)) = message => {
                     if let Some((_, session_id)) = sessions
@@ -380,46 +377,17 @@ async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
         Err(err) => Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     })?;
 
-    let sessions = AUTH_SESSIONS.lock().await;
-    let challenge = match sessions.get(&id) {
-        Some(Session::Challenged(challenge)) => Ok(challenge),
-        _ => Err(WebshooterError::NotChallenged),
-    }?
-    .to_vec();
-    drop(sessions);
+    let cookie = verify_challenge_and_issue_cookie(id, &params.id, &params.signature).await?;
 
-    let key = ecdsa::VerifyingKey::<NistP384>::from_public_key_der(params.id.as_ref())
-        .map_err(|_| WebshooterError::InvalidLogin)?;
-    let verification = key.verify(
-        &challenge,
-        &ecdsa::Signature::from_slice(&params.signature)
-            .map_err(|_| WebshooterError::InvalidLogin)?,
-    );
-    verification.map_err(|_| WebshooterError::ChallengeFailed)?;
-
-    let mut cookie = [0 as u8; COOKIE_SIZE];
-    rng().fill(&mut cookie);
-
-    {
-        let mut sessions = AUTH_SESSIONS.lock().await;
-        sessions.insert(
-            id.clone(),
-            Session::Approved {
-                cookie: cookie.to_vec(),
-                created_at: Instant::now(),
-            },
-        );
-    }
     config.users.insert(User {
         verification_key: params.id,
         display_name,
     });
-    let _str = serde_json::to_string(&config).ok();
     update_config(config)
         .await
         .map_err(|err| Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
-    Ok(Bytes64(cookie.to_vec()))
+    Ok(cookie)
 }
 
 pub struct Authenticated(pub User);

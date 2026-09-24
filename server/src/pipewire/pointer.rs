@@ -2,7 +2,7 @@ use reis::ei;
 use reis::ei::button::ButtonState;
 
 
-use super::eis::timestamp_us;
+use super::eis::with_emulation;
 
 pub enum EisPointerEvent {
     Motion { dx: f32, dy: f32 },
@@ -89,21 +89,11 @@ pub(crate) fn send_pointer_motion(
     sequence: &mut u32,
     event: EisPointerEvent,
 ) {
-    let serial = connection.serial();
-    *sequence = sequence.wrapping_add(1);
-
-    device.device().start_emulating(serial, *sequence);
-    match event {
+    with_emulation(connection, device, sequence, "pointer", || match event {
         EisPointerEvent::Motion { dx, dy } => {
             pointer.motion_relative(dx, dy);
         }
-    }
-    device.device().frame(serial, timestamp_us());
-    device.device().stop_emulating(serial);
-
-    if let Err(e) = connection.flush() {
-        log::error!("EIS: pointer flush error: {e}");
-    }
+    });
 }
 
 pub(crate) fn send_button_event(
@@ -113,11 +103,7 @@ pub(crate) fn send_button_event(
     sequence: &mut u32,
     event: EisButtonEvent,
 ) {
-    let serial = connection.serial();
-    *sequence = sequence.wrapping_add(1);
-
-    device.device().start_emulating(serial, *sequence);
-    match event {
+    with_emulation(connection, device, sequence, "button", || match event {
         EisButtonEvent::Button { button, pressed } => {
             let state = if pressed {
                 ButtonState::Press
@@ -126,13 +112,7 @@ pub(crate) fn send_button_event(
             };
             button_dev.button(button, state);
         }
-    }
-    device.device().frame(serial, timestamp_us());
-    device.device().stop_emulating(serial);
-
-    if let Err(e) = connection.flush() {
-        log::error!("EIS: button flush error: {e}");
-    }
+    });
 }
 
 pub(crate) fn send_scroll_event(
@@ -142,19 +122,9 @@ pub(crate) fn send_scroll_event(
     sequence: &mut u32,
     event: EisScrollEvent,
 ) {
-    let serial = connection.serial();
-    *sequence = sequence.wrapping_add(1);
-
-    device.device().start_emulating(serial, *sequence);
-    match event {
+    with_emulation(connection, device, sequence, "scroll", || match event {
         EisScrollEvent::Scroll { dx, dy } => {
             scroll.scroll_discrete(dx, dy);
         }
-    }
-    device.device().frame(serial, timestamp_us());
-    device.device().stop_emulating(serial);
-
-    if let Err(e) = connection.flush() {
-        log::error!("EIS: scroll flush error: {e}");
-    }
+    });
 }

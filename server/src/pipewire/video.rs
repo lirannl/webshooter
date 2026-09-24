@@ -167,7 +167,6 @@ pub async fn capture(
         let decoder_caps = decoder_caps.clone();
         let user_name = user_name.clone();
         let portal_token = portal_token.clone();
-        let client_id = client_id;
         let server_msg_tx = server_msg_tx.clone();
         async move {
             while !cancel.is_cancelled() {
@@ -261,9 +260,9 @@ async fn single_capture(
         // restore the same device permissions without showing a dialog.
         let select_dev_opts = SelectDevicesOptions::default()
             .set_restore_token(get_portal_token(portal_token).as_deref())
-            .set_devices(Some(BitFlags::from(
+            .set_devices(Some(
                 DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
-            )))
+            ))
             .set_persist_mode(PersistMode::ExplicitlyRevoked);
         accept_dialog(
             &mut portal_kb,
@@ -378,11 +377,11 @@ async fn single_capture(
                     // Extract compositor cursor position from
                     // GstVideoRegionOfInterestMeta("cursor") emitted by
                     // pipewiresrc when CursorMode::Embedded is set.
-                    if let Some(meta) = buffer.meta::<gst_video::VideoRegionOfInterestMeta>() {
-                        if meta.roi_type() == "cursor" {
-                            let (x, y, _w, _h) = meta.rect();
-                            let _ = cursor_tx.try_send((x as i32, y as i32));
-                        }
+                    if let Some(meta) = buffer.meta::<gst_video::VideoRegionOfInterestMeta>()
+                        && meta.roi_type() == "cursor"
+                    {
+                        let (x, y, _w, _h) = meta.rect();
+                        let _ = cursor_tx.try_send((x as i32, y as i32));
                     }
 
                     let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);

@@ -33,6 +33,27 @@ pub(crate) fn timestamp_us() -> u64 {
         .as_micros() as u64
 }
 
+/// Run one input event inside an EIS emulation frame: bump the sequence,
+/// start emulating, emit the event(s), then frame + stop emulating + flush as
+/// one unit. Every EIS sender (keyboard, pointer, touch) uses this skeleton.
+pub(crate) fn with_emulation(
+    connection: &reis::event::Connection,
+    device: &reis::event::Device,
+    sequence: &mut u32,
+    event_name: &str,
+    emit: impl FnOnce(),
+) {
+    let serial = connection.serial();
+    *sequence = sequence.wrapping_add(1);
+    device.device().start_emulating(serial, *sequence);
+    emit();
+    device.device().frame(serial, timestamp_us());
+    device.device().stop_emulating(serial);
+    if let Err(e) = connection.flush() {
+        log::error!("EIS: {event_name} flush error: {e}");
+    }
+}
+
 /// How often the server samples its input-pipeline load to decide whether to
 /// ask the client to throttle. Fast enough to react to a sustained burst
 /// within ~100 ms, slow enough not to spam the client with control datagrams.

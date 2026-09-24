@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 use tokio::{spawn, sync::Mutex, task::JoinHandle, time::sleep};
-use crate::config::Config;
 
 use crate::APP_CONFIG;
 
@@ -44,11 +43,12 @@ pub async fn watch_config(file: &Path) {
 pub fn watch_respond(file: PathBuf) -> JoinHandle<Result<()>> {
     spawn(async move {
         sleep(Duration::from_secs(4)).await;
-        let string = tokio::fs::read_to_string(file).await?;
-        if let Ok(config) = toml::from_str::<Config>(&string)
-            .or_else(|_| serde_yaml::from_str(&string))
-            .or_else(|_| serde_json::from_str(&string))
-        {
+        let string = tokio::fs::read_to_string(&file).await?;
+        // Same parse path as startup so a hot-reloaded config behaves exactly
+        // like one loaded at boot (previously `.yaml` configs reloaded fine
+        // but crashed on restart because startup and reload ordered formats
+        // differently).
+        if let Ok(config) = crate::config::parse_config(&file, &string) {
             *APP_CONFIG.lock().await = Some(config);
         }
         Ok(())

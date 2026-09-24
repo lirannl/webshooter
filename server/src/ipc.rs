@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use shared::server_datagram::ServerDatagram;
 use std::{
@@ -23,37 +23,58 @@ pub enum IPCMessage {
 
 impl IPCMessage {
     pub fn parse_args(args: impl Iterator<Item = impl Display>) -> Result<IPCMessage> {
-        let args = args
+        let mut args = args
             .map(|arg| arg.to_string().to_lowercase())
             .collect::<Vec<_>>();
-        match args.iter().map(|arg| &**arg).collect::<Vec<&str>>()[..] {
-            ["exit"] => Ok(IPCMessage::Exit),
-            ["authorise"] => Ok(IPCMessage::Authorise(None)),
-            ["authorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Authorise(Some(n))),
-            ["deauthorise"] => Ok(IPCMessage::Deauthorise(None)),
-            ["deauthorise", n] if let Ok(n) = n.parse() => Ok(IPCMessage::Deauthorise(Some(n))),
-            ["release_mouse"] => Ok(IPCMessage::ReleaseMouse),
-            ["mouse_release"] => Ok(IPCMessage::ReleaseMouse),
-            ["fullscreen"] => Ok(IPCMessage::FullscreenToggle(None)),
-            ["fullscreen", n] if let Ok(n) = n.parse() => Ok(IPCMessage::FullscreenToggle(Some(n))),
-            ["fullscreen_toggle"] => Ok(IPCMessage::FullscreenToggle(None)),
-            ["fullscreen_toggle", n] if let Ok(n) = n.parse() => {
-                Ok(IPCMessage::FullscreenToggle(Some(n)))
+
+        // Normalise historical command aliases to their canonical spelling so
+        // the match below only needs one arm per command.
+        if let Some(cmd) = args.first_mut() {
+            match cmd.as_str() {
+                "toggle_fullscreen" | "fullscreen_toggle" => *cmd = "fullscreen".to_string(),
+                "mouse_release" => *cmd = "release_mouse".to_string(),
+                _ => {}
             }
-            ["toggle_fullscreen"] => Ok(IPCMessage::FullscreenToggle(None)),
-            ["toggle_fullscreen", n] if let Ok(n) = n.parse() => {
-                Ok(IPCMessage::FullscreenToggle(Some(n)))
-            }
-            _ => bail!(
-                "Webshooter supports the following commands while running:
+        }
+
+        match args.as_slice() {
+            [cmd] => match cmd.as_str() {
+                "exit" => Ok(IPCMessage::Exit),
+                "authorise" => Ok(IPCMessage::Authorise(None)),
+                "deauthorise" => Ok(IPCMessage::Deauthorise(None)),
+                "release_mouse" => Ok(IPCMessage::ReleaseMouse),
+                "fullscreen" => Ok(IPCMessage::FullscreenToggle(None)),
+                _ => Err(usage()),
+            },
+            [cmd, n] => match cmd.as_str() {
+                "authorise" => n
+                    .parse()
+                    .map(|n| IPCMessage::Authorise(Some(n)))
+                    .map_err(|_| usage()),
+                "deauthorise" => n
+                    .parse()
+                    .map(|n| IPCMessage::Deauthorise(Some(n)))
+                    .map_err(|_| usage()),
+                "fullscreen" => n
+                    .parse()
+                    .map(|n| IPCMessage::FullscreenToggle(Some(n)))
+                    .map_err(|_| usage()),
+                _ => Err(usage()),
+            },
+            _ => Err(usage()),
+        }
+    }
+}
+
+fn usage() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Webshooter supports the following commands while running:
     authorise
     deauthorise
     release_mouse
     fullscreen
     exit"
-            ),
-        }
-    }
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -340,11 +361,7 @@ pub const IPC_ID: &str = include_str!("../../ipc_id.txt");
 pub async fn setup_ipc(_config: Config) -> Result<()> {
     let target = env::var("XDG_RUNTIME_DIR")?;
     let target = PathBuf::from_str(&target)?.join(format!("webshooter_{IPC_ID}.sock",));
-    use std::process::exit;
-    use tokio::{
-        fs::remove_file,
-        net::{UnixListener, UnixStream},
-    };
+    use tokio::{fs::remove_file, net::UnixListener};
 
     use crate::auth::get_challenged_sessions;
 
@@ -457,15 +474,6 @@ fn stdio_setup() {
     });
 }
 
-fn format_id(id: &[u8]) -> String {
-    use data_encoding::BASE64;
-    if id.len() >= 32 {
-        BASE64.encode(&id[24..32]).trim_matches('=').to_string()
-    } else {
-        BASE64.encode(id).trim_matches('=').to_string()
-    }
-}
-
 pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Result<()> {
     let sessions = crate::auth::get_challenged_sessions().await;
     let id = match sessions.len() {
@@ -481,21 +489,12 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
                     .nth(n)
                     .ok_or_else(|| anyhow::anyhow!("Invalid index"))?
             } else {
-                conn.write(&format!(
-                    "Please select a session:\n{}",
-                    sessions
-                        .iter()
-                        .enumerate()
-                        .map(|(n, s)| format!("{n}: {}", format_id(&s)))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ))
-                .await?;
+                conn.write(&crate::auth::session_menu(&sessions)).await?;
                 return Ok(());
             }
         }
     };
-    let short = format_id(&id);
+    let short = crate::auth::format_id(&id);
     let mut config = crate::get_config().await;
     if let Some(doomed) = config.users.extract_if(|user| id == *user).last() {
         crate::update_config(config).await?;

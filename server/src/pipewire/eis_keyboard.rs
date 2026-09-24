@@ -6,7 +6,7 @@ use reis::event as reis_event;
 use shared::client_datagram::Modifiers;
 
 
-use super::eis::timestamp_us;
+use super::eis::with_emulation;
 
 // ---------------------------------------------------------------------------
 // Linux input event key codes (linux/input-event-codes.h)
@@ -65,8 +65,6 @@ pub const KEY_M: u32 = 50;
 pub const KEY_COMMA: u32 = 51;
 pub const KEY_DOT: u32 = 52;
 pub const KEY_SLASH: u32 = 53;
-#[allow(dead_code)]
-pub const KEY_RIGHTSHIFT: u32 = 54;
 pub const KEY_LEFTALT: u32 = 56;
 pub const KEY_SPACE: u32 = 57;
 pub const KEY_CAPSLOCK: u32 = 58;
@@ -84,11 +82,7 @@ pub const KEY_NUMLOCK: u32 = 69;
 pub const KEY_SCROLLLOCK: u32 = 70;
 pub const KEY_F11: u32 = 87;
 pub const KEY_F12: u32 = 88;
-#[allow(dead_code)]
-pub const KEY_RIGHTCTRL: u32 = 97;
 pub const KEY_SYSRQ: u32 = 99;
-#[allow(dead_code)]
-pub const KEY_RIGHTALT: u32 = 100;
 pub const KEY_HOME: u32 = 102;
 pub const KEY_UP: u32 = 103;
 pub const KEY_PAGEUP: u32 = 104;
@@ -101,8 +95,6 @@ pub const KEY_INSERT: u32 = 110;
 pub const KEY_DELETE: u32 = 111;
 pub const KEY_PAUSE: u32 = 119;
 pub const KEY_LEFTMETA: u32 = 125;
-#[allow(dead_code)]
-pub const KEY_RIGHTMETA: u32 = 126;
 
 // ---------------------------------------------------------------------------
 // Numpad
@@ -333,22 +325,14 @@ pub fn send_keyboard_key(
     key: u32,
     press: bool,
 ) {
-    let serial = connection.serial();
-    *sequence = sequence.wrapping_add(1);
-
-    device.device().start_emulating(serial, *sequence);
-    let state = if press {
-        ei::keyboard::KeyState::Press
-    } else {
-        ei::keyboard::KeyState::Released
-    };
-    keyboard.key(key, state);
-    device.device().frame(serial, timestamp_us());
-    device.device().stop_emulating(serial);
-
-    if let Err(e) = connection.flush() {
-        log::error!("EIS: keyboard flush error: {e}");
-    }
+    with_emulation(connection, device, sequence, "keyboard", || {
+        let state = if press {
+            ei::keyboard::KeyState::Press
+        } else {
+            ei::keyboard::KeyState::Released
+        };
+        keyboard.key(key, state);
+    });
 }
 
 // ---------------------------------------------------------------------------
