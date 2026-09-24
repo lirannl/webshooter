@@ -27,7 +27,6 @@ pub(crate) struct GlobalWt {
     pub writer: WritableStreamDefaultWriter,
     pub reader: ReadableStreamDefaultReader,
     pub wt: WebTransport,
-    pub max_dgram_size: f64,
 }
 
 thread_local! {
@@ -168,7 +167,6 @@ pub async fn start() -> Result<(), JsValue> {
         .get_reader()
         .dyn_into()
         .expect("get_reader() did not return a ReadableStreamDefaultReader");
-    let max_dgram_size: f64 = datagrams.max_datagram_size().into();
 
     // 5. Store in global handle.
     GLOBAL_WT.with(|cell| {
@@ -176,19 +174,14 @@ pub async fn start() -> Result<(), JsValue> {
             writer,
             reader,
             wt: wt.clone(),
-            max_dgram_size,
         });
     });
 
     // Transport ready — from here we can send errors via WT
     let result = async {
         // 6. Keepalive every 50 ms.
-        let keepalive_bytes = ClientDatagram::KeepAlive.to_bytes();
-        let buf = Uint8Array::from(&keepalive_bytes[..]);
-        let keepalive = Closure::wrap(Box::new(move || {
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+        let keepalive = Closure::wrap(Box::new(|| {
+            send_datagram(ClientDatagram::KeepAlive);
         }) as Box<dyn FnMut()>);
         let keepalive_id = window.set_interval_with_callback_and_timeout_and_arguments_0(
             keepalive.as_ref().unchecked_ref::<js_sys::Function>(),

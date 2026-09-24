@@ -88,10 +88,6 @@ fn trigger_value(gp: &WebGamepad, button_idx: usize, axis_idx: Option<usize>) ->
     0
 }
 
-fn send(msg: ClientDatagram) {
-    send_input(msg);
-}
-
 /// Priority chain for motion on a controller slot. Controller motion wins
 /// when the bound provider reports it; otherwise the host device's own motion
 /// sensors are used; when neither has data no motion is passed on at all.
@@ -228,7 +224,7 @@ pub fn setup_gamepad() {
                             .and_then(|provider| provider(slot as u8))
                     });
                     let motion = pick_motion(controller_motion, device_motion);
-                    send(ClientDatagram::Gamepad {
+                    send_input(ClientDatagram::Gamepad {
                         id: slot as u8,
                         buttons,
                         lx,

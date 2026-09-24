@@ -12,15 +12,11 @@ use web_sys::{
     AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 
+use shared::fragment::{FragmentFrame, PushOutcome};
+
 /// How far ahead (seconds) audio frames are scheduled relative to the running
 /// play-head, to absorb jitter in datagram arrival.
 const SCHEDULE_AHEAD: f64 = 0.05;
-
-/// One pending (possibly fragmented) audio frame awaiting reassembly.
-struct PendingAudio {
-    fragments: Vec<Option<Vec<u8>>>,
-    received: usize,
-}
 
 /// Per-player playback state shared with the decoder output callback.
 struct PlaybackState {
@@ -42,9 +38,7 @@ struct PlaybackState {
 
 pub struct AudioPlayer {
     decoder: AudioDecoder,
-    pending: RefCell<HashMap<u16, PendingAudio>>,
-    #[allow(dead_code)]
-    state: Rc<RefCell<PlaybackState>>,
+    pending: RefCell<HashMap<u16, FragmentFrame>>,
     configured: Cell<bool>,
     /// Running count of decoded samples, used to derive strictly increasing,
     /// accurate chunk timestamps (one Opus packet may hold several 20 ms
@@ -202,7 +196,6 @@ impl AudioPlayer {
         Some(AudioPlayer {
             decoder,
             pending: RefCell::new(HashMap::new()),
-            state,
             configured: Cell::new(false),
             next_sample: Cell::new(0),
             dbg_count: Cell::new(0),
@@ -232,28 +225,16 @@ impl AudioPlayer {
         }
 
         let mut map = self.pending.borrow_mut();
-        let entry = map.entry(frame_id).or_insert_with(|| PendingAudio {
-            fragments: vec![None; num_frags as usize],
-            received: 0,
-        });
+        let entry = map
+            .entry(frame_id)
+            .or_insert_with(|| FragmentFrame::new(num_frags as usize));
 
-        let fi = frag_idx as usize;
-        if fi >= entry.fragments.len() || entry.fragments[fi].is_some() {
-            return;
-        }
-        entry.fragments[fi] = Some(payload);
-        entry.received += 1;
-
-        if entry.received < entry.fragments.len() {
-            return;
-        }
-
-        let mut assembled = Vec::with_capacity(entry.fragments.len() * 256);
-        for frag in entry.fragments.drain(..) {
-            if let Some(d) = frag {
-                assembled.extend_from_slice(&d);
-            }
-        }
+        // Only a completed frame is consumed; everything else (incomplete,
+        // duplicate, out-of-range fragment) keeps the entry for later.
+        let assembled = match entry.push(frag_idx as usize, payload) {
+            PushOutcome::Complete(assembled) => assembled,
+            _ => return,
+        };
         map.remove(&frame_id);
         drop(map);
 

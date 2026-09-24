@@ -2,6 +2,7 @@ use crate::audio::AudioPlayer;
 use crate::with_wt;
 use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
+use shared::fragment::{FragmentFrame, PushOutcome};
 use shared::server_datagram::ServerDatagram;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -34,15 +35,10 @@ pub fn send_initial_resize(canvas: &HtmlCanvasElement) -> Result<(), JsError> {
     let window = web_sys::window().ok_or(JsError::new("Window not found"))?;
     let w = canvas.offset_width() as f64;
     let h = canvas.offset_height() as f64;
-    let msg = ClientDatagram::ResizeDisplay {
+    crate::send_datagram(ClientDatagram::ResizeDisplay {
         index: 0,
         width: (w * window.device_pixel_ratio()) as u16,
         height: (h * window.device_pixel_ratio()) as u16,
-    };
-    let bytes = msg.to_bytes();
-    let buf = js_sys::Uint8Array::from(&bytes[..]);
-    with_wt(|gwt| {
-        let _ = gwt.writer.write_with_chunk(buf.as_ref());
     });
     Ok(())
 }
@@ -77,19 +73,7 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
             }
         };
         if should_send {
-            let window = web_sys::window().ok_or(JsError::new("Window not found"))?;
-            let w = canvas.offset_width() as f64;
-            let h = canvas.offset_height() as f64;
-            let msg = ClientDatagram::ResizeDisplay {
-                index: 0,
-                width: (w * window.device_pixel_ratio()) as u16,
-                height: (h * window.device_pixel_ratio()) as u16,
-            };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_initial_resize(canvas)?;
         }
         Ok(())
     };
@@ -133,11 +117,7 @@ pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
             width: w * window.device_pixel_ratio() as u16,
             height: h * window.device_pixel_ratio() as u16,
         };
-        let bytes = msg.to_bytes();
-        let buf = js_sys::Uint8Array::from(&bytes[..]);
-        with_wt(|gwt| {
-            let _ = gwt.writer.write_with_chunk(buf.as_ref());
-        });
+        crate::send_datagram(msg);
     }) as Box<dyn FnMut()>);
     let _ = canvas.add_event_listener_with_callback(
         "fullscreenchange",
@@ -203,12 +183,7 @@ fn is_installed_pwa(window: &web_sys::Window) -> bool {
 
 pub fn send_decoder_capabilities() -> Result<(), JsError> {
     let decoders = probe_codecs();
-    let msg = ClientDatagram::DecoderCapabilities { decoders };
-    let bytes = msg.to_bytes();
-    let buf = js_sys::Uint8Array::from(&bytes[..]);
-    with_wt(|gwt| {
-        let _ = gwt.writer.write_with_chunk(buf.as_ref());
-    });
+    crate::send_datagram(ClientDatagram::DecoderCapabilities { decoders });
     log::info!("sent decoder capabilities");
     Ok(())
 }
@@ -218,11 +193,7 @@ pub fn send_decoder_capabilities() -> Result<(), JsError> {
 /// it bounds corruption to a single round-trip instead of waiting for the
 /// next scheduled keyframe.
 fn send_request_keyframe() {
-    let bytes = ClientDatagram::RequestKeyframe.to_bytes();
-    let buf = js_sys::Uint8Array::from(&bytes[..]);
-    with_wt(|gwt| {
-        let _ = gwt.writer.write_with_chunk(buf.as_ref());
-    });
+    crate::send_datagram(ClientDatagram::RequestKeyframe);
 }
 
 fn probe_codecs() -> Vec<Codec> {
@@ -252,13 +223,61 @@ fn probe_codecs() -> Vec<Codec> {
 // ---------------------------------------------------------------------------
 
 struct PendingFrame {
-    fragments: Vec<Option<Vec<u8>>>,
+    fragments: FragmentFrame,
     is_keyframe: bool,
-    received: usize,
+}
+
+impl PendingFrame {
+    fn new(num_frags: usize) -> Self {
+        Self {
+            fragments: FragmentFrame::new(num_frags),
+            is_keyframe: false,
+        }
+    }
 }
 
 fn u16_leq(a: u16, b: u16) -> bool {
     ((b.wrapping_sub(a)) & 0xffff) < 0x8000
+}
+
+/// Read the next datagram off the WebTransport (unreliable datagram) stream
+/// as raw bytes. An `Err` means the stream ended or failed and the render
+/// loop must stop.
+async fn read_datagram() -> Result<Vec<u8>, JsValue> {
+    let promise = with_wt(|gwt| gwt.reader.read());
+    let result = JsFuture::from(promise).await;
+
+    match result {
+        Ok(val) => {
+            if val.is_undefined() || val.is_null() {
+                log::info!("render_loop: stream ended (null/undefined)");
+                return Err(JsValue::from_str("stream ended"));
+            }
+            let done = js_sys::Reflect::get(&val, &"done".into())
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if done {
+                log::info!("render_loop: stream done");
+                return Err(JsValue::from_str("stream done"));
+            }
+            let value = match js_sys::Reflect::get(&val, &"value".into()) {
+                Ok(v) if !v.is_undefined() && !v.is_null() => v,
+                _ => {
+                    log::warn!("render_loop: missing value");
+                    return Err(JsValue::from_str("missing value"));
+                }
+            };
+            let arr = js_sys::Uint8Array::new(&value);
+            let mut buf = vec![0u8; arr.length() as usize];
+            arr.copy_to(&mut buf);
+            Ok(buf)
+        }
+        Err(e) => {
+            log::error!("render_loop: read error: {e:?}");
+            Err(e)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,40 +357,9 @@ pub async fn render_loop(
     }
 
     loop {
-        // Read one datagram from the reader.
-        let promise = with_wt(|gwt| gwt.reader.read());
-        let result = JsFuture::from(promise).await;
-
-        let data: Vec<u8> = match result {
-            Ok(val) => {
-                if val.is_undefined() || val.is_null() {
-                    log::info!("render_loop: stream ended (null/undefined)");
-                    return Err(JsValue::from_str("stream ended"));
-                }
-                let done = js_sys::Reflect::get(&val, &"done".into())
-                    .ok()
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if done {
-                    log::info!("render_loop: stream done");
-                    return Err(JsValue::from_str("stream done"));
-                }
-                let value = match js_sys::Reflect::get(&val, &"value".into()) {
-                    Ok(v) if !v.is_undefined() && !v.is_null() => v,
-                    _ => {
-                        log::warn!("render_loop: missing value");
-                        return Err(JsValue::from_str("missing value"));
-                    }
-                };
-                let arr = js_sys::Uint8Array::new(&value);
-                let mut buf = vec![0u8; arr.length() as usize];
-                arr.copy_to(&mut buf);
-                buf
-            }
-            Err(e) => {
-                log::error!("render_loop: read error: {e:?}");
-                return Err(e);
-            }
+        let data = match read_datagram().await {
+            Ok(data) => data,
+            Err(e) => return Err(e),
         };
 
         let msg = match ServerDatagram::from_bytes(&data) {
@@ -394,7 +382,6 @@ pub async fn render_loop(
                 }
                 continue;
             }
-            ServerDatagram::VideoFrame { .. } => {}
             ServerDatagram::LogLevel { level } => {
                 crate::log::apply_server_level(level);
                 continue;
@@ -423,9 +410,6 @@ pub async fn render_loop(
                 crate::throttle::set_throttle(interval_ms);
                 continue;
             }
-        }
-
-        let (frame_id, frag_idx, num_frags, is_keyframe, codec, payload) = match msg {
             ServerDatagram::VideoFrame {
                 frame_id,
                 frag_idx,
@@ -433,170 +417,170 @@ pub async fn render_loop(
                 is_keyframe,
                 codec,
                 payload,
-            } => (frame_id, frag_idx, num_frags, is_keyframe, codec, payload),
-            _ => continue,
-        };
+            } => {
+                let (entry_is_keyframe, assembled) = {
+                    let mut map = pending.borrow_mut();
 
-        let (entry_is_keyframe, assembled) = {
-            let mut map = pending.borrow_mut();
+                    // Drop fragments for frames we have already fully moved
+                    // past. On a lossy link a fragment can arrive late (after
+                    // its frame was already displayed); re-decoding a stale
+                    // frame would feed the decoder garbage. Compared in
+                    // circular order so the u16 wraparound at frame_id 65535
+                    // is handled correctly.
+                    if let Some(last) = last_assembled.get() {
+                        if u16_leq(frame_id, last) {
+                            continue;
+                        }
+                    }
 
-            // Drop fragments for frames we have already fully moved past. On a
-            // lossy link a fragment can arrive late (after its frame was
-            // already displayed); re-decoding a stale frame would feed the
-            // decoder garbage. Compared in circular order so the u16 wraparound
-            // at frame_id 65535 is handled correctly.
-            if let Some(last) = last_assembled.get() {
-                if u16_leq(frame_id, last) {
-                    continue;
-                }
-            }
+                    let entry = map
+                        .entry(frame_id)
+                        .or_insert_with(|| PendingFrame::new(num_frags as usize));
 
-            let entry = map.entry(frame_id).or_insert_with(|| PendingFrame {
-                fragments: vec![None; num_frags as usize],
-                is_keyframe: false,
-                received: 0,
-            });
+                    // A fragment's declared fragment count must match the
+                    // entry we are accumulating. A mismatch means a stale entry
+                    // from a previous use of this frame_id (the u16 counter
+                    // wrapped) collided with a new frame. Restart it cleanly
+                    // instead of indexing out of bounds and aborting the
+                    // entire stream.
+                    if num_frags as usize != entry.fragments.num_frags() {
+                        *entry = PendingFrame::new(num_frags as usize);
+                    }
 
-            // A fragment's declared fragment count must match the entry we are
-            // accumulating. A mismatch means a stale entry from a previous use
-            // of this frame_id (the u16 counter wrapped) collided with a new
-            // frame. Restart it cleanly instead of indexing out of bounds and
-            // aborting the entire stream.
-            if num_frags as usize != entry.fragments.len() {
-                *entry = PendingFrame {
-                    fragments: vec![None; num_frags as usize],
-                    is_keyframe: false,
-                    received: 0,
+                    let assembled = match entry.fragments.push(frag_idx as usize, payload) {
+                        PushOutcome::OutOfRange => {
+                            // Impossible fragment index (corrupt/truncated
+                            // datagram). Drop the whole frame rather than
+                            // panic on out-of-bounds access.
+                            map.remove(&frame_id);
+                            continue;
+                        }
+                        PushOutcome::Duplicate => continue,
+                        PushOutcome::Incomplete => {
+                            if is_keyframe {
+                                entry.is_keyframe = true;
+                            }
+                            // Not all fragments arrived yet — wait for the
+                            // rest. A lost fragment here simply means this
+                            // frame is skipped (frozen until the next
+                            // keyframe) rather than crashing the stream.
+                            seen.borrow_mut().insert(frame_id);
+                            continue;
+                        }
+                        PushOutcome::Complete(assembled) => {
+                            if is_keyframe {
+                                entry.is_keyframe = true;
+                            }
+                            assembled
+                        }
+                    };
+
+                    seen.borrow_mut().insert(frame_id);
+                    let is_keyframe = entry.is_keyframe;
+
+                    // --- Loss detection (packet-loss resilience) ---------
+                    // A frame is lost when a later frame_id assembles but an
+                    // earlier one was never observed. Detecting by positive
+                    // evidence (rather than a timeout) keeps steady-state
+                    // latency at zero. On loss we request a keyframe and stop
+                    // decoding deltas until it arrives, so a single dropped
+                    // frame can't poison the prediction chain.
+                    if is_keyframe {
+                        // Fresh keyframe: resynced, reset all loss state.
+                        waiting_for_keyframe.set(false);
+                        seen.borrow_mut().clear();
+                        seen.borrow_mut().insert(frame_id);
+                        last_assembled.set(Some(frame_id));
+                    } else if let Some(l) = last_assembled.get() {
+                        let diff = frame_id.wrapping_sub(l);
+                        // Only consider a forward gap (diff in [1, 0x8000));
+                        // equal or out-of-order frames are not loss evidence.
+                        if diff != 0 && diff < 0x8000 {
+                            let lost = (1..diff)
+                                .any(|g| !seen.borrow().contains(&l.wrapping_add(g)));
+                            if lost && !waiting_for_keyframe.get() {
+                                send_request_keyframe();
+                                waiting_for_keyframe.set(true);
+                            }
+                        }
+                        last_assembled.set(Some(frame_id));
+                        seen.borrow_mut().insert(frame_id);
+                    } else {
+                        // First frame is a delta: nothing to predict from,
+                        // request a keyframe to establish a clean reference.
+                        if !waiting_for_keyframe.get() {
+                            send_request_keyframe();
+                            waiting_for_keyframe.set(true);
+                        }
+                        last_assembled.set(Some(frame_id));
+                        seen.borrow_mut().insert(frame_id);
+                    }
+
+                    let keys: Vec<u16> = map.keys().copied().collect();
+                    for id in keys {
+                        if u16_leq(id, frame_id) {
+                            map.remove(&id);
+                        }
+                    }
+
+                    (is_keyframe, assembled)
                 };
-            }
 
-            let idx = frag_idx as usize;
-            if idx >= entry.fragments.len() {
-                // Impossible fragment index (corrupt/truncated datagram). Drop
-                // the whole frame rather than panic on out-of-bounds access.
-                map.remove(&frame_id);
-                continue;
-            }
-            if entry.fragments[idx].is_some() {
-                continue;
-            }
-            entry.fragments[idx] = Some(payload);
-            entry.received += 1;
-            if is_keyframe {
-                entry.is_keyframe = true;
-            }
-            seen.borrow_mut().insert(frame_id);
-
-            if entry.received < entry.fragments.len() {
-                // Not all fragments arrived yet — wait for the rest. A lost
-                // fragment here simply means this frame is skipped (frozen
-                // until the next keyframe) rather than crashing the stream.
-                continue;
-            }
-
-            let total: usize = entry
-                .fragments
-                .iter()
-                .map(|f| f.as_ref().map_or(0, |v| v.len()))
-                .sum();
-            let mut assembled = Vec::with_capacity(total);
-            for frag in entry.fragments.iter() {
-                if let Some(d) = frag {
-                    assembled.extend_from_slice(d);
-                }
-            }
-            let is_keyframe = entry.is_keyframe;
-
-            // --- Loss detection (packet-loss resilience) -----------------
-            // A frame is lost when a later frame_id assembles but an earlier
-            // one was never observed. Detecting by positive evidence (rather
-            // than a timeout) keeps steady-state latency at zero. On loss we
-            // request a keyframe and stop decoding deltas until it arrives,
-            // so a single dropped frame can't poison the prediction chain.
-            if is_keyframe {
-                // Fresh keyframe: resynced, reset all loss state.
-                waiting_for_keyframe.set(false);
-                seen.borrow_mut().clear();
-                seen.borrow_mut().insert(frame_id);
-                last_assembled.set(Some(frame_id));
-            } else if let Some(l) = last_assembled.get() {
-                let diff = frame_id.wrapping_sub(l);
-                // Only consider a forward gap (diff in [1, 0x8000)); equal or
-                // out-of-order frames are not loss evidence.
-                if diff != 0 && diff < 0x8000 {
-                    let lost = (1..diff)
-                        .any(|g| !seen.borrow().contains(&l.wrapping_add(g)));
-                    if lost && !waiting_for_keyframe.get() {
-                        send_request_keyframe();
-                        waiting_for_keyframe.set(true);
+                // Reconfigure the decoder if the codec changed.
+                {
+                    let mut cur = current_codec.borrow_mut();
+                    if *cur != Some(codec) {
+                        log::info!("codec changed: {cur:?} -> {codec:?}");
+                        let config = js_sys::Object::new();
+                        js_sys::Reflect::set(
+                            &config,
+                            &"codec".into(),
+                            &codec.web_codec_string().into(),
+                        )
+                        .ok();
+                        js_sys::Reflect::set(
+                            &config,
+                            &"optimizeForLatency".into(),
+                            &JsValue::TRUE,
+                        )
+                        .ok();
+                        decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
+                        *cur = Some(codec);
                     }
                 }
-                last_assembled.set(Some(frame_id));
-                seen.borrow_mut().insert(frame_id);
-            } else {
-                // First frame is a delta: nothing to predict from, request a
-                // keyframe to establish a clean reference.
-                if !waiting_for_keyframe.get() {
-                    send_request_keyframe();
-                    waiting_for_keyframe.set(true);
+
+                let chunk_init = js_sys::Object::new();
+                let chunk_type = if entry_is_keyframe {
+                    JsValue::from_str("key")
+                } else {
+                    JsValue::from_str("delta")
+                };
+                js_sys::Reflect::set(&chunk_init, &"type".into(), &chunk_type).ok();
+                js_sys::Reflect::set(
+                    &chunk_init,
+                    &"timestamp".into(),
+                    &JsValue::from_f64((frame_id as u64 * 1000) as f64),
+                )
+                .ok();
+                let data_arr = js_sys::Uint8Array::from(&assembled[..]);
+                js_sys::Reflect::set(&chunk_init, &"data".into(), &data_arr).ok();
+
+                let chunk = EncodedVideoChunk::new(
+                    chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>(),
+                );
+                match chunk {
+                    Ok(chunk) => {
+                        // While waiting for a keyframe to resync, every delta
+                        // frame still references the lost one — decoding it
+                        // would just reproduce corruption, so discard it.
+                        if !(waiting_for_keyframe.get() && !entry_is_keyframe) {
+                            decoder.decode(&chunk);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("EncodedVideoChunk creation failed: {e:?}");
+                    }
                 }
-                last_assembled.set(Some(frame_id));
-                seen.borrow_mut().insert(frame_id);
-            }
-
-            let keys: Vec<u16> = map.keys().copied().collect();
-            for id in keys {
-                if u16_leq(id, frame_id) {
-                    map.remove(&id);
-                }
-            }
-
-            (is_keyframe, assembled)
-        };
-
-        // Reconfigure the decoder if the codec changed.
-        {
-            let mut cur = current_codec.borrow_mut();
-            if *cur != Some(codec) {
-                log::info!("codec changed: {cur:?} -> {codec:?}");
-                let config = js_sys::Object::new();
-                js_sys::Reflect::set(&config, &"codec".into(), &codec.web_codec_string().into())
-                    .ok();
-                js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &JsValue::TRUE).ok();
-                decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
-                *cur = Some(codec);
-            }
-        }
-
-        let chunk_init = js_sys::Object::new();
-        let chunk_type = if entry_is_keyframe {
-            JsValue::from_str("key")
-        } else {
-            JsValue::from_str("delta")
-        };
-        js_sys::Reflect::set(&chunk_init, &"type".into(), &chunk_type).ok();
-        js_sys::Reflect::set(
-            &chunk_init,
-            &"timestamp".into(),
-            &JsValue::from_f64((frame_id as u64 * 1000) as f64),
-        )
-        .ok();
-        let data_arr = js_sys::Uint8Array::from(&assembled[..]);
-        js_sys::Reflect::set(&chunk_init, &"data".into(), &data_arr).ok();
-
-        let chunk =
-            EncodedVideoChunk::new(chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>());
-        match chunk {
-            Ok(chunk) => {
-                // While waiting for a keyframe to resync, every delta frame
-                // still references the lost one — decoding it would just
-                // reproduce corruption, so discard it.
-                if !(waiting_for_keyframe.get() && !entry_is_keyframe) {
-                    decoder.decode(&chunk);
-                }
-            }
-            Err(e) => {
-                log::error!("EncodedVideoChunk creation failed: {e:?}");
             }
         }
     }

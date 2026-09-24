@@ -15,8 +15,6 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 
-use crate::with_wt;
-
 struct Throttle {
     /// Server-requested minimum spacing between input datagrams (ms).
     /// 0 = no throttling.
@@ -97,14 +95,24 @@ fn schedule_flush() {
             return;
         }
         let due = t.last_send + t.interval_ms;
-        let delay = (due - now_ms()).max(0.0);
-        let flush_fn = FLUSH_CB.with(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
-        let handle = web_sys::window()
-            .unwrap()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&flush_fn, delay as i32)
-            .unwrap();
-        t.flush_id = Some(handle);
+        arm_flush(&mut t, due - now_ms());
     });
+}
+
+/// Arm the flush timer for a delay (ms), recording it on `t`. Both
+/// [`schedule_flush`] (first arm after an event) and [`flush_pending`] (the
+/// interval grew while the timer was armed) compute their own delay; the
+/// actual `setTimeout` bookkeeping is shared.
+fn arm_flush(t: &mut Throttle, delay: f64) {
+    let flush_fn = FLUSH_CB.with(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+    let handle = web_sys::window()
+        .unwrap()
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            &flush_fn,
+            delay.max(0.0) as i32,
+        )
+        .unwrap();
+    t.flush_id = Some(handle);
 }
 
 /// Timer callback: send everything queued since the last flush, observing the
@@ -120,15 +128,7 @@ fn flush_pending() {
         let due = t.last_send + t.interval_ms;
         if now < due {
             // The interval grew while the timer was armed: wait the remainder.
-            let flush_fn = FLUSH_CB.with(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
-            let handle = web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &flush_fn,
-                    (due - now).max(0.0) as i32,
-                )
-                .unwrap();
-            t.flush_id = Some(handle);
+            arm_flush(&mut t, due - now);
             return;
         }
         let msgs = std::mem::take(&mut t.pending);
@@ -145,9 +145,5 @@ fn now_ms() -> f64 {
 }
 
 fn send_raw(msg: &ClientDatagram) {
-    let bytes = msg.to_bytes();
-    let buf = js_sys::Uint8Array::from(&bytes[..]);
-    with_wt(|gwt| {
-        let _ = gwt.writer.write_with_chunk(buf.as_ref());
-    });
+    crate::send_datagram(msg.clone());
 }

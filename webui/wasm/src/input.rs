@@ -35,16 +35,6 @@ pub fn setup_keyboard(canvas: &HtmlCanvasElement) {
     keydown_cb.forget();
 }
 
-fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
-    if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
-    }
-}
-
 pub fn setup_touch(canvas: &HtmlCanvasElement) {
     let _ = canvas.style().set_property("touch-action", "none");
 
@@ -86,8 +76,8 @@ pub fn setup_touch(canvas: &HtmlCanvasElement) {
             };
             let nx = (touch.client_x() as f64 - rect.left()) / rect.width();
             let ny = (touch.client_y() as f64 - rect.top()) / rect.height();
-            let x = clamp((nx * cw).round(), 0.0, cw - 1.0) as u16;
-            let y = clamp((ny * ch).round(), 0.0, ch - 1.0) as u16;
+            let x = ((nx * cw).round()).clamp(0.0, cw - 1.0) as u16;
+            let y = ((ny * ch).round()).clamp(0.0, ch - 1.0) as u16;
             touches_vec.push((slot, x, y));
         }
         for (slot, x, y) in touches_vec {
@@ -264,35 +254,28 @@ pub fn setup_mouse(canvas: &HtmlCanvasElement, release_flag: Rc<Cell<bool>>) {
     }
 
     // --- mousedown / mouseup: send button events while locked ---
-    {
+    // Both differ only in the pressed flag, so one handler factory covers them.
+    let mouse_button_closure = |pressed: bool| {
         let doc = document.clone();
-        let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
+        Closure::wrap(Box::new(move |e: MouseEvent| {
             if doc.pointer_lock_element().is_none() {
                 return;
             }
             e.prevent_default();
             let msg = ClientDatagram::MouseButton {
                 button: e.button() as u8,
-                pressed: true,
+                pressed,
             };
             send_input(msg);
-        }) as Box<dyn FnMut(MouseEvent)>);
+        }) as Box<dyn FnMut(MouseEvent)>)
+    };
+    {
+        let cb = mouse_button_closure(true);
         let _ = canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
         cb.forget();
     }
     {
-        let doc = document.clone();
-        let cb = Closure::wrap(Box::new(move |e: MouseEvent| {
-            if doc.pointer_lock_element().is_none() {
-                return;
-            }
-            e.prevent_default();
-            let msg = ClientDatagram::MouseButton {
-                button: e.button() as u8,
-                pressed: false,
-            };
-            send_input(msg);
-        }) as Box<dyn FnMut(MouseEvent)>);
+        let cb = mouse_button_closure(false);
         let _ = canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref());
         cb.forget();
     }

@@ -16,12 +16,5 @@ export const dataUrlToBytes = async (dataUrl: string) => {
     return await res.arrayBuffer();
 }
 
-export const base64ToBytes = (base64: string) => {
-    const binary_string = window.atob(base64);
-    const len = binary_string.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binary_string.charCodeAt(i);
-    }
-    return bytes.buffer;
-}
+/** Base64 (no data-URL prefix, and machine-readable — no padding) of `buf`. */
+export const toRawBase64 = async (buf: ArrayBuffer) => (await bytesToBase64DataUrl(buf)).split("base64,")[1]

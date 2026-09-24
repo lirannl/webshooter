@@ -75,18 +75,6 @@ pub(crate) fn apply_server_level(filter: LevelFilter) {
     log::debug!("server set maximum log level: {filter}");
 }
 
-/// Log any `Serialize` value as JSON at `level`.
-///
-/// The server transport carries text datagrams, so structure is preserved
-/// by embedding a JSON document in the message rather than flattening the
-/// value into a `Debug` string.
-pub fn log_serialized<T: serde::Serialize + ?Sized>(level: Level, value: &T) {
-    match serde_json::to_string(value) {
-        Ok(json) => log::log!(level, "{json}"),
-        Err(err) => log::error!("failed to serialize log value: {err}"),
-    }
-}
-
 /// Parse a JS-supplied level name; unknown or missing means `Info`.
 fn parse_level(level: Option<&str>) -> Level {
     match level.map(str::to_ascii_lowercase).as_deref() {
