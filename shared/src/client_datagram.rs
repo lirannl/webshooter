@@ -39,6 +39,18 @@ pub struct GamepadMotion {
     pub gyro_z: f32,
 }
 
+/// Pack one real-world measurement into the `i16` motion field, clamping to
+/// the representable range. Mirror of [`axis_from_wire`].
+fn axis_to_wire(value: f32, scale: f64) -> i16 {
+    (value as f64 * scale).clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
+/// Unpack one `i16` motion field back into real-world units. Mirror of
+/// [`axis_to_wire`].
+fn axis_from_wire(value: i16, scale: f64) -> f32 {
+    (value as f64 / scale) as f32
+}
+
 /// Convert a client-side gamepad button bitmask (where bit `i` is set when
 /// standard button `i` is pressed, see [`GAMEPAD_NUM_BUTTONS`]) into the
 /// bitmask expected by inputtino's joypad `set_pressed_buttons`.
@@ -256,7 +268,7 @@ impl ClientDatagram {
                 width,
                 height,
             } => {
-                let mut buf = Vec::with_capacity(6);
+                let mut buf = Vec::with_capacity(1 + 1 + 2 * size_of::<u16>());
                 buf.push(ClientDatagramVariants::RESIZE_DISPLAY.0);
                 buf.push(*index);
                 buf.extend_from_slice(&width.to_be_bytes());
@@ -264,7 +276,7 @@ impl ClientDatagram {
                 buf
             }
             Self::Touchscreen { index, x, y } => {
-                let mut buf = Vec::with_capacity(6);
+                let mut buf = Vec::with_capacity(1 + 2 * size_of::<u16>() + 1);
                 buf.push(ClientDatagramVariants::TOUCHSCREEN.0);
                 buf.extend_from_slice(&x.to_be_bytes());
                 buf.extend_from_slice(&y.to_be_bytes());
@@ -285,7 +297,11 @@ impl ClientDatagram {
                 rt,
                 motion,
             } => {
-                let mut buf = Vec::with_capacity(33);
+                // 1 discriminant + 1 id + 1 buttons (u32) + 6 sticks/triggers
+                // (i16) + 1 motion flag, plus the optional 6 motion i16s.
+                let mut buf =
+                    Vec::with_capacity(1 + 1 + size_of::<u32>() + 6 * size_of::<i16>() + 1
+                        + 6 * size_of::<i16>() * motion.is_some() as usize);
                 buf.push(ClientDatagramVariants::GAMEPAD.0);
                 buf.push(*id);
                 buf.extend_from_slice(&buttons.to_be_bytes());
@@ -301,30 +317,16 @@ impl ClientDatagram {
                     }
                     Some(m) => {
                         buf.push(1);
-                        let ax = (m.accel_x as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        let ay = (m.accel_y as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        let az = (m.accel_z as f64 * MOTION_ACCEL_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        let gx = (m.gyro_x as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        let gy = (m.gyro_y as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        let gz = (m.gyro_z as f64 * MOTION_GYRO_SCALE)
-                            .clamp(i16::MIN as f64, i16::MAX as f64)
-                            as i16;
-                        buf.extend_from_slice(&ax.to_be_bytes());
-                        buf.extend_from_slice(&ay.to_be_bytes());
-                        buf.extend_from_slice(&az.to_be_bytes());
-                        buf.extend_from_slice(&gx.to_be_bytes());
-                        buf.extend_from_slice(&gy.to_be_bytes());
-                        buf.extend_from_slice(&gz.to_be_bytes());
+                        for wire in [
+                            axis_to_wire(m.accel_x, MOTION_ACCEL_SCALE),
+                            axis_to_wire(m.accel_y, MOTION_ACCEL_SCALE),
+                            axis_to_wire(m.accel_z, MOTION_ACCEL_SCALE),
+                            axis_to_wire(m.gyro_x, MOTION_GYRO_SCALE),
+                            axis_to_wire(m.gyro_y, MOTION_GYRO_SCALE),
+                            axis_to_wire(m.gyro_z, MOTION_GYRO_SCALE),
+                        ] {
+                            buf.extend_from_slice(&wire.to_be_bytes());
+                        }
                     }
                 }
                 buf
@@ -349,14 +351,14 @@ impl ClientDatagram {
                 buf
             }
             Self::AudioReady { channels, rate } => {
-                let mut buf = Vec::with_capacity(6);
+                let mut buf = Vec::with_capacity(1 + 1 + size_of::<u32>());
                 buf.push(ClientDatagramVariants::AUDIO_READY.0);
                 buf.push(*channels);
                 buf.extend_from_slice(&rate.to_be_bytes());
                 buf
             }
             Self::MouseMove { dx, dy } => {
-                let mut buf = Vec::with_capacity(5);
+                let mut buf = Vec::with_capacity(1 + 2 * size_of::<i16>());
                 buf.push(ClientDatagramVariants::MOUSE_MOVE.0);
                 buf.extend_from_slice(&dx.to_be_bytes());
                 buf.extend_from_slice(&dy.to_be_bytes());
@@ -370,7 +372,7 @@ impl ClientDatagram {
                 ]
             }
             Self::Scroll { dx, dy } => {
-                let mut buf = Vec::with_capacity(9);
+                let mut buf = Vec::with_capacity(1 + 2 * size_of::<i32>());
                 buf.push(ClientDatagramVariants::SCROLL.0);
                 buf.extend_from_slice(&dx.to_be_bytes());
                 buf.extend_from_slice(&dy.to_be_bytes());
@@ -446,25 +448,17 @@ impl ClientDatagram {
                     let Some(body) = data.get(18..30) else {
                         anyhow::bail!("Gamepad motion datagram too short: {} bytes", bytes.len());
                     };
-                    let accel_x =
-                        i16::from_be_bytes([body[0], body[1]]) as f64 / MOTION_ACCEL_SCALE;
-                    let accel_y =
-                        i16::from_be_bytes([body[2], body[3]]) as f64 / MOTION_ACCEL_SCALE;
-                    let accel_z =
-                        i16::from_be_bytes([body[4], body[5]]) as f64 / MOTION_ACCEL_SCALE;
-                    let gyro_x =
-                        i16::from_be_bytes([body[6], body[7]]) as f64 / MOTION_GYRO_SCALE;
-                    let gyro_y =
-                        i16::from_be_bytes([body[8], body[9]]) as f64 / MOTION_GYRO_SCALE;
-                    let gyro_z =
-                        i16::from_be_bytes([body[10], body[11]]) as f64 / MOTION_GYRO_SCALE;
+                    let mut axes = [0i16; 6];
+                    for (i, [a, b]) in body.as_chunks::<2>().0.iter().enumerate() {
+                        axes[i] = i16::from_be_bytes([*a, *b]);
+                    }
                     Some(GamepadMotion {
-                        accel_x: accel_x as f32,
-                        accel_y: accel_y as f32,
-                        accel_z: accel_z as f32,
-                        gyro_x: gyro_x as f32,
-                        gyro_y: gyro_y as f32,
-                        gyro_z: gyro_z as f32,
+                        accel_x: axis_from_wire(axes[0], MOTION_ACCEL_SCALE),
+                        accel_y: axis_from_wire(axes[1], MOTION_ACCEL_SCALE),
+                        accel_z: axis_from_wire(axes[2], MOTION_ACCEL_SCALE),
+                        gyro_x: axis_from_wire(axes[3], MOTION_GYRO_SCALE),
+                        gyro_y: axis_from_wire(axes[4], MOTION_GYRO_SCALE),
+                        gyro_z: axis_from_wire(axes[5], MOTION_GYRO_SCALE),
                     })
                 } else {
                     None
@@ -712,6 +706,137 @@ mod tests {
     fn is_input_byte_rejects_unknown_discriminants() {
         for disc in [0x0E, 0x0F, 0x7F, 0xFF] {
             assert!(!is_input_byte(disc));
+        }
+    }
+
+    /// The exact wire bytes for every variant. This is the on-the-wire
+    /// contract: both ends of the transport are compiled from this repo, but a
+    /// cached page (old client) can still be talking to a freshly built
+    /// server, so the layout must never drift. If this test ever needs
+    /// updating, the new bytes are a wire-format change and old clients will
+    /// stop working.
+    #[test]
+    fn wire_bytes_are_stable() {
+        let cases: Vec<(ClientDatagram, Vec<u8>)> = vec![
+            (ClientDatagram::KeepAlive, vec![0x00]),
+            (
+                ClientDatagram::Keyboard {
+                    keycode: "KeyA".into(),
+                    modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                },
+                vec![0x01, 0x03, b'K', b'e', b'y', b'A'],
+            ),
+            (
+                ClientDatagram::Keyboard {
+                    keycode: String::new(),
+                    modifiers: Modifiers::empty(),
+                },
+                vec![0x01, 0x00],
+            ),
+            (
+                ClientDatagram::ResizeDisplay {
+                    index: 1,
+                    width: 1920,
+                    height: 1080,
+                },
+                vec![0x02, 0x01, 0x07, 0x80, 0x04, 0x38],
+            ),
+            (
+                ClientDatagram::Touchscreen {
+                    index: 0,
+                    x: 100,
+                    y: 200,
+                },
+                vec![0x03, 0x00, 0x64, 0x00, 0xC8, 0x00],
+            ),
+            (
+                ClientDatagram::TouchscreenRelease { index: 2 },
+                vec![0x04, 0x02],
+            ),
+            (
+                ClientDatagram::Gamepad {
+                    id: 3,
+                    buttons: 0xFFFF,
+                    lx: -32768,
+                    ly: 32767,
+                    rx: 0,
+                    ry: -1,
+                    lt: 10,
+                    rt: 20,
+                    motion: None,
+                },
+                vec![
+                    0x05, 0x03, 0x00, 0x00, 0xFF, 0xFF, 0x80, 0x00, 0x7F, 0xFF, 0x00, 0x00, 0xFF,
+                    0xFF, 0x00, 0x0A, 0x00, 0x14, 0x00,
+                ],
+            ),
+            (
+                ClientDatagram::Gamepad {
+                    id: 4,
+                    buttons: 0,
+                    lx: 0,
+                    ly: 0,
+                    rx: 0,
+                    ry: 0,
+                    lt: 0,
+                    rt: 0,
+                    motion: Some(GamepadMotion {
+                        accel_x: 1.0,
+                        accel_y: -2.0,
+                        accel_z: 3.0,
+                        gyro_x: 10.0,
+                        gyro_y: -20.0,
+                        gyro_z: 30.0,
+                    }),
+                },
+                vec![
+                    0x05, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x64,
+                    0xFF, 0x38, 0x01, 0x2C, 0x00, 0x64, 0xFF, 0x38, 0x01, 0x2C,
+                ],
+            ),
+            (
+                ClientDatagram::GamepadDisconnect { id: 7 },
+                vec![0x06, 0x07],
+            ),
+            (
+                ClientDatagram::Error {
+                    level: log::Level::Warn,
+                    message: "hello".into(),
+                },
+                vec![0x07, 0x02, b'h', b'e', b'l', b'l', b'o'],
+            ),
+            (
+                ClientDatagram::DecoderCapabilities {
+                    decoders: vec![Codec::Av1, Codec::H264, Codec::Vp9],
+                },
+                vec![0x08, 0x03, 0x00, 0x02, 0x03],
+            ),
+            (
+                ClientDatagram::AudioReady {
+                    channels: 2,
+                    rate: 48000,
+                },
+                vec![0x09, 0x02, 0x00, 0x00, 0xBB, 0x80],
+            ),
+            (
+                ClientDatagram::MouseMove { dx: 12, dy: -34 },
+                vec![0x0A, 0x00, 0x0C, 0xFF, 0xDE],
+            ),
+            (
+                ClientDatagram::MouseButton {
+                    button: 2,
+                    pressed: true,
+                },
+                vec![0x0B, 0x02, 0x01],
+            ),
+            (
+                ClientDatagram::Scroll { dx: 100, dy: -200 },
+                vec![0x0C, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xFF, 0xFF, 0x38],
+            ),
+            (ClientDatagram::RequestKeyframe, vec![0x0D]),
+        ];
+        for (dgram, expected) in cases {
+            assert_eq!(dgram.to_bytes(), expected, "bytes changed for {dgram:?}");
         }
     }
 }

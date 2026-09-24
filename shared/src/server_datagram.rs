@@ -3,12 +3,15 @@ use log::LevelFilter;
 use anyhow::Result;
 use named_constants::named_constants;
 
-/// 1 byte discriminant + 2×3 frame metadata + 1 is_keyframe + 1 codec = 9
-const HEADER: usize = 9;
+/// 1 discriminant + 3×u16 frame metadata + 1 is_keyframe + 1 codec.
+const HEADER: usize = 1 + 3 * size_of::<u16>() + 1 + 1;
+
+/// 1 discriminant + 3×u16 frame metadata + 1 channels + 1 rate (u32) + 1 format.
+const AUDIO_HEADER: usize = 1 + 3 * size_of::<u16>() + 1 + size_of::<u32>() + 1;
 
 /// Maximum payload we send per audio datagram. Derived from the WebTransport
-/// default `max_datagram_size` of 1200, minus the `AudioFrame` header (13).
-pub const MAX_AUDIO_DATAGRAM_PAYLOAD: usize = 1187;
+/// default max datagram size of 1200, minus the [`AUDIO_HEADER`] header.
+pub const MAX_AUDIO_DATAGRAM_PAYLOAD: usize = 1200 - AUDIO_HEADER;
 
 /// Format of the bytes carried by [`ServerDatagram::AudioFrame`]. Audio is
 /// always sent as a single encoded Opus packet (RFC 6716).
@@ -102,17 +105,14 @@ impl ServerDatagram {
                 is_keyframe,
                 codec,
                 payload,
-            } => {
-                let mut buf = Vec::with_capacity(HEADER + payload.len());
-                buf.push(ServerDatagramVariants::VIDEO_FRAME.0);
-                buf.extend_from_slice(&frame_id.to_be_bytes());
-                buf.extend_from_slice(&frag_idx.to_be_bytes());
-                buf.extend_from_slice(&num_frags.to_be_bytes());
-                buf.push(*is_keyframe as u8);
-                buf.push(codec.to_byte());
-                buf.extend_from_slice(payload);
-                buf
-            }
+            } => Self::video_frame_to_bytes(
+                *frame_id,
+                *frag_idx,
+                *num_frags,
+                *is_keyframe,
+                *codec,
+                payload,
+            ),
             Self::ReleaseMouse => vec![ServerDatagramVariants::RELEASE_MOUSE.0],
             Self::ToggleFullscreen => vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
             Self::LogLevel { level } => vec![
@@ -128,7 +128,7 @@ impl ServerDatagram {
                 format,
                 payload,
             } => {
-                let mut buf = Vec::with_capacity(13 + payload.len());
+                let mut buf = Vec::with_capacity(AUDIO_HEADER + payload.len());
                 buf.push(ServerDatagramVariants::AUDIO_FRAME.0);
                 buf.extend_from_slice(&frame_id.to_be_bytes());
                 buf.extend_from_slice(&frag_idx.to_be_bytes());
@@ -183,9 +183,7 @@ impl ServerDatagram {
                 })
             }
             ServerDatagramVariants::AUDIO_FRAME => {
-                // 1 discriminant + 2*3 frame metadata + 1 channels + 4 rate + 1 format
-                const H: usize = 13;
-                if bytes.len() < H {
+                if bytes.len() < AUDIO_HEADER {
                     anyhow::bail!("AudioFrame datagram too short: {} bytes", bytes.len());
                 }
                 let frame_id = u16::from_be_bytes([bytes[1], bytes[2]]);
@@ -221,7 +219,53 @@ impl ServerDatagram {
     }
 }
 
-/// Maximum safe payload per datagram given a max datagram size.
-pub fn max_payload_size(max_datagram_size: usize) -> usize {
-    max_datagram_size.saturating_sub(HEADER).max(1)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the exact wire bytes for every server variant (see the analogous
+    /// test in `client_datagram.rs` for why this must never drift).
+    #[test]
+    fn wire_bytes_are_stable() {
+        let cases: Vec<(ServerDatagram, Vec<u8>)> = vec![
+            (
+                ServerDatagram::VideoFrame {
+                    frame_id: 0x1234,
+                    frag_idx: 0x0056,
+                    num_frags: 0x0003,
+                    is_keyframe: true,
+                    codec: Codec::Av1,
+                    payload: vec![0xAA, 0xBB],
+                },
+                vec![0x00, 0x12, 0x34, 0x00, 0x56, 0x00, 0x03, 0x01, 0x00, 0xAA, 0xBB],
+            ),
+            (ServerDatagram::ReleaseMouse, vec![0x01]),
+            (ServerDatagram::ToggleFullscreen, vec![0x02]),
+            (
+                ServerDatagram::LogLevel {
+                    level: log::LevelFilter::Info,
+                },
+                vec![0x03, 0x03],
+            ),
+            (
+                ServerDatagram::AudioFrame {
+                    frame_id: 0x0001,
+                    frag_idx: 0,
+                    num_frags: 1,
+                    channels: 2,
+                    rate: 48000,
+                    format: AudioFormat::Opus,
+                    payload: vec![0x11],
+                },
+                vec![0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x11],
+            ),
+            (
+                ServerDatagram::Throttle { interval_ms: 300 },
+                vec![0x05, 0x01, 0x2C],
+            ),
+        ];
+        for (dgram, expected) in cases {
+            assert_eq!(dgram.to_bytes(), expected, "bytes changed for {dgram:?}");
+        }
+    }
 }
