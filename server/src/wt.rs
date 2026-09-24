@@ -9,7 +9,7 @@ use crate::{
 use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 use log::LevelFilter;
-use shared::client_datagram::ClientDatagram;
+use shared::client_datagram::{ClientDatagram, is_input_byte};
 use shared::server_datagram;
 use shared::server_datagram::ServerDatagram;
 use std::{
@@ -30,6 +30,53 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::Incomin
 // missed keepalives before we consider the peer gone — enough headroom
 // for jitter while still detecting a refresh within half a second.
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Maximum rate at which one receive pump will accept *input* datagrams once
+/// its burst allowance is spent, per second. Real input (mouse, keyboard,
+/// touch, gamepad) never approaches this rate, even from a 1000 Hz gaming
+/// mouse plus gamepad simultaneously. It exists to bound the CPU the pump
+/// spends parsing and broadcasting a deliberate flood, so a hostile client
+/// cannot starve the session's other tasks (frame forwarding, control,
+/// capture) into a visible freeze.
+const INPUT_FLOOD_RATE_PER_SEC: u32 = 4000;
+/// Instantaneous burst of input datagrams allowed through before the rate
+/// limit applies, so genuine micro-bursts (a fast flick, a quick key rollover)
+/// are forwarded untouched.
+const INPUT_FLOOD_BURST: u32 = 32;
+
+/// A token bucket bounding the rate at which *input* datagrams are accepted
+/// from the network. One token is consumed per input datagram; tokens refill
+/// at [`INPUT_FLOOD_RATE_PER_SEC`] and accumulate up to [`INPUT_FLOOD_BURST`].
+/// Per-pump state: each session's `broadcast_datagrams` task owns its own.
+struct InputFloodGuard {
+    tokens: f64,
+    last_refill: std::time::Instant,
+}
+
+impl InputFloodGuard {
+    fn new() -> Self {
+        Self {
+            tokens: INPUT_FLOOD_BURST as f64,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Take a token if one is available (refilling first). Returns whether the
+    /// caller may accept the next input datagram.
+    fn allow_input(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * INPUT_FLOOD_RATE_PER_SEC as f64)
+            .min(INPUT_FLOOD_BURST as f64);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
     let server_config = ServerConfig::builder()
@@ -357,9 +404,21 @@ fn broadcast_datagrams(
     broadcaster: broadcast::Sender<ClientDatagram>,
 ) -> tokio::task::JoinHandle<()> {
     spawn(async move {
+        // Input datagrams are flood-limited before the full parse + broadcast;
+        // control datagrams (keepalive, resize, keyframe, decoder caps, …)
+        // are always parsed and forwarded.
+        let mut flood = InputFloodGuard::new();
         loop {
             match time::timeout(KEEPALIVE_TIMEOUT, connection.receive_datagram()).await {
                 Ok(Ok(datagram)) => {
+                    // Cheap byte pre-filter: skip floods without paying for the
+                    // full `from_bytes` parse. Extra datagrams simply linger in
+                    // the (bounded) QUIC receive buffer until dropped.
+                    if datagram.first().is_some_and(|&b| is_input_byte(b))
+                        && !flood.allow_input()
+                    {
+                        continue;
+                    }
                     if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
                         let _ = broadcaster.send(datagram);
                     }
@@ -429,4 +488,66 @@ fn frame_forwarder(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn flood_guard_spends_its_burst_then_refuses() {
+        let mut guard = InputFloodGuard::new();
+        for _ in 0..INPUT_FLOOD_BURST {
+            assert!(guard.allow_input(), "burst tokens should be spendable");
+        }
+        // No time has elapsed: the bucket is empty, further input is refused.
+        assert!(!guard.allow_input());
+    }
+
+    #[test]
+    fn flood_guard_refills_to_the_burst_cap() {
+        let mut guard = InputFloodGuard::new();
+        for _ in 0..INPUT_FLOOD_BURST {
+            assert!(guard.allow_input());
+        }
+        assert!(!guard.allow_input());
+        // Pretend a full second passed: 4000 tokens refill, capped at the burst.
+        guard.last_refill -= Duration::from_secs(1);
+        let mut allowed = 0;
+        while guard.allow_input() {
+            allowed += 1;
+        }
+        assert_eq!(allowed, INPUT_FLOOD_BURST);
+    }
+
+    /// Sustained throughput tracks the refill rate, never the attempt rate:
+    /// attempting to spend faster than rate/2 over half a second yields
+    /// ~rate/2 accepted datagrams (plus whatever the drained burst still held
+    /// and a little wall-clock refill).
+    #[test]
+    fn flood_guard_limits_sustained_rate_over_time() {
+        let mut guard = InputFloodGuard::new();
+        for _ in 0..INPUT_FLOOD_BURST {
+            assert!(guard.allow_input());
+        }
+        // Simulate half a second in 0.25 ms steps, trying to spend on *every*
+        // step (far more than the refill provides).
+        let mut allowed = 0u32;
+        for _ in 0..2000 {
+            guard.last_refill -= Duration::from_micros(250);
+            if guard.allow_input() {
+                allowed += 1;
+            }
+        }
+        let expected = INPUT_FLOOD_RATE_PER_SEC / 2; // 2000 tokens over 500 ms
+        assert!(
+            allowed <= expected + INPUT_FLOOD_BURST + 16,
+            "must cap sustained input near the refill rate: allowed {allowed}, expected ~{expected}"
+        );
+        assert!(
+            allowed >= expected - 8,
+            "must track the refill rate under load: allowed {allowed}, expected ~{expected}"
+        );
+    }
 }

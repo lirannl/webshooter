@@ -1,4 +1,4 @@
-use crate::with_wt;
+use crate::throttle::send_input;
 use shared::client_datagram::{ClientDatagram, Modifiers};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -29,11 +29,7 @@ pub fn setup_keyboard(canvas: &HtmlCanvasElement) {
             keycode: e.code(),
             modifiers,
         };
-        let bytes = msg.to_bytes();
-        let buf = js_sys::Uint8Array::from(&bytes[..]);
-        with_wt(|gwt| {
-            let _ = gwt.writer.write_with_chunk(buf.as_ref());
-        });
+        send_input(msg);
     }) as Box<dyn FnMut(KeyboardEvent)>);
     let _ = canvas.add_event_listener_with_callback("keydown", keydown_cb.as_ref().unchecked_ref());
     keydown_cb.forget();
@@ -96,11 +92,7 @@ pub fn setup_touch(canvas: &HtmlCanvasElement) {
         }
         for (slot, x, y) in touches_vec {
             let msg = ClientDatagram::Touchscreen { index: slot, x, y };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_input(msg);
         }
     }) as Box<dyn FnMut(TouchEvent)>);
     let _ =
@@ -126,11 +118,7 @@ pub fn setup_touch(canvas: &HtmlCanvasElement) {
             // Also send individual releases for server slot cleanup
             for slot in release_vec {
                 let msg = ClientDatagram::TouchscreenRelease { index: slot };
-                let bytes = msg.to_bytes();
-                let buf = js_sys::Uint8Array::from(&bytes[..]);
-                with_wt(|gwt| {
-                    let _ = gwt.writer.write_with_chunk(buf.as_ref());
-                });
+                send_input(msg);
             }
         }
     }) as Box<dyn FnMut(TouchEvent)>);
@@ -269,11 +257,7 @@ pub fn setup_mouse(canvas: &HtmlCanvasElement, release_flag: Rc<Cell<bool>>) {
                 return;
             }
             let msg = ClientDatagram::MouseMove { dx, dy };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_input(msg);
         }) as Box<dyn FnMut(MouseEvent)>);
         let _ = canvas.add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref());
         cb.forget();
@@ -291,11 +275,7 @@ pub fn setup_mouse(canvas: &HtmlCanvasElement, release_flag: Rc<Cell<bool>>) {
                 button: e.button() as u8,
                 pressed: true,
             };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_input(msg);
         }) as Box<dyn FnMut(MouseEvent)>);
         let _ = canvas.add_event_listener_with_callback("mousedown", cb.as_ref().unchecked_ref());
         cb.forget();
@@ -311,11 +291,7 @@ pub fn setup_mouse(canvas: &HtmlCanvasElement, release_flag: Rc<Cell<bool>>) {
                 button: e.button() as u8,
                 pressed: false,
             };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_input(msg);
         }) as Box<dyn FnMut(MouseEvent)>);
         let _ = canvas.add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref());
         cb.forget();
@@ -340,11 +316,7 @@ pub fn setup_mouse(canvas: &HtmlCanvasElement, release_flag: Rc<Cell<bool>>) {
                 dx: (e.delta_x() * factor) as i32,
                 dy: (e.delta_y() * factor) as i32,
             };
-            let bytes = msg.to_bytes();
-            let buf = js_sys::Uint8Array::from(&bytes[..]);
-            with_wt(|gwt| {
-                let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            });
+            send_input(msg);
         }) as Box<dyn FnMut(web_sys::WheelEvent)>);
         let _ = canvas.add_event_listener_with_callback("wheel", cb.as_ref().unchecked_ref());
         cb.forget();

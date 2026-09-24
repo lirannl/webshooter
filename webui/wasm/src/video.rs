@@ -419,6 +419,10 @@ pub async fn render_loop(
                 }
                 continue;
             }
+            ServerDatagram::Throttle { interval_ms } => {
+                crate::throttle::set_throttle(interval_ms);
+                continue;
+            }
         }
 
         let (frame_id, frag_idx, num_frags, is_keyframe, codec, payload) = match msg {

@@ -2,6 +2,7 @@ use crate::codec::Codec;
 use anyhow::Result;
 use log::Level;
 use named_constants::named_constants;
+use std::collections::VecDeque;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,78 @@ pub fn gamepad_client_buttons_to_inputtino(mask: u32) -> u32 {
     set(&mut out, 17, 0x100000);
     set(&mut out, 18, 0x200000);
     out
+}
+
+/// True when the wire discriminant `byte` (the first byte of an encoded
+/// [`ClientDatagram`]) identifies an *input* event rather than control
+/// traffic. The server's receive pump uses this cheap byte check to apply
+/// flood limiting to input datagrams *before* spending CPU on the full parse.
+pub fn is_input_byte(byte: u8) -> bool {
+    matches!(
+        ClientDatagramVariants(byte),
+        ClientDatagramVariants::KEYBOARD
+            | ClientDatagramVariants::MOUSE_MOVE
+            | ClientDatagramVariants::MOUSE_BUTTON
+            | ClientDatagramVariants::SCROLL
+            | ClientDatagramVariants::TOUCHSCREEN
+            | ClientDatagramVariants::TOUCHSCREEN_RELEASE
+            | ClientDatagramVariants::GAMEPAD
+            | ClientDatagramVariants::GAMEPAD_DISCONNECT
+    )
+}
+
+/// Merge `msg` into the tail of a queue of pending input datagrams when
+/// plausible, collapsing consecutive same-kind events into one representative
+/// datagram so a throttled window keeps the newest state at a fraction of the
+/// event count:
+///
+/// - mouse motion and scroll deltas are summed (saturating), so no movement is
+///   lost across the window;
+/// - touch keeps the newest absolute position per slot;
+/// - gamepad keeps the newest full snapshot per controller;
+/// - everything else (keys, buttons, releases, …) is appended in arrival order.
+///
+/// Used by both the client (which throttles before sending) and the server
+/// (which enforces the throttle by discarding excess input). Inputs travel as
+/// WebTransport datagrams — unreliable, best-effort delivery — so collapsing
+/// them to the latest state is consistent with the transport's semantics.
+pub fn coalesce_input(queue: &mut VecDeque<ClientDatagram>, msg: ClientDatagram) {
+    match &msg {
+        ClientDatagram::MouseMove { dx, dy } => {
+            if let Some(ClientDatagram::MouseMove { dx: pdx, dy: pdy }) = queue.back_mut() {
+                *pdx = pdx.saturating_add(*dx);
+                *pdy = pdy.saturating_add(*dy);
+                return;
+            }
+        }
+        ClientDatagram::Scroll { dx, dy } => {
+            if let Some(ClientDatagram::Scroll { dx: pdx, dy: pdy }) = queue.back_mut() {
+                *pdx = pdx.saturating_add(*dx);
+                *pdy = pdy.saturating_add(*dy);
+                return;
+            }
+        }
+        ClientDatagram::Touchscreen { index, x, y } => {
+            if let Some(ClientDatagram::Touchscreen { index: pi, x: px, y: py }) = queue.back_mut()
+                && pi == index
+            {
+                *px = *x;
+                *py = *y;
+                return;
+            }
+        }
+        ClientDatagram::Gamepad { id, .. } => {
+            if let Some(ClientDatagram::Gamepad { id: pid, .. }) = queue.back_mut()
+                && pid == id
+            {
+                // Keep only the newest full snapshot for this controller.
+                *queue.back_mut().unwrap() = msg;
+                return;
+            }
+        }
+        _ => {}
+    }
+    queue.push_back(msg);
 }
 
 #[named_constants(preserve_original)]
@@ -307,62 +380,84 @@ impl ClientDatagram {
         }
     }
 
+    /// Parse a client datagram from its wire bytes.
+    ///
+    /// This is fed with data that arrives from the network (the WebTransport
+    /// datagram and uni-stream pumps), so it must never panic — not even on
+    /// truncated or malformed input. Every variant length-checks its fixed
+    /// fields first and returns `Err` instead of indexing out of bounds,
+    /// so a flood of garbage bytes can slow a session down but never tear a
+    /// pump task (and with it the whole session) down.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() {
             anyhow::bail!("Empty datagram");
         }
+        let data = &bytes[1..];
         Ok(match ClientDatagramVariants(bytes[0]) {
             ClientDatagramVariants::KEEP_ALIVE => Self::KeepAlive,
             ClientDatagramVariants::KEYBOARD => {
-                let modifiers = Modifiers::from_bits_truncate(bytes[1]);
-                let keycode = String::from_utf8_lossy(&bytes[2..]).into_owned();
-                Self::Keyboard { keycode, modifiers }
+                let Some((&modifier, key_bytes)) = data.split_first() else {
+                    anyhow::bail!("Keyboard datagram too short: {} bytes", bytes.len());
+                };
+                Self::Keyboard {
+                    keycode: String::from_utf8_lossy(key_bytes).into_owned(),
+                    modifiers: Modifiers::from_bits_truncate(modifier),
+                }
             }
             ClientDatagramVariants::RESIZE_DISPLAY => {
-                let index = bytes[1];
-                let width = u16::from_be_bytes([bytes[2], bytes[3]]);
-                let height = u16::from_be_bytes([bytes[4], bytes[5]]);
+                let [index, a, b, c, d] = data else {
+                    anyhow::bail!("ResizeDisplay datagram too short: {} bytes", bytes.len());
+                };
                 Self::ResizeDisplay {
-                    index,
-                    width,
-                    height,
+                    index: *index,
+                    width: u16::from_be_bytes([*a, *b]),
+                    height: u16::from_be_bytes([*c, *d]),
                 }
             }
             ClientDatagramVariants::TOUCHSCREEN => {
-                let x = u16::from_be_bytes([bytes[1], bytes[2]]);
-                let y = u16::from_be_bytes([bytes[3], bytes[4]]);
-                let index = bytes[5];
-                Self::Touchscreen { x, y, index }
+                let [a, b, c, d, index] = data else {
+                    anyhow::bail!("Touchscreen datagram too short: {} bytes", bytes.len());
+                };
+                Self::Touchscreen {
+                    x: u16::from_be_bytes([*a, *b]),
+                    y: u16::from_be_bytes([*c, *d]),
+                    index: *index,
+                }
             }
             ClientDatagramVariants::TOUCHSCREEN_RELEASE => {
-                let index = bytes[1];
-                Self::TouchscreenRelease { index }
+                let [index] = data else {
+                    anyhow::bail!("TouchscreenRelease datagram too short: {} bytes", bytes.len());
+                };
+                Self::TouchscreenRelease { index: *index }
             }
             ClientDatagramVariants::GAMEPAD => {
-                if bytes.len() < 19 {
+                if data.len() < 18 {
                     anyhow::bail!("Gamepad datagram too short: {} bytes", bytes.len());
                 }
-                let id = bytes[1];
-                let buttons = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                let lx = i16::from_be_bytes([bytes[6], bytes[7]]);
-                let ly = i16::from_be_bytes([bytes[8], bytes[9]]);
-                let rx = i16::from_be_bytes([bytes[10], bytes[11]]);
-                let ry = i16::from_be_bytes([bytes[12], bytes[13]]);
-                let lt = i16::from_be_bytes([bytes[14], bytes[15]]);
-                let rt = i16::from_be_bytes([bytes[16], bytes[17]]);
-                let motion = if bytes.len() >= 33 && bytes[18] != 0 {
+                let id = data[0];
+                let buttons = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+                let lx = i16::from_be_bytes([data[5], data[6]]);
+                let ly = i16::from_be_bytes([data[7], data[8]]);
+                let rx = i16::from_be_bytes([data[9], data[10]]);
+                let ry = i16::from_be_bytes([data[11], data[12]]);
+                let lt = i16::from_be_bytes([data[13], data[14]]);
+                let rt = i16::from_be_bytes([data[15], data[16]]);
+                let motion = if data[17] != 0 {
+                    let Some(body) = data.get(18..30) else {
+                        anyhow::bail!("Gamepad motion datagram too short: {} bytes", bytes.len());
+                    };
                     let accel_x =
-                        i16::from_be_bytes([bytes[19], bytes[20]]) as f64 / MOTION_ACCEL_SCALE;
+                        i16::from_be_bytes([body[0], body[1]]) as f64 / MOTION_ACCEL_SCALE;
                     let accel_y =
-                        i16::from_be_bytes([bytes[21], bytes[22]]) as f64 / MOTION_ACCEL_SCALE;
+                        i16::from_be_bytes([body[2], body[3]]) as f64 / MOTION_ACCEL_SCALE;
                     let accel_z =
-                        i16::from_be_bytes([bytes[23], bytes[24]]) as f64 / MOTION_ACCEL_SCALE;
+                        i16::from_be_bytes([body[4], body[5]]) as f64 / MOTION_ACCEL_SCALE;
                     let gyro_x =
-                        i16::from_be_bytes([bytes[25], bytes[26]]) as f64 / MOTION_GYRO_SCALE;
+                        i16::from_be_bytes([body[6], body[7]]) as f64 / MOTION_GYRO_SCALE;
                     let gyro_y =
-                        i16::from_be_bytes([bytes[27], bytes[28]]) as f64 / MOTION_GYRO_SCALE;
+                        i16::from_be_bytes([body[8], body[9]]) as f64 / MOTION_GYRO_SCALE;
                     let gyro_z =
-                        i16::from_be_bytes([bytes[29], bytes[30]]) as f64 / MOTION_GYRO_SCALE;
+                        i16::from_be_bytes([body[10], body[11]]) as f64 / MOTION_GYRO_SCALE;
                     Some(GamepadMotion {
                         accel_x: accel_x as f32,
                         accel_y: accel_y as f32,
@@ -387,50 +482,236 @@ impl ClientDatagram {
                 }
             }
             ClientDatagramVariants::GAMEPAD_DISCONNECT => {
-                let id = bytes[1];
-                Self::GamepadDisconnect { id }
+                let [id] = data else {
+                    anyhow::bail!("GamepadDisconnect datagram too short: {} bytes", bytes.len());
+                };
+                Self::GamepadDisconnect { id: *id }
             }
             ClientDatagramVariants::ERROR => {
-                if bytes.len() < 2 {
+                let Some((&level, message)) = data.split_first() else {
                     anyhow::bail!("Error datagram too short: {} bytes", bytes.len());
-                }
+                };
                 Self::Error {
-                    level: crate::log_level::level_from_byte(bytes[1])?,
-                    message: String::from_utf8_lossy(&bytes[2..]).into_owned(),
+                    level: crate::log_level::level_from_byte(level)?,
+                    message: String::from_utf8_lossy(message).into_owned(),
                 }
             }
             ClientDatagramVariants::DECODER_CAPABILITIES => {
-                let len = bytes[1] as usize;
-                let decoders = (0..len)
-                    .filter_map(|i| Codec::from_byte(bytes[2 + i]).ok())
+                let Some((&len, codecs)) = data.split_first() else {
+                    anyhow::bail!("DecoderCapabilities datagram too short: {} bytes", bytes.len());
+                };
+                if codecs.len() < len as usize {
+                    anyhow::bail!(
+                        "DecoderCapabilities datagram too short: {} codec bytes but {} declared",
+                        codecs.len(),
+                        len
+                    );
+                }
+                let decoders = codecs[..len as usize]
+                    .iter()
+                    .filter_map(|b| Codec::from_byte(*b).ok())
                     .collect();
                 Self::DecoderCapabilities { decoders }
             }
             ClientDatagramVariants::AUDIO_READY => {
-                if bytes.len() < 6 {
+                let [channels, a, b, c, d] = data else {
                     anyhow::bail!("AudioReady datagram too short: {} bytes", bytes.len());
+                };
+                Self::AudioReady {
+                    channels: *channels,
+                    rate: u32::from_be_bytes([*a, *b, *c, *d]),
                 }
-                let channels = bytes[1];
-                let rate = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                Self::AudioReady { channels, rate }
             }
             ClientDatagramVariants::MOUSE_MOVE => {
-                let dx = i16::from_be_bytes([bytes[1], bytes[2]]);
-                let dy = i16::from_be_bytes([bytes[3], bytes[4]]);
-                Self::MouseMove { dx, dy }
+                let [a, b, c, d] = data else {
+                    anyhow::bail!("MouseMove datagram too short: {} bytes", bytes.len());
+                };
+                Self::MouseMove {
+                    dx: i16::from_be_bytes([*a, *b]),
+                    dy: i16::from_be_bytes([*c, *d]),
+                }
             }
             ClientDatagramVariants::MOUSE_BUTTON => {
-                let button = bytes[1];
-                let pressed = bytes[2] != 0;
-                Self::MouseButton { button, pressed }
+                let [button, pressed] = data else {
+                    anyhow::bail!("MouseButton datagram too short: {} bytes", bytes.len());
+                };
+                Self::MouseButton {
+                    button: *button,
+                    pressed: *pressed != 0,
+                }
             }
             ClientDatagramVariants::SCROLL => {
-                let dx = i32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-                let dy = i32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
-                Self::Scroll { dx, dy }
+                let [a, b, c, d, e, f, g, h] = data else {
+                    anyhow::bail!("Scroll datagram too short: {} bytes", bytes.len());
+                };
+                Self::Scroll {
+                    dx: i32::from_be_bytes([*a, *b, *c, *d]),
+                    dy: i32::from_be_bytes([*e, *f, *g, *h]),
+                }
             }
             ClientDatagramVariants::REQUEST_KEYFRAME => Self::RequestKeyframe,
             n => anyhow::bail!("Invalid datagram discriminant: {}", n.0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::Codec;
+
+    fn sample_datagrams() -> Vec<ClientDatagram> {
+        vec![
+            ClientDatagram::KeepAlive,
+            ClientDatagram::Keyboard {
+                keycode: "KeyA".into(),
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            },
+            ClientDatagram::Keyboard {
+                keycode: String::new(),
+                modifiers: Modifiers::empty(),
+            },
+            ClientDatagram::ResizeDisplay {
+                index: 1,
+                width: 1920,
+                height: 1080,
+            },
+            ClientDatagram::Touchscreen {
+                index: 0,
+                x: 100,
+                y: 200,
+            },
+            ClientDatagram::TouchscreenRelease { index: 2 },
+            ClientDatagram::Gamepad {
+                id: 3,
+                buttons: 0xFFFF,
+                lx: -32768,
+                ly: 32767,
+                rx: 0,
+                ry: -1,
+                lt: 10,
+                rt: 20,
+                motion: None,
+            },
+            ClientDatagram::Gamepad {
+                id: 4,
+                buttons: 0,
+                lx: 0,
+                ly: 0,
+                rx: 0,
+                ry: 0,
+                lt: 0,
+                rt: 0,
+                motion: Some(GamepadMotion {
+                    accel_x: 1.0,
+                    accel_y: -2.0,
+                    accel_z: 3.0,
+                    gyro_x: 10.0,
+                    gyro_y: -20.0,
+                    gyro_z: 30.0,
+                }),
+            },
+            ClientDatagram::GamepadDisconnect { id: 7 },
+            ClientDatagram::Error {
+                level: log::Level::Warn,
+                message: "hello".into(),
+            },
+            ClientDatagram::DecoderCapabilities {
+                decoders: vec![Codec::Av1, Codec::H264, Codec::Vp9],
+            },
+            ClientDatagram::AudioReady {
+                channels: 2,
+                rate: 48000,
+            },
+            ClientDatagram::MouseMove { dx: 12, dy: -34 },
+            ClientDatagram::MouseButton {
+                button: 2,
+                pressed: true,
+            },
+            ClientDatagram::Scroll { dx: 100, dy: -200 },
+            ClientDatagram::RequestKeyframe,
+        ]
+    }
+
+    /// Every variant (with and without optional fields) round-trips.
+    #[test]
+    fn all_variants_round_trip() {
+        for dgram in sample_datagrams() {
+            let bytes = dgram.to_bytes();
+            assert_eq!(
+                ClientDatagram::from_bytes(&bytes).unwrap(),
+                dgram,
+                "round-trip failed for {dgram:?}"
+            );
+        }
+    }
+
+    /// Truncating any datagram — even right before a fixed-offset field read —
+    /// must yield `Err`, never a panic. This is a hard requirement because the
+    /// parser sits directly on the network receive path.
+    #[test]
+    fn truncated_datagrams_return_err_not_panic() {
+        for dgram in sample_datagrams() {
+            let bytes = dgram.to_bytes();
+            for cut in 0..bytes.len() {
+                let _ = ClientDatagram::from_bytes(&bytes[..cut]);
+            }
+        }
+    }
+
+    /// Garbage and unknown discriminants of every plausible length must never
+    /// panic either.
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        for disc in 0..=255u8 {
+            for len in 0..40usize {
+                let mut buf = vec![disc];
+                for i in 0..len {
+                    buf.push(i as u8 ^ disc);
+                }
+                let _ = ClientDatagram::from_bytes(&buf);
+            }
+        }
+    }
+
+    /// A `DecoderCapabilities` payload declaring more codecs than it carries
+    /// must fail, not read past the end.
+    #[test]
+    fn decoder_capabilities_checks_declared_len() {
+        let truncated = [ClientDatagramVariants::DECODER_CAPABILITIES.0, 5, 0, 1];
+        assert!(ClientDatagram::from_bytes(&truncated).is_err());
+    }
+
+    /// The byte-level classifier used by the receive pump agrees with the
+    /// variants it is meant to catch, for exactly the input datagrams.
+    #[test]
+    fn is_input_byte_matches_input_variants() {
+        for dgram in sample_datagrams() {
+            let bytes = dgram.to_bytes();
+            let expect_input = matches!(
+                dgram,
+                ClientDatagram::Keyboard { .. }
+                    | ClientDatagram::MouseMove { .. }
+                    | ClientDatagram::MouseButton { .. }
+                    | ClientDatagram::Scroll { .. }
+                    | ClientDatagram::Touchscreen { .. }
+                    | ClientDatagram::TouchscreenRelease { .. }
+                    | ClientDatagram::Gamepad { .. }
+                    | ClientDatagram::GamepadDisconnect { .. }
+            );
+            assert_eq!(
+                is_input_byte(bytes[0]),
+                expect_input,
+                "is_input_byte mismatch for {dgram:?}"
+            );
+        }
+    }
+
+    /// Unknown discriminants are never flagged as input.
+    #[test]
+    fn is_input_byte_rejects_unknown_discriminants() {
+        for disc in [0x0E, 0x0F, 0x7F, 0xFF] {
+            assert!(!is_input_byte(disc));
+        }
     }
 }

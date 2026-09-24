@@ -2,6 +2,7 @@ mod audio;
 mod gamepad;
 mod input;
 mod log;
+mod throttle;
 mod video;
 
 use js_sys::Uint8Array;
@@ -12,7 +13,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     HtmlDivElement, ReadableStreamDefaultReader, WebTransport, WebTransportDatagramDuplexStream,
-    WebTransportOptions, WritableStreamDefaultWriter,
+    WebTransportOptions, WritableStream, WritableStreamDefaultWriter,
 };
 
 use crate::log::init as init_log;
@@ -66,6 +67,38 @@ pub(crate) fn send_datagram(d: shared::client_datagram::ClientDatagram) {
     with_wt(|gwt| {
         let _ = gwt.writer.write_with_chunk(buf.as_ref());
     });
+}
+
+/// Send a [`ClientDatagram`] *reliably*, over a freshly opened unidirectional
+/// stream rather than a datagram. Datagrams are best-effort and can be silently
+/// dropped in transit; streams are ordered and delivered. Use this for state
+/// transitions whose loss would leave the server with a stale virtual device —
+/// most importantly `GamepadDisconnect`, which must always tear down the host's
+/// virtual controller. Returns `false` when the transport is gone or the send
+/// failed (the datagram path is unaffected by a failure here).
+pub(crate) async fn send_reliable(d: shared::client_datagram::ClientDatagram) -> bool {
+    let bytes = d.to_bytes();
+    let buf = Uint8Array::from(&bytes[..]);
+    let wt = match GLOBAL_WT.with(|cell| cell.borrow().as_ref().map(|g| g.wt.clone())) {
+        Some(wt) => wt,
+        None => return false,
+    };
+    let stream_promise = wt.create_unidirectional_stream();
+    let stream: WritableStream = match JsFuture::from(stream_promise).await {
+        Ok(v) => match v.dyn_into() {
+            Ok(s) => s,
+            Err(_) => return false,
+        },
+        Err(_) => return false,
+    };
+    let writer = match stream.get_writer() {
+        Ok(w) => w,
+        Err(_) => return false,
+    };
+    if JsFuture::from(writer.write_with_chunk(&JsValue::from(buf))).await.is_err() {
+        return false;
+    }
+    JsFuture::from(writer.close()).await.is_ok()
 }
 
 fn show_connection_lost() -> Option<()> {

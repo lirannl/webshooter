@@ -60,6 +60,15 @@ pub enum ServerDatagram {
         format: AudioFormat,
         payload: Vec<u8>,
     },
+    /// Asks the client to reduce its input event rate. `interval_ms` is the
+    /// minimum spacing the client must keep between consecutive input
+    /// datagrams (0 = no throttling). Sent by the server when its input
+    /// processing pipeline approaches saturation so it can shed load before
+    /// events start blocking or overflowing. The client keeps sending the
+    /// newest input state, just not more often than this interval.
+    Throttle {
+        interval_ms: u16,
+    },
 }
 
 impl ServerDatagram {
@@ -130,6 +139,12 @@ impl ServerDatagram {
                 buf.extend_from_slice(payload);
                 buf
             }
+            Self::Throttle { interval_ms } => {
+                let mut buf = Vec::with_capacity(3);
+                buf.push(ServerDatagramVariants::THROTTLE.0);
+                buf.extend_from_slice(&interval_ms.to_be_bytes());
+                buf
+            }
         }
     }
 
@@ -189,6 +204,13 @@ impl ServerDatagram {
                     format,
                     payload,
                 })
+            }
+            ServerDatagramVariants::THROTTLE => {
+                if bytes.len() < 3 {
+                    anyhow::bail!("Throttle datagram too short: {} bytes", bytes.len());
+                }
+                let interval_ms = u16::from_be_bytes([bytes[1], bytes[2]]);
+                Ok(Self::Throttle { interval_ms })
             }
             n => anyhow::bail!("Invalid server datagram discriminant: {}", n.0),
         }
