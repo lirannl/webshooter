@@ -74,6 +74,7 @@ web-sys = { workspace = true, features = [
     "Response",
     "Headers",
     "CloseEvent",
+    "Storage",
     "DomRect",
     "DomRectReadOnly",
     "HtmlButtonElement",

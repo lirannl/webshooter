@@ -1,11 +1,12 @@
 use crate::audio::AudioPlayer;
-use crate::with_wt;
+use crate::{PendingStreams, with_wt};
 use shared::client_datagram::ClientDatagram;
 use shared::codec::Codec;
 use shared::fragment::{FragmentFrame, PushOutcome};
+use shared::frame_gate::{FrameAction, FrameGate, HeldFrame};
 use shared::server_datagram::ServerDatagram;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -188,12 +189,70 @@ pub fn send_decoder_capabilities() -> Result<(), JsError> {
     Ok(())
 }
 
-/// Picture Loss Indication: tell the server a frame was lost so it can emit a
-/// fresh keyframe. Cheap — the WebTransport back-channel already exists, and
-/// it bounds corruption to a single round-trip instead of waiting for the
-/// next scheduled keyframe.
-fn send_request_keyframe() {
-    crate::send_datagram(ClientDatagram::RequestKeyframe);
+/// Picture Loss Indication: tell the server its prediction chain is broken.
+///
+/// Over a stream, and that is load-bearing rather than a nicety. The server
+/// never sends a keyframe on its own initiative, so this is the *only* thing
+/// that will produce one: a request lost in transit leaves the client holding
+/// frames until the session restarts, with nothing on screen to show for it.
+/// Datagrams can be dropped without either end noticing, which is exactly the
+/// failure this cannot tolerate.
+///
+/// The client decides how many keyframes it needs, by only asking when the gate
+/// has actually found a gap, and never asking again while a request is
+/// outstanding. A lossy link therefore asks again as soon as the previous
+/// keyframe lands — which is the useful behaviour, since the new keyframe is
+/// what the next loss will be measured against — while a clean link stops
+/// asking entirely.
+async fn send_request_keyframe() {
+    if !crate::send_reliable(ClientDatagram::RequestKeyframe).await {
+        // Nothing can be done about it from here: the transport is gone, and the
+        // session is about to end anyway. Say so, because the freeze it causes
+        // would otherwise be silent.
+        log::error!("keyframe request could not be sent; the display is stuck");
+    }
+}
+
+/// Ask the server to resend the fragments the gate says are missing.
+///
+/// The gate reports the *frame ids* that never assembled. For each of those the
+/// client's own pending map holds the frame with its empty slots, so the request
+/// can name the exact fragments — which is the difference between resending a
+/// few datagrams and asking for a keyframe.
+///
+/// Returns whether anything was actually requested, so the caller can fall back
+/// to a keyframe when the answer is "nothing": a gap the client cannot name a
+/// fragment for is a gap only a keyframe can close.
+async fn send_request_repair(
+    pending: &Rc<RefCell<HashMap<u16, PendingFrame>>>,
+    missing: &[u16],
+) -> bool {
+    let frames: Vec<(u16, Vec<u16>)> = {
+        let map = pending.borrow();
+        missing
+            .iter()
+            .filter_map(|id| {
+                map.get(id).map(|entry| (*id, entry.fragments.missing()))
+            })
+            // A frame the client cannot name a fragment for contributes nothing,
+            // and a request naming it would be a request the server cannot answer.
+            .filter(|(_, indices)| !indices.is_empty())
+            .collect()
+    };
+    if frames.is_empty() {
+        return false;
+    }
+    log::debug!("repair: asking for {} fragment(s) of {} frame(s)",
+        frames.iter().map(|(_, i)| i.len()).sum::<usize>(),
+        frames.len());
+    if !crate::send_reliable(ClientDatagram::ResendDeltas { frames }).await {
+        // The request is lost, which is the case the escalation deadline exists
+        // for: the gap is still open and the client will ask for a keyframe when
+        // it passes. Say so, because a silent failure here looks identical to a
+        // server that ignored the request.
+        log::error!("repair request could not be sent; the gap will escalate");
+    }
+    true
 }
 
 fn probe_codecs() -> Vec<Codec> {
@@ -224,20 +283,279 @@ fn probe_codecs() -> Vec<Codec> {
 
 struct PendingFrame {
     fragments: FragmentFrame,
-    is_keyframe: bool,
 }
 
 impl PendingFrame {
     fn new(num_frags: usize) -> Self {
         Self {
             fragments: FragmentFrame::new(num_frags),
-            is_keyframe: false,
         }
     }
 }
 
-fn u16_leq(a: u16, b: u16) -> bool {
-    ((b.wrapping_sub(a)) & 0xffff) < 0x8000
+/// Accumulate one fragment of a delta, yielding the frame once it is whole.
+///
+/// `None` means this fragment did not complete a frame, and in all three cases
+/// the right answer is the same: wait for the rest. The rest are still in
+/// flight, this one repeats something already held, or its index is impossible.
+fn assemble_delta(
+    pending: &Rc<RefCell<HashMap<u16, PendingFrame>>>,
+    frame_id: u16,
+    frag_idx: u16,
+    num_frags: u16,
+    payload: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let mut map = pending.borrow_mut();
+
+    // Drop fragments for frames we have already fully moved past. On a lossy
+    // link a fragment can arrive late (after its frame was already displayed);
+    // re-decoding a stale frame would feed the decoder garbage. Whether a frame
+    // is stale is decided later, by the gate, because it depends on whether the
+    // chain is waiting to be rebuilt — a keyframe that overtook its own deltas
+    // is behind, not stale.
+    let entry = map
+        .entry(frame_id)
+        .or_insert_with(|| PendingFrame::new(num_frags as usize));
+
+    // A fragment's declared fragment count must match the entry we are
+    // accumulating. A mismatch means a stale entry from a previous use of this
+    // frame_id (the u16 counter wrapped) collided with a new frame. Restart it
+    // cleanly instead of indexing out of bounds and aborting the entire stream.
+    if num_frags as usize != entry.fragments.num_frags() {
+        *entry = PendingFrame::new(num_frags as usize);
+    }
+
+    match entry.fragments.push(frag_idx as usize, payload) {
+        PushOutcome::OutOfRange => {
+            // Impossible fragment index (corrupt/truncated datagram). Drop the
+            // whole frame rather than panic on out-of-bounds access.
+            map.remove(&frame_id);
+            None
+        }
+        PushOutcome::Duplicate => None,
+        // Not all fragments arrived yet. A lost fragment here simply means this
+        // frame is skipped — frozen until the next keyframe — rather than
+        // crashing the stream.
+        PushOutcome::Incomplete => None,
+        PushOutcome::Complete(assembled) => Some(assembled),
+    }
+}
+
+/// The state a frame passes through on its way to the screen.
+///
+/// Bundled because the same four things are needed at every step, and because
+/// `gate` is the only one of them that is mutated — passing them together
+/// makes it obvious at each call site which of them this step may change.
+struct FramePath {
+    decoder: web_sys::VideoDecoder,
+    /// The codec the decoder is configured for, which is not the codec of the
+    /// frame being decoded: the decoder has to be reconfigured first.
+    current_codec: Rc<RefCell<Option<Codec>>>,
+    /// Ordering and loss policy; owns the prediction chain. See
+    /// `shared::frame_gate`.
+    gate: FrameGate,
+    /// Deltas still arriving a fragment at a time.
+    pending: Rc<RefCell<HashMap<u16, PendingFrame>>>,
+}
+
+/// Hand a whole frame to the ordering policy, and decode whatever it releases.
+///
+/// Returns whether anything was decoded. It is not when the gate drops the frame
+/// as stale, or holds it pending a gap that has not closed yet.
+async fn present(
+    path: &mut FramePath,
+    frame_id: u16,
+    is_keyframe: bool,
+    codec: Codec,
+    assembled: Vec<u8>,
+    repair_deadline: &mut Option<f64>,
+) -> bool {
+    // The frames the gate releases once the sequence is whole again; empty for
+    // every outcome except a keyframe landing or a repair closing a gap.
+    let mut replay: Vec<HeldFrame> = Vec::new();
+    // Whether this frame itself is decodable. It is not when the gate holds it.
+    let mut decode = false;
+    // The ids a gap named, when this frame is the first one behind it. Kept
+    // rather than acted on inside the block below, because answering a gap means
+    // reading the pending map — which the cleanup there is still borrowing.
+    let mut gap: Option<Vec<u16>> = None;
+    {
+        let mut map = path.pending.borrow_mut();
+
+        match path.gate.admit(frame_id, is_keyframe) {
+            FrameAction::Drop => return false,
+            FrameAction::Hold { request } => {
+                if request {
+                    // The missing ids are the whole diagnosis. A gap costs a
+                    // resend or a keyframe, and a keyframe is the most expensive
+                    // thing on the wire, so it is worth being able to say whether
+                    // these were never sent, lost, or dropped after arriving.
+                    log::debug!("gap after {frame_id}: missing {:?}", path.gate.missing());
+                    gap = Some(path.gate.missing().to_vec());
+                }
+            }
+            FrameAction::Resync { held } => {
+                replay = held;
+                decode = true;
+            }
+            FrameAction::Decode => decode = true,
+        }
+
+        // Every frame we have moved past is finished with; its leftovers
+        // (fragments of a delta that will never complete) would otherwise sit
+        // in the map forever. Compared in circular order so the u16 wraparound
+        // at frame_id 65535 is handled correctly.
+        //
+        // Two kinds of frame behind us are the exception, and both are here for
+        // the same reason: their partial fragments are the only thing that can
+        // complete them. A frame the gap named is waiting to have its missing
+        // fragments requested; a frame already named in a request is waiting for
+        // them to come back. Dropping either turns a repairable gap into an
+        // unrepairable one — and the first of them is destroyed by this cleanup
+        // before the request that would name it has even been built.
+        let gap_ids: &[u16] = gap.as_deref().unwrap_or(&[]);
+        let keys: Vec<u16> = map.keys().copied().collect();
+        for id in keys {
+            if frame_id.wrapping_sub(id) < 0x8000
+                && !path.gate.is_awaiting(id)
+                && !gap_ids.contains(&id)
+            {
+                map.remove(&id);
+            }
+        }
+    }
+
+    // Answered outside the block above, because it reads the pending map and the
+    // cleanup that just ran is what makes that read meaningful.
+    if let Some(missing) = gap {
+        // Prefer a resend. It names the exact fragments, so it costs a few
+        // datagrams where a keyframe costs tens of packets, and it puts the lost
+        // frame back where it belongs — so the frames between the loss and a
+        // keyframe stay decodable instead of being discarded.
+        if send_request_repair(&path.pending, &missing).await {
+            path.gate.expect_repair(&missing);
+            *repair_deadline = Some(now_ms() + REPAIR_TIMEOUT_MS);
+        } else {
+            // Nothing to name a fragment for: the frames were never sent, or
+            // their fragments are already gone. Only a keyframe closes this.
+            send_request_keyframe().await;
+        }
+    }
+
+    // The two are mutually exclusive by construction — a frame the gate decodes
+    // is not one it holds — and written as branches so each moves `assembled` on
+    // exactly one path. Holding a frame can be what closes the gap, so the run it
+    // releases comes back here rather than from `admit`.
+    if decode {
+        configure_decoder(&path.decoder, &path.current_codec, codec);
+        decode_frame(&path.decoder, frame_id, &assembled, is_keyframe);
+    } else {
+        replay = path.gate.hold(frame_id, codec, assembled);
+    }
+    // The frames that were waiting for exactly this point in the sequence, in
+    // frame order. They are decoded only after the frame they are predicted
+    // from, which is why a keyframe's own decode comes first.
+    let released = replay.len();
+    for frame in replay {
+        configure_decoder(&path.decoder, &path.current_codec, frame.codec);
+        decode_frame(&path.decoder, frame.frame_id, &frame.payload, false);
+    }
+    decode || released > 0
+}
+
+/// The monotonic clock in milliseconds, for the repair deadline.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+/// How long a client waits for a resend before asking for a keyframe instead.
+///
+/// The resend needs two round trips — one for the request, one for the fragments —
+/// so this has to be at least that, and at the 28 ms round trip this project was
+/// measured on, 100 ms is about three and a half. It is still well short of the
+/// keyframe path it falls back to, which is a request round trip plus an encode
+/// plus a transfer of tens of packets.
+///
+/// The trade is deliberate and worth stating: a repair that is itself lost costs
+/// this much latency before the fallback begins, where asking for a keyframe
+/// immediately would not. It is accepted because the common case — a repair that
+/// arrives — is both faster and far cheaper, and because the alternative pays the
+/// keyframe cost on every single gap rather than on the rare lost repair.
+const REPAIR_TIMEOUT_MS: f64 = 100.0;
+
+/// The next message from the server, in the order the server sent it.
+///
+/// A keyframe and the delta frames the server sent *after* it are not ordered
+/// against each other — they travel on different transports, read concurrently —
+/// yet those deltas are inter-predicted *from* the keyframe, so decoding one
+/// first would leave every frame after it applying to the wrong reference. A
+/// stream therefore always wins, including over a datagram that landed while its
+/// read was outstanding: such a datagram belongs behind the keyframe and is
+/// parked in `deferred` until the stream has been drained.
+///
+/// That covers every datagram that arrives once the keyframe's stream is
+/// visible. One can still overtake it — a delta datagram leaves the server
+/// while a multi-megabyte keyframe is still being written — and the frame ids
+/// are what catch it: [`shared::frame_gate::FrameGate`] spots the gap, holds the
+/// deltas, and releases them once the keyframe that overtook them is decoded.
+///
+/// Returns `Ok(None)` for a message that could not be parsed, which the caller
+/// skips, and `Err` once the transport is gone and the render loop must stop.
+///
+/// `drained` reports whether any server stream has been drained yet, so the
+/// first one crossing can be reported: the split transport is only working if a
+/// keyframe arrives here, and nothing else in the pipeline distinguishes "the
+/// server never sent one" from "it was sent and never read".
+async fn next_message(
+    streams: &PendingStreams,
+    deferred: &mut Option<ServerDatagram>,
+    drained: &Cell<bool>,
+) -> Result<Option<ServerDatagram>, JsValue> {
+    loop {
+        // Taken in its own statement: the borrow must be released before the
+        // drain below awaits, or the acceptor task cannot queue the next
+        // stream while this one is being read.
+        let next_stream = streams.borrow_mut().pop_front();
+        if let Some(stream) = next_stream {
+            // Drained here rather than by the acceptor so the ordering above
+            // holds: the deltas racing to overtake this keyframe stay unread
+            // until it has been decoded.
+            let bytes = match crate::read_to_end(stream).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    // A stream that dies mid-transfer takes its keyframe with
+                    // it; the next one, or a loss, resynchronises us.
+                    log::warn!("server stream read failed: {err:?}");
+                    continue;
+                }
+            };
+            if !drained.replace(true) {
+                log::info!("first server stream drained ({} bytes)", bytes.len());
+            } else {
+                log::debug!("server stream drained ({} bytes)", bytes.len());
+            }
+            if let Ok(msg) = ServerDatagram::from_bytes(&bytes) {
+                return Ok(Some(msg));
+            }
+            log::warn!("unparsable server stream, ignored");
+            continue;
+        }
+        if let Some(msg) = deferred.take() {
+            return Ok(Some(msg));
+        }
+        let data = read_datagram().await?;
+        let msg = ServerDatagram::from_bytes(&data);
+        if !streams.borrow().is_empty() {
+            // A keyframe this datagram is predicted from was accepted while the
+            // read was outstanding, so it has to be decoded first.
+            *deferred = msg.ok();
+            continue;
+        }
+        return Ok(msg.ok());
+    }
 }
 
 /// Read the next datagram off the WebTransport (unreliable datagram) stream
@@ -281,6 +599,50 @@ async fn read_datagram() -> Result<Vec<u8>, JsValue> {
 }
 
 // ---------------------------------------------------------------------------
+// Decoding
+// ---------------------------------------------------------------------------
+
+/// Point the decoder at `codec`, reconfiguring only when the codec actually
+/// changed: `configure` drops every chunk already queued, so calling it for
+/// every frame would itself throw frames away.
+fn configure_decoder(
+    decoder: &web_sys::VideoDecoder,
+    current: &RefCell<Option<Codec>>,
+    codec: Codec,
+) {
+    let mut current = current.borrow_mut();
+    if *current == Some(codec) {
+        return;
+    }
+    log::info!("codec changed: {current:?} -> {codec:?}");
+    let config = js_sys::Object::new();
+    js_sys::Reflect::set(&config, &"codec".into(), &codec.web_codec_string().into()).ok();
+    js_sys::Reflect::set(&config, &"optimizeForLatency".into(), &JsValue::TRUE).ok();
+    decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
+    *current = Some(codec);
+}
+
+/// Hand one assembled frame to the decoder, typed as a key or a delta.
+fn decode_frame(decoder: &web_sys::VideoDecoder, frame_id: u16, payload: &[u8], is_keyframe: bool) {
+    let chunk_init = js_sys::Object::new();
+    let chunk_type = if is_keyframe { "key" } else { "delta" };
+    js_sys::Reflect::set(&chunk_init, &"type".into(), &JsValue::from_str(chunk_type)).ok();
+    js_sys::Reflect::set(
+        &chunk_init,
+        &"timestamp".into(),
+        &JsValue::from_f64((frame_id as u64 * 1000) as f64),
+    )
+    .ok();
+    let data_arr = js_sys::Uint8Array::from(payload);
+    js_sys::Reflect::set(&chunk_init, &"data".into(), &data_arr).ok();
+
+    match EncodedVideoChunk::new(chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>()) {
+        Ok(chunk) => decoder.decode(&chunk),
+        Err(e) => log::error!("EncodedVideoChunk creation failed: {e:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Render loop
 // ---------------------------------------------------------------------------
 
@@ -288,6 +650,7 @@ pub async fn render_loop(
     canvas: &HtmlCanvasElement,
     release_flag: Rc<Cell<bool>>,
     pending_fullscreen: Rc<Cell<bool>>,
+    streams: PendingStreams,
 ) -> Result<(), JsValue> {
     let canvas = canvas.clone();
     let ctx = canvas
@@ -333,20 +696,23 @@ pub async fn render_loop(
         }
     };
 
-    // Decoder is configured on first frame (or when codec changes).
-    let current_codec: Rc<RefCell<Option<Codec>>> = Rc::new(RefCell::new(None));
-
-    let pending: Rc<RefCell<HashMap<u16, PendingFrame>>> = Rc::new(RefCell::new(HashMap::new()));
-
-    // Loss-tracking state for packet-loss resilience. We detect a lost frame
-    // by positive evidence (a later frame_id assembled while an earlier one
-    // was never seen) rather than a timeout, so no extra latency is added in
-    // the steady state. On loss we ask the server for a keyframe (PLI) and
-    // stop feeding delta frames to the decoder until one arrives — otherwise
-    // the dropped frame poisons every subsequent inter-predicted frame.
-    let seen: Rc<RefCell<HashSet<u16>>> = Rc::new(RefCell::new(HashSet::new()));
-    let last_assembled: Rc<Cell<Option<u16>>> = Rc::new(Cell::new(None));
-    let waiting_for_keyframe: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Ordering and loss policy, which is what makes a keyframe travelling on
+    // its own stream safe to interleave with delta frames travelling as
+    // datagrams: the two are not ordered against each other, so a delta
+    // inter-predicted from a keyframe can reach us first. Loss is detected by
+    // positive evidence (a later frame_id assembled while an earlier one was
+    // never seen) rather than a timeout, so no latency is added in the steady
+    // state; on loss the server is asked for a keyframe (PLI) and the frames
+    // behind the gap are held until it arrives, instead of poisoning the
+    // prediction chain. See `shared::frame_gate`.
+    let mut path = FramePath {
+        decoder,
+        // The decoder is configured on the first frame, or whenever the codec
+        // changes.
+        current_codec: Rc::new(RefCell::new(None)),
+        gate: FrameGate::default(),
+        pending: Rc::new(RefCell::new(HashMap::new())),
+    };
 
     // Audio player: decodes the Opus frames we receive and plays them through
     // the (user-gesture-resumed) AudioContext. `None` if the browser lacks an
@@ -356,16 +722,54 @@ pub async fn render_loop(
         log::error!("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
     }
 
-    loop {
-        let data = match read_datagram().await {
-            Ok(data) => data,
-            Err(e) => return Err(e),
-        };
+    // A datagram held back because a keyframe the server opened was still
+    // being drained; see `next_message`.
+    let mut deferred: Option<ServerDatagram> = None;
+    // Whether a server stream has ever been drained; see `next_message`.
+    let drained = Cell::new(false);
+    // When the outstanding repair was requested, and `None` when there is none.
+    //
+    // Checked on every message rather than on a timer, because the loop only
+    // runs when the server is sending: a deadline that is never reached is
+    // reached exactly when the next frame arrives, and a server that has gone
+    // quiet has no gaps left to escalate. See `REPAIR_TIMEOUT_MS`.
+    let mut repair_deadline: Option<f64> = None;
 
-        let msg = match ServerDatagram::from_bytes(&data) {
-            Ok(m) => m,
-            Err(_) => continue,
+    // How many messages to work through before yielding to the event loop. When
+    // the server is sending faster than we can decode, every read resolves from
+    // the queue without suspending, and the loop would run for as long as the
+    // backlog lasts without the keepalive timer ever getting a turn. See
+    // `crate::yield_to_event_loop`.
+    const MESSAGES_PER_YIELD: u32 = 32;
+    let mut since_yield: u32 = 0;
+
+    loop {
+        if since_yield >= MESSAGES_PER_YIELD {
+            since_yield = 0;
+            crate::yield_to_event_loop().await;
+        }
+        // A keyframe only ever arrives on its own stream, as one whole message
+        // that is a distinct message type, so which frame of a split delta this
+        // completes is decided by the variant rather than by a flag.
+        let Some(msg) = next_message(&streams, &mut deferred, &drained).await? else {
+            continue;
         };
+        since_yield += 1;
+
+        // A repair that has not come back by now is not coming back: the request
+        // was lost, or the resend was, or the frame is one the server no longer
+        // holds. Asking for a keyframe is the only thing that closes a gap a
+        // resend cannot, and waiting longer would cost more than the keyframe
+        // would have.
+        if let Some(deadline) = repair_deadline
+            && now_ms() >= deadline
+        {
+            repair_deadline = None;
+            if path.gate.awaiting_repair() {
+                log::debug!("repair deadline passed; asking for a keyframe");
+                send_request_keyframe().await;
+            }
+        }
 
         match msg {
             ServerDatagram::AudioFrame {
@@ -410,177 +814,47 @@ pub async fn render_loop(
                 crate::throttle::set_throttle(interval_ms);
                 continue;
             }
-            ServerDatagram::VideoFrame {
+            ServerDatagram::VideoKeyFrame {
                 frame_id,
-                frag_idx,
-                num_frags,
-                is_keyframe,
                 codec,
                 payload,
             } => {
-                let (entry_is_keyframe, assembled) = {
-                    let mut map = pending.borrow_mut();
-
-                    // Drop fragments for frames we have already fully moved
-                    // past. On a lossy link a fragment can arrive late (after
-                    // its frame was already displayed); re-decoding a stale
-                    // frame would feed the decoder garbage. Compared in
-                    // circular order so the u16 wraparound at frame_id 65535
-                    // is handled correctly.
-                    if let Some(last) = last_assembled.get() {
-                        if u16_leq(frame_id, last) {
-                            continue;
-                        }
-                    }
-
-                    let entry = map
-                        .entry(frame_id)
-                        .or_insert_with(|| PendingFrame::new(num_frags as usize));
-
-                    // A fragment's declared fragment count must match the
-                    // entry we are accumulating. A mismatch means a stale entry
-                    // from a previous use of this frame_id (the u16 counter
-                    // wrapped) collided with a new frame. Restart it cleanly
-                    // instead of indexing out of bounds and aborting the
-                    // entire stream.
-                    if num_frags as usize != entry.fragments.num_frags() {
-                        *entry = PendingFrame::new(num_frags as usize);
-                    }
-
-                    let assembled = match entry.fragments.push(frag_idx as usize, payload) {
-                        PushOutcome::OutOfRange => {
-                            // Impossible fragment index (corrupt/truncated
-                            // datagram). Drop the whole frame rather than
-                            // panic on out-of-bounds access.
-                            map.remove(&frame_id);
-                            continue;
-                        }
-                        PushOutcome::Duplicate => continue,
-                        PushOutcome::Incomplete => {
-                            if is_keyframe {
-                                entry.is_keyframe = true;
-                            }
-                            // Not all fragments arrived yet — wait for the
-                            // rest. A lost fragment here simply means this
-                            // frame is skipped (frozen until the next
-                            // keyframe) rather than crashing the stream.
-                            seen.borrow_mut().insert(frame_id);
-                            continue;
-                        }
-                        PushOutcome::Complete(assembled) => {
-                            if is_keyframe {
-                                entry.is_keyframe = true;
-                            }
-                            assembled
-                        }
-                    };
-
-                    seen.borrow_mut().insert(frame_id);
-                    let is_keyframe = entry.is_keyframe;
-
-                    // --- Loss detection (packet-loss resilience) ---------
-                    // A frame is lost when a later frame_id assembles but an
-                    // earlier one was never observed. Detecting by positive
-                    // evidence (rather than a timeout) keeps steady-state
-                    // latency at zero. On loss we request a keyframe and stop
-                    // decoding deltas until it arrives, so a single dropped
-                    // frame can't poison the prediction chain.
-                    if is_keyframe {
-                        // Fresh keyframe: resynced, reset all loss state.
-                        waiting_for_keyframe.set(false);
-                        seen.borrow_mut().clear();
-                        seen.borrow_mut().insert(frame_id);
-                        last_assembled.set(Some(frame_id));
-                    } else if let Some(l) = last_assembled.get() {
-                        let diff = frame_id.wrapping_sub(l);
-                        // Only consider a forward gap (diff in [1, 0x8000));
-                        // equal or out-of-order frames are not loss evidence.
-                        if diff != 0 && diff < 0x8000 {
-                            let lost = (1..diff)
-                                .any(|g| !seen.borrow().contains(&l.wrapping_add(g)));
-                            if lost && !waiting_for_keyframe.get() {
-                                send_request_keyframe();
-                                waiting_for_keyframe.set(true);
-                            }
-                        }
-                        last_assembled.set(Some(frame_id));
-                        seen.borrow_mut().insert(frame_id);
-                    } else {
-                        // First frame is a delta: nothing to predict from,
-                        // request a keyframe to establish a clean reference.
-                        if !waiting_for_keyframe.get() {
-                            send_request_keyframe();
-                            waiting_for_keyframe.set(true);
-                        }
-                        last_assembled.set(Some(frame_id));
-                        seen.borrow_mut().insert(frame_id);
-                    }
-
-                    let keys: Vec<u16> = map.keys().copied().collect();
-                    for id in keys {
-                        if u16_leq(id, frame_id) {
-                            map.remove(&id);
-                        }
-                    }
-
-                    (is_keyframe, assembled)
-                };
-
-                // Reconfigure the decoder if the codec changed.
-                {
-                    let mut cur = current_codec.borrow_mut();
-                    if *cur != Some(codec) {
-                        log::info!("codec changed: {cur:?} -> {codec:?}");
-                        let config = js_sys::Object::new();
-                        js_sys::Reflect::set(
-                            &config,
-                            &"codec".into(),
-                            &codec.web_codec_string().into(),
-                        )
-                        .ok();
-                        js_sys::Reflect::set(
-                            &config,
-                            &"optimizeForLatency".into(),
-                            &JsValue::TRUE,
-                        )
-                        .ok();
-                        decoder.configure(config.unchecked_ref::<web_sys::VideoDecoderConfig>());
-                        *cur = Some(codec);
-                    }
-                }
-
-                let chunk_init = js_sys::Object::new();
-                let chunk_type = if entry_is_keyframe {
-                    JsValue::from_str("key")
-                } else {
-                    JsValue::from_str("delta")
-                };
-                js_sys::Reflect::set(&chunk_init, &"type".into(), &chunk_type).ok();
-                js_sys::Reflect::set(
-                    &chunk_init,
-                    &"timestamp".into(),
-                    &JsValue::from_f64((frame_id as u64 * 1000) as f64),
+                // Already the whole frame. The variant has no fragment fields, so
+                // there is nothing to reassemble and no way for half of one to
+                // go missing.
+                present(
+                    &mut path,
+                    frame_id,
+                    /* is_keyframe = */ true,
+                    codec,
+                    payload,
+                    &mut repair_deadline,
                 )
-                .ok();
-                let data_arr = js_sys::Uint8Array::from(&assembled[..]);
-                js_sys::Reflect::set(&chunk_init, &"data".into(), &data_arr).ok();
-
-                let chunk = EncodedVideoChunk::new(
-                    chunk_init.unchecked_ref::<web_sys::EncodedVideoChunkInit>(),
-                );
-                match chunk {
-                    Ok(chunk) => {
-                        // While waiting for a keyframe to resync, every delta
-                        // frame still references the lost one — decoding it
-                        // would just reproduce corruption, so discard it.
-                        if !(waiting_for_keyframe.get() && !entry_is_keyframe) {
-                            decoder.decode(&chunk);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("EncodedVideoChunk creation failed: {e:?}");
-                    }
-                }
+                .await;
+            }
+            ServerDatagram::VideoDelta {
+                frame_id,
+                frag_idx,
+                num_frags,
+                codec,
+                payload,
+            } => {
+                // Split across as many datagrams as it needed; whole only once
+                // the last fragment lands.
+                let Some(assembled) =
+                    assemble_delta(&path.pending, frame_id, frag_idx, num_frags, payload)
+                else {
+                    continue;
+                };
+                present(
+                    &mut path,
+                    frame_id,
+                    /* is_keyframe = */ false,
+                    codec,
+                    assembled,
+                    &mut repair_deadline,
+                )
+                .await;
             }
         }
     }

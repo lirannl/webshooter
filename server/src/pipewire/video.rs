@@ -26,12 +26,13 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tokio::{
     spawn,
-    sync::{broadcast::Receiver, mpsc},
+    sync::{broadcast::error::RecvError, broadcast::Receiver, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -223,9 +224,25 @@ async fn single_capture(
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
                     msg = client_rx.recv() => match msg {
-                        Ok(ClientDatagram::ResizeDisplay { width, height, index }) => break (width, height, index),
+                        Ok(ClientDatagram::ResizeDisplay { width, height, index }) => {
+                            // A resize is not a cheap message: the loop below closes
+                            // the portal session and rebuilds the entire pipeline,
+                            // encoder included, and a new encoder's first frame owes
+                            // the client a keyframe it has to ask for. Every
+                            // address-bar collapse or keyboard toggle on a phone
+                            // triggers one, so it is worth being able to see.
+                            log::info!("resize: rebuilding capture at {width}x{height}");
+                            break (width, height, index);
+                        }
                         Ok(_) => continue,
-                        Err(_) => return Ok(()),
+                        // Falling behind the bus is expected here, not fatal: the
+                        // client keeps its 50 ms keepalive running while the
+                        // portal dialog is up, so a slow human decision
+                        // overflows the channel on its own. The resize being
+                        // waited for has not been lost — it is a state message
+                        // the client resends on the next one.
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => return Ok(()),
                     },
                 }
             },
@@ -319,7 +336,14 @@ async fn single_capture(
         println!("[video] selected codec: {codec:?} (client decoders: {decoders:?})");
 
         gst::init()?;
-        let bitrate = 7000;
+        // The link this runs on measures about 7 Mbit/s, and a keyframe is
+        // 25-30x a delta. At 7 Mbit/s of video there is no headroom for one:
+        // a 67 KB keyframe is a 77 ms freeze, and the deltas produced behind
+        // it push the total past what the link carries, so the keyframe itself
+        // is what loses the frames that ask for the next one. The ceiling is
+        // set below the link's capacity so a keyframe fits inside the space
+        // the deltas leave, which is the only thing that breaks the loop.
+        let bitrate = 4000;
         let pipeline = gst::parse::launch(&format!(
             "pipewiresrc fd={raw_fd} path={node_id} \
          ! videoconvert \
@@ -330,10 +354,13 @@ async fn single_capture(
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("not a pipeline"))?;
 
-        // Force a keyframe on demand (PLI) or on a fixed interval so that a
-        // single dropped frame cannot poison the inter-frame prediction chain
-        // indefinitely. Packet loss turns into a bounded clean resync rather
-        // than progressive corruption.
+        // Keyframes are produced only when the client asks for one. The client is
+        // the only party that knows whether its prediction chain is broken, and a
+        // keyframe is the most expensive thing on the link by a wide margin
+        // (measured ~72 KB against ~16 KB for a delta), so a schedule the server
+        // picks for itself spends the link on frames nobody needs — and a
+        // periodic one guarantees the client pays for a burst of them every
+        // period, right when the link is already struggling.
         let encoder = pipeline
             .by_name("enc")
             .ok_or(anyhow!("no encoder element"))?;
@@ -342,9 +369,6 @@ async fn single_capture(
             let encoder = encoder.clone();
             let cancel = cancel.clone();
             spawn(async move {
-                // Bound corruption duration even if no PLI arrives.
-                let mut interval = tokio::time::interval(Duration::from_secs(2));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         biased;
@@ -352,9 +376,15 @@ async fn single_capture(
                         msg = keyframe_rx.recv() => match msg {
                             Ok(ClientDatagram::RequestKeyframe) => force_keyframe(&encoder),
                             Ok(_) => continue,
-                            Err(_) => break,
+                            // The request may be in the messages this receiver just
+                            // missed, and the client cannot recover on its own: it
+                            // is holding frames waiting for a keyframe that nothing
+                            // is going to send, so the display stays frozen until
+                            // the session restarts. A keyframe nobody asked for is
+                            // cheap next to that, so err towards sending one.
+                            Err(RecvError::Lagged(_)) => force_keyframe(&encoder),
+                            Err(RecvError::Closed) => break,
                         },
-                        _ = interval.tick() => force_keyframe(&encoder),
                     }
                 }
             });
@@ -507,13 +537,18 @@ async fn single_capture(
                     break Some((width, height, index));
                 },
                 msg = client_rx.recv() => match msg {
-                    Ok(ClientDatagram::ResizeDisplay { width, height, .. }) =>
-                        break Some((width, height, index)),
+                    Ok(ClientDatagram::ResizeDisplay { width, height, .. }) => {
+                        log::info!("resize: rebuilding capture at {width}x{height}");
+                        break Some((width, height, index));
+                    }
                     Ok(ClientDatagram::Keyboard { keycode: _, modifiers: _ }) => {
                         // Handled by the EIS input task in touch.rs
                     }
                     Ok(_) => continue,
-                    Err(_) => break None,
+                    // A stalled consumer is not a lost session: keep the
+                    // pipeline up and wait for the next resize, as above.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break None,
                 },
             }
         };
@@ -555,10 +590,18 @@ fn sized_stream(width: &u16, height: &u16) -> impl Fn(&&Stream) -> bool {
 
 /// Ask the encoder to produce a keyframe as soon as possible. We send a
 /// standard `GstForceKeyUnit` downstream event, which every GStreamer video
-/// encoder recognises. This is how the server answers a client's PLI and how
-/// it enforces a periodic keyframe interval to bound corruption from packet
-/// loss — no bitstream-specific logic required.
+/// encoder recognises. This is the only way a keyframe is produced: the server
+/// never schedules one, so a keyframe means some client asked for it.
+///
+/// The running count is reported because the rate is the whole story on a
+/// constrained link — a keyframe costs several times a delta, so keyframes per
+/// second is what decides whether the link keeps up. Nothing else in the log
+/// shows it: the client asks over a stream that looks like any other, and the
+/// frames themselves are indistinguishable once they reach the forwarder.
 fn force_keyframe(encoder: &gst::Element) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    log::debug!("keyframe {n} forced on client request");
     let structure = gst::Structure::new_empty("GstForceKeyUnit");
     let event = gst::event::CustomDownstream::new(structure);
     let _ = encoder.send_event(event);

@@ -3,8 +3,13 @@ use log::LevelFilter;
 use anyhow::Result;
 use named_constants::named_constants;
 
-/// 1 discriminant + 3×u16 frame metadata + 1 is_keyframe + 1 codec.
-const HEADER: usize = 1 + 3 * size_of::<u16>() + 1 + 1;
+/// 1 discriminant + 1×u16 frame id + 1 codec. A keyframe is never fragmented,
+/// so it carries no fragment fields at all.
+const KEY_FRAME_HEADER: usize = 1 + size_of::<u16>() + 1;
+
+/// 1 discriminant + 3×u16 frame metadata (id, fragment index, fragment count)
+/// + 1 codec. The largest video header, so it is what bounds a datagram payload.
+const DELTA_HEADER: usize = 1 + 3 * size_of::<u16>() + 1;
 
 /// 1 discriminant + 3×u16 frame metadata + 1 channels + 1 rate (u32) + 1 format.
 const AUDIO_HEADER: usize = 1 + 3 * size_of::<u16>() + 1 + size_of::<u32>() + 1;
@@ -39,11 +44,18 @@ impl AudioFormat {
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerDatagram {
-    VideoFrame {
+    /// A complete keyframe, on its own unidirectional stream.
+    ///
+    /// Split from [`Self::VideoDelta`] rather than sharing one variant with an
+    /// `is_keyframe` flag so that being a keyframe is a property of the type
+    /// instead of a field someone has to remember to set. A keyframe is the one
+    /// frame the client cannot decode without, so it is the one frame that must
+    /// never be dropped — and it must never be split, because a fragment lost in
+    /// transit would leave the client with no reference at all. Having no
+    /// `frag_idx`/`num_frags` here makes that unrepresentable rather than a
+    /// convention.
+    VideoKeyFrame {
         frame_id: u16,
-        frag_idx: u16,
-        num_frags: u16,
-        is_keyframe: bool,
         codec: Codec,
         payload: Vec<u8>,
     },
@@ -72,25 +84,47 @@ pub enum ServerDatagram {
     Throttle {
         interval_ms: u16,
     },
-}
-
-impl ServerDatagram {
-    /// Serialize a video frame directly from an already-encoded payload slice,
-    /// avoiding an intermediate `Vec<u8>` allocation per fragment.
-    pub fn video_frame_to_bytes(
+    /// A delta frame, split across as many datagrams as it needs.
+    ///
+    /// Declared last on purpose: the discriminant is its position, so a variant
+    /// inserted above this one would silently renumber every message after it
+    /// and change the wire format of things this has nothing to do with.
+    VideoDelta {
         frame_id: u16,
         frag_idx: u16,
         num_frags: u16,
-        is_keyframe: bool,
+        codec: Codec,
+        payload: Vec<u8>,
+    },
+}
+
+impl ServerDatagram {
+    /// Serialize a whole keyframe from an already-encoded payload slice,
+    /// avoiding an intermediate `Vec<u8>` allocation.
+    pub fn key_frame_to_bytes(frame_id: u16, codec: Codec, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(KEY_FRAME_HEADER + payload.len());
+        buf.push(ServerDatagramVariants::VIDEO_KEY_FRAME.0);
+        buf.extend_from_slice(&frame_id.to_be_bytes());
+        buf.push(codec.to_byte());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    /// Serialize one fragment of a delta directly from an already-encoded
+    /// payload slice, avoiding an intermediate `Vec<u8>` allocation per
+    /// fragment — a wide delta is a dozen of these.
+    pub fn delta_to_bytes(
+        frame_id: u16,
+        frag_idx: u16,
+        num_frags: u16,
         codec: Codec,
         payload: &[u8],
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER + payload.len());
-        buf.push(ServerDatagramVariants::VIDEO_FRAME.0);
+        let mut buf = Vec::with_capacity(DELTA_HEADER + payload.len());
+        buf.push(ServerDatagramVariants::VIDEO_DELTA.0);
         buf.extend_from_slice(&frame_id.to_be_bytes());
         buf.extend_from_slice(&frag_idx.to_be_bytes());
         buf.extend_from_slice(&num_frags.to_be_bytes());
-        buf.push(is_keyframe as u8);
         buf.push(codec.to_byte());
         buf.extend_from_slice(payload);
         buf
@@ -98,21 +132,18 @@ impl ServerDatagram {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::VideoFrame {
+            Self::VideoKeyFrame {
+                frame_id,
+                codec,
+                payload,
+            } => Self::key_frame_to_bytes(*frame_id, *codec, payload),
+            Self::VideoDelta {
                 frame_id,
                 frag_idx,
                 num_frags,
-                is_keyframe,
                 codec,
                 payload,
-            } => Self::video_frame_to_bytes(
-                *frame_id,
-                *frag_idx,
-                *num_frags,
-                *is_keyframe,
-                *codec,
-                payload,
-            ),
+            } => Self::delta_to_bytes(*frame_id, *frag_idx, *num_frags, *codec, payload),
             Self::ReleaseMouse => vec![ServerDatagramVariants::RELEASE_MOUSE.0],
             Self::ToggleFullscreen => vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
             Self::LogLevel { level } => vec![
@@ -153,21 +184,32 @@ impl ServerDatagram {
             anyhow::bail!("Empty datagram");
         }
         match ServerDatagramVariants(bytes[0]) {
-            ServerDatagramVariants::VIDEO_FRAME => {
-                if bytes.len() < HEADER {
-                    anyhow::bail!("VideoFrame datagram too short: {} bytes", bytes.len());
+            ServerDatagramVariants::VIDEO_KEY_FRAME => {
+                if bytes.len() < KEY_FRAME_HEADER {
+                    anyhow::bail!("VideoKeyFrame datagram too short: {} bytes", bytes.len());
+                }
+                let frame_id = u16::from_be_bytes([bytes[1], bytes[2]]);
+                let codec = Codec::from_byte(bytes[3])?;
+                let payload = bytes[4..].to_vec();
+                Ok(Self::VideoKeyFrame {
+                    frame_id,
+                    codec,
+                    payload,
+                })
+            }
+            ServerDatagramVariants::VIDEO_DELTA => {
+                if bytes.len() < DELTA_HEADER {
+                    anyhow::bail!("VideoDelta datagram too short: {} bytes", bytes.len());
                 }
                 let frame_id = u16::from_be_bytes([bytes[1], bytes[2]]);
                 let frag_idx = u16::from_be_bytes([bytes[3], bytes[4]]);
                 let num_frags = u16::from_be_bytes([bytes[5], bytes[6]]);
-                let is_keyframe = (bytes[7] & 1) != 0;
-                let codec = Codec::from_byte(bytes[8])?;
-                let payload = bytes[9..].to_vec();
-                Ok(Self::VideoFrame {
+                let codec = Codec::from_byte(bytes[7])?;
+                let payload = bytes[8..].to_vec();
+                Ok(Self::VideoDelta {
                     frame_id,
                     frag_idx,
                     num_frags,
-                    is_keyframe,
                     codec,
                     payload,
                 })
@@ -214,8 +256,11 @@ impl ServerDatagram {
         }
     }
 
-    pub const fn header_size() -> usize {
-        HEADER
+    /// The largest video header, which is what bounds the payload that fits one
+    /// datagram. Deltas carry the fragment fields keyframes do not, so a payload
+    /// sized for a keyframe would overflow a delta.
+    pub const fn video_header_size() -> usize {
+        DELTA_HEADER
     }
 }
 
@@ -229,15 +274,24 @@ mod tests {
     fn wire_bytes_are_stable() {
         let cases: Vec<(ServerDatagram, Vec<u8>)> = vec![
             (
-                ServerDatagram::VideoFrame {
+                // A keyframe is whole by construction: no fragment fields on the
+                // wire at all, so it cannot be split by accident.
+                ServerDatagram::VideoKeyFrame {
                     frame_id: 0x1234,
-                    frag_idx: 0x0056,
-                    num_frags: 0x0003,
-                    is_keyframe: true,
                     codec: Codec::Av1,
                     payload: vec![0xAA, 0xBB],
                 },
-                vec![0x00, 0x12, 0x34, 0x00, 0x56, 0x00, 0x03, 0x01, 0x00, 0xAA, 0xBB],
+                vec![0x00, 0x12, 0x34, 0x00, 0xAA, 0xBB],
+            ),
+            (
+                ServerDatagram::VideoDelta {
+                    frame_id: 0x1234,
+                    frag_idx: 0x0056,
+                    num_frags: 0x0003,
+                    codec: Codec::Av1,
+                    payload: vec![0xAA, 0xBB],
+                },
+                vec![0x06, 0x12, 0x34, 0x00, 0x56, 0x00, 0x03, 0x00, 0xAA, 0xBB],
             ),
             (ServerDatagram::ReleaseMouse, vec![0x01]),
             (ServerDatagram::ToggleFullscreen, vec![0x02]),

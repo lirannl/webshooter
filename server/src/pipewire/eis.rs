@@ -12,6 +12,7 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use reis::tokio::EiConvertEventStream;
 use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -202,7 +203,11 @@ async fn input_gate_task(
             }
             msg = client_rx.recv() => {
                 match msg {
-                    Err(_) => break,
+                    // Input is coalesced, not replayed, so a lagged record is
+                    // superseded by the state that follows it; only a closed
+                    // bus means the client is really gone.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
                     Ok(msg) => {
                         // Control datagrams are not input: bypass the gate.
                         if !is_input_datagram(&msg) {

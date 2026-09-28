@@ -249,7 +249,44 @@ pub enum ClientDatagram {
     /// because a back-channel already exists; bounded recovery instead of
     /// waiting for the next scheduled keyframe.
     RequestKeyframe,
+    /// Ask for specific delta fragments to be sent again.
+    ///
+    /// This is the cheaper half of the answer to a gap, and the one that should
+    /// usually win. A delta is split across datagrams and carries its own
+    /// fragment count, so a client short one fragment knows *which* fragment is
+    /// missing — and a keyframe, the alternative, is orders of magnitude larger
+    /// than the fragment that went missing. It also repairs more: resending a
+    /// lost delta puts the frame back where it belongs, so the frames between
+    /// the loss and a keyframe stay decodable instead of being discarded.
+    ///
+    /// Batched, because gaps arrive in runs and one message covering a whole run
+    /// costs a single round trip where one message per frame would cost a round
+    /// trip each. Entries are `(frame_id, missing fragment indices)`, and the
+    /// server ignores any frame it no longer holds.
+    ///
+    /// A request that is itself lost is not fatal: the client gives the gap a
+    /// deadline and asks for a keyframe when it passes, so repair is an attempt
+    /// rather than a dependency.
+    ResendDeltas {
+        frames: Vec<(u16, Vec<u16>)>,
+    },
 }
+
+/// Most frames a single [`ClientDatagram::ResendDeltas`] may name.
+///
+/// The client's own pending map is what it draws from, so in practice a run of
+/// lost frames fits many times over. The cap is not there to limit a well-behaved
+/// client — it bounds what a malformed one can make the server allocate, and it
+/// keeps the encoded request to a size that is never the reason a repair fails.
+pub const MAX_RESEND_FRAMES: usize = 16;
+
+/// Most fragment indices one frame may name in a [`ClientDatagram::ResendDeltas`].
+///
+/// A delta is a handful of datagrams, so this is generous for any real frame; the
+/// real bound on cost is [`MAX_RESEND_FRAMES`], and this stops one frame's worth of
+/// indices from dominating the message.
+pub const MAX_RESEND_FRAGS: usize = 32;
+
 
 impl ClientDatagram {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -379,6 +416,33 @@ impl ClientDatagram {
                 buf
             }
             Self::RequestKeyframe => vec![ClientDatagramVariants::REQUEST_KEYFRAME.0],
+            Self::ResendDeltas { frames } => {
+                // Counted rather than trusted: the list is built from the client's
+                // own pending map, but a client that reports more entries than it
+                // can hold must not be able to make this allocate on their say-so.
+                let frames: Vec<&(u16, Vec<u16>)> = frames
+                    .iter()
+                    .take(MAX_RESEND_FRAMES)
+                    .filter(|(_, indices)| !indices.is_empty())
+                    .collect();
+                let mut buf =
+                    Vec::with_capacity(1 + 1 + frames.iter().map(|(_, i)| 3 + 2 * i.len().min(MAX_RESEND_FRAGS)).sum::<usize>());
+                buf.push(ClientDatagramVariants::RESEND_DELTAS.0);
+                buf.push(frames.len() as u8);
+                for (frame_id, indices) in frames {
+                    let indices: Vec<u16> = indices
+                        .iter()
+                        .copied()
+                        .take(MAX_RESEND_FRAGS)
+                        .collect();
+                    buf.extend_from_slice(&frame_id.to_be_bytes());
+                    buf.push(indices.len() as u8);
+                    for index in &indices {
+                        buf.extend_from_slice(&index.to_be_bytes());
+                    }
+                }
+                buf
+            }
         }
     }
 
@@ -544,6 +608,44 @@ impl ClientDatagram {
                 }
             }
             ClientDatagramVariants::REQUEST_KEYFRAME => Self::RequestKeyframe,
+            ClientDatagramVariants::RESEND_DELTAS => {
+                // Walked with a cursor rather than destructured, because the
+                // length is not fixed: a truncated tail must fail here rather
+                // than index out of bounds, and the declared counts are read
+                // from the wire and so are not trusted to be small.
+                let mut rest = data;
+                // `..` in each pattern is what makes these "at least this long"
+                // rather than "exactly this long": the tail after the last frame
+                // is legitimately empty, and a slice pattern without it only
+                // matches a slice of precisely that length.
+                let [count, ..] = rest else {
+                    anyhow::bail!("ResendDeltas datagram too short: {} bytes", bytes.len());
+                };
+                rest = &rest[1..];
+                let mut frames = Vec::new();
+                for _ in 0..*count {
+                    let [a, b, n, ..] = rest else {
+                        anyhow::bail!(
+                            "ResendDeltas datagram truncated in frame {} of {count}",
+                            frames.len()
+                        );
+                    };
+                    rest = &rest[3..];
+                    let frame_id = u16::from_be_bytes([*a, *b]);
+                    let mut indices = Vec::new();
+                    for _ in 0..*n {
+                        let [c, d, ..] = rest else {
+                            anyhow::bail!(
+                                "ResendDeltas datagram truncated in fragment list of frame {frame_id}"
+                            );
+                        };
+                        rest = &rest[2..];
+                        indices.push(u16::from_be_bytes([*c, *d]));
+                    }
+                    frames.push((frame_id, indices));
+                }
+                Self::ResendDeltas { frames }
+            }
             n => anyhow::bail!("Invalid datagram discriminant: {}", n.0),
         })
     }
@@ -834,9 +936,69 @@ mod tests {
                 vec![0x0C, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xFF, 0xFF, 0x38],
             ),
             (ClientDatagram::RequestKeyframe, vec![0x0D]),
+            // Two frames, one missing a single fragment and one missing two. The
+            // shape of a real request: a run of lost frames, each short a fragment
+            // or two, which is what a burst of datagram loss looks like.
+            (
+                ClientDatagram::ResendDeltas {
+                    frames: vec![(814, vec![3]), (820, vec![0, 4])],
+                },
+                vec![
+                    0x0E, 0x02, // two frames
+                    0x03, 0x2E, 0x01, 0x00, 0x03, // frame 814, one index: 3
+                    0x03, 0x34, 0x02, 0x00, 0x00, 0x00, 0x04, // frame 820, two: 0, 4
+                ],
+            ),
         ];
         for (dgram, expected) in cases {
             assert_eq!(dgram.to_bytes(), expected, "bytes changed for {dgram:?}");
         }
+    }
+
+    /// A repair request must survive the wire in both directions, and must
+    /// survive being truncated — this is fed with bytes from the network, so a
+    /// short read has to be an error rather than an out-of-bounds panic.
+    #[test]
+    fn a_resend_request_round_trips_and_rejects_a_truncated_tail() {
+        let request = ClientDatagram::ResendDeltas {
+            frames: vec![(0x0402, vec![1, 2, 3]), (0xFFFF, vec![0])],
+        };
+        let bytes = request.to_bytes();
+        assert_eq!(ClientDatagram::from_bytes(&bytes).expect("parses"), request);
+
+        // Every prefix of a real request must fail to parse rather than panic.
+        // The last byte is the one that makes the final index complete.
+        for cut in 0..bytes.len() {
+            assert!(
+                ClientDatagram::from_bytes(&bytes[..cut]).is_err(),
+                "a {cut}-byte prefix parsed, so a truncated request is not rejected"
+            );
+        }
+    }
+
+    /// The caps are a bound on what a malformed client can make the server
+    /// allocate, so they have to be enforced on the way out as well as on the
+    /// way in: a client that reports more than it can hold must not be able to
+    /// grow the message without limit.
+    #[test]
+    fn a_resend_request_is_capped_at_the_declared_limits() {
+        let many_frames: Vec<(u16, Vec<u16>)> = (0..MAX_RESEND_FRAMES as u16 * 4)
+            .map(|id| (id, vec![0u16; MAX_RESEND_FRAGS * 2]))
+            .collect();
+        let bytes = ClientDatagram::ResendDeltas {
+            frames: many_frames,
+        }
+        .to_bytes();
+        let parsed = ClientDatagram::from_bytes(&bytes).expect("parses");
+        let ClientDatagram::ResendDeltas { frames } = parsed else {
+            panic!("wrong variant");
+        };
+        assert_eq!(frames.len(), MAX_RESEND_FRAMES, "the frame cap is enforced");
+        assert!(
+            frames.iter().all(|(_, indices)| indices.len() == MAX_RESEND_FRAGS),
+            "the per-frame index cap is enforced"
+        );
+        // And the result is still a message that fits a control datagram.
+        assert!(bytes.len() < 1200, "the capped request is {} bytes", bytes.len());
     }
 }

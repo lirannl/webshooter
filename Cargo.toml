@@ -52,6 +52,10 @@ ts-rs = "12.0"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = "0.3"
-wtransport = "0.7"
+# The `quinn` feature exposes the inner quinn::Connection, which is the only way
+# to read the path counters (MTU, lost packets, black holes) and the datagram
+# send-buffer space. Both decide whether a frame can go out as a datagram
+# without being lost, so neither is optional here.
+wtransport = { version = "0.7", features = ["quinn"] }
 named_constants = { git = "https://github.com/lirannl/named_constants", rev = "16bbad860fe868ec63030ae1ece0fa7bab341f42" }
 log = { version = "0.4.34", features = [ "serde", "alloc" ] }

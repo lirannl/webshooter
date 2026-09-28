@@ -39,6 +39,26 @@ impl FragmentFrame {
         self.fragments.len()
     }
 
+    /// The fragment indices that have not arrived, in ascending order.
+    ///
+    /// This is what turns "a frame is incomplete" into something actionable.
+    /// A caller that only knows a frame is short of fragments has one option —
+    /// give up on it and ask for a keyframe — but the empty slots name
+    /// themselves, and the server can resend exactly those. Losing three
+    /// fragments of a frame and losing the whole frame are the same event to
+    /// anyone watching, and they should not cost the same to recover from.
+    ///
+    /// Empty once the frame is complete, and for a frame declared to have no
+    /// fragments at all.
+    pub fn missing(&self) -> Vec<u16> {
+        self.fragments
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(index, _)| index as u16)
+            .collect()
+    }
+
     /// Record fragment `index`. Out-of-range and duplicate fragments leave the
     /// frame untouched and are reported as such so each caller applies its own
     /// entry-lifetime policy (drop the frame vs. keep waiting).

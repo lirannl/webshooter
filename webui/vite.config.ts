@@ -71,6 +71,7 @@ export default defineConfig({
             protocol: "http",
             clientPort: 5173,
         },
+        strictPort: true,
     },
     plugins: [wasm(), topLevelAwait(), wasmWatcher()],
 });
