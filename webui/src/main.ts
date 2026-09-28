@@ -61,5 +61,22 @@ const authenticated: boolean = await (async () => {
 
 if (authenticated) {
   await init();
-  start();
+  start(isAudioOnlyPage());
+}
+
+/// Whether this page opens an audio-only session.
+///
+/// `/audio` is the same application served at a path of its own, and the page
+/// decides its own session from the path it was fetched from — the server has
+/// no separate audio endpoint for a WebTransport connection to go to. Sending
+/// no display size is the whole of it: the server holds its capture back until
+/// a size arrives, so a page that never sends one gets audio and nothing else,
+/// while the transport, keepalive, audio sink and control channel are all built
+/// exactly as they are for a video session.
+///
+/// Matched on the last path segment, so a page served from a mount point behind
+/// a reverse proxy is recognised too.
+function isAudioOnlyPage(): boolean {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  return path === "/audio" || path.endsWith("/audio");
 }

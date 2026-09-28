@@ -21,6 +21,32 @@ use std::{
 /// from the brand vector, e.g. `/icon-192.png`.
 const ICON_SIZES: std::ops::RangeInclusive<u32> = 32..=2048;
 
+/// The last path segment the audio-only client is served from.
+///
+/// A page loaded from here runs a session with no display. The page decides
+/// that for itself: the server's capture pipeline is gated on the client's
+/// first `ResizeDisplay` and parks until one arrives, so a client that never
+/// announces a size never causes a virtual monitor, a portal dialog, an
+/// encoder or an input path to come into existence. The session otherwise
+/// starts and runs identically — same transport, same keepalive, same audio
+/// sink, same control channel.
+const AUDIO_PATH: &str = "audio";
+
+/// Whether `path` (relative to the base path) is the audio-only entry point.
+///
+/// Matched on the *last* segment rather than as a whole path, because the
+/// application is routinely served from a mount point behind a reverse proxy
+/// (see [`base_path`]) and the client builds its WebTransport URL from its own
+/// href — so a page at `/webshooter/audio` has to be recognised as readily as
+/// one at `/audio`. Any other segment falls through to the asset pipeline
+/// unchanged.
+fn is_audio_path(path: &str) -> bool {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| segment == AUDIO_PATH)
+}
+
 /// Rasterised icon cache keyed by pixel size.
 static ICON_CACHE: LazyLock<Mutex<HashMap<u32, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -120,6 +146,14 @@ pub async fn frontend(req: &Request, path: Option<Path<String>>) -> impl IntoRes
         );
     }
 
+    // The audio-only entry point, which is the same application at a path of
+    // its own. Handled here rather than as a route of its own so the trailing
+    // slash is covered too, and because the asset route already owns "a path
+    // that is not a file on disk" — `/audio` is not an asset.
+    if is_audio_path(&path) {
+        return Ok::<_, Error>(app_shell().await.into_response());
+    }
+
     // Rasterised icon endpoints; anything that doesn't match this shape falls
     // through to the regular asset pipeline.
     if let Some(size) = icon_size_from_path(&path) {
@@ -149,6 +183,22 @@ pub async fn frontend(req: &Request, path: Option<Path<String>>) -> impl IntoRes
             .set_content_type(asset.metadata.mimetype())
             .into_response(),
     )
+}
+
+/// The page that boots a session, resolved like any other asset so a debug
+/// build's dev server serves the live page and a release build serves the
+/// embedded bundle.
+///
+/// Not a generated response like the manifest: the two entry points are the
+/// same document, and everything that separates them is in the path the page
+/// was fetched from, which the client reads for itself.
+async fn app_shell() -> Response {
+    match asset_bytes("index.html").await {
+        Some(body) => Response::builder().content_type("text/html").body(body),
+        None => Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .finish(),
+    }
 }
 
 /// Match `/icon-{size}.png` within ICON_SIZES range.
@@ -220,9 +270,34 @@ fn manifest_response(req: &Request, base_manifest: Option<Vec<u8>>) -> Response 
 
 #[cfg(test)]
 mod tests {
-    use super::{icon_size_from_path, rendered_icon};
+    use super::{icon_size_from_path, is_audio_path, rendered_icon};
 
     const BRAND_SVG: &[u8] = include_bytes!("../../webui/public/webshooter.svg");
+
+    /// The audio-only entry point has to be recognised wherever it is mounted,
+    /// because the client connects its WebTransport session back to the very
+    /// path it was served from. A page reached at `/audio` and the same page
+    /// reached through a reverse proxy at `/webshooter/audio` have to end up
+    /// in the same kind of session, and a near miss has to fall through to the
+    /// asset pipeline rather than silently become one.
+    #[test]
+    fn the_audio_entry_point_is_the_last_path_segment() {
+        assert!(is_audio_path("audio"), "served at the origin root");
+        assert!(is_audio_path("audio/"), "with a trailing slash");
+        assert!(is_audio_path("/audio"), "leading separator included");
+        assert!(is_audio_path("webshooter/audio"), "behind a proxy prefix");
+        assert!(
+            is_audio_path("a/deeply/nested/mount/audio"),
+            "however deeply it is mounted"
+        );
+
+        assert!(!is_audio_path(""), "the root is the video session");
+        assert!(!is_audio_path("index.html"));
+        assert!(!is_audio_path("assets/index-abc123.js"));
+        assert!(!is_audio_path("audios"), "not a prefix match");
+        assert!(!is_audio_path("audio.js"), "not a prefix match");
+        assert!(!is_audio_path("video/audio.html"), "an exact segment, not a suffix");
+    }
 
     #[test]
     fn icon_path_parsing() {

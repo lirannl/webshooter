@@ -8,8 +8,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use web_sys::{
-    AudioBuffer, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder, AudioDecoderConfig,
-    AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
+    AnalyserNode, AudioBuffer, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder,
+    AudioDecoderConfig, AudioNode, AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit,
+    EncodedAudioChunkType, HtmlDivElement, HtmlSpanElement,
 };
 
 use shared::fragment::{FragmentFrame, PushOutcome};
@@ -21,6 +22,14 @@ const SCHEDULE_AHEAD: f64 = 0.05;
 /// Per-player playback state shared with the decoder output callback.
 struct PlaybackState {
     ctx: AudioContext,
+    /// The analyser every decoded buffer is routed through on its way to the
+    /// speakers. It is a pass-through tap: it forwards what it measures, so
+    /// this costs nothing audible. It feeds the client-side visualiser — the
+    /// server sends the same Opus frames whether or not it is here.
+    analyser: AnalyserNode,
+    /// Client-side, server-oblivious signs that the player is alive: written
+    /// by the playback paths, read by the status badge.
+    activity: Rc<RefCell<AudioActivity>>,
     next_time: f64,
     /// Set while we've told the server the AudioContext is `Running`, so it can
     /// create the PipeWire sink and start forwarding Opus. Cleared if the
@@ -36,8 +45,188 @@ struct PlaybackState {
     last_end: Cell<f64>,
 }
 
+// ---------------------------------------------------------------------------
+// Client-side audio status badge + activity feed
+// ---------------------------------------------------------------------------
+
+/// What the client believes about the audio player right now. Purely
+/// client-side: derived from the AudioContext state and recent play-out, and
+/// the server both plays no part in it and is never told about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AudioPhase {
+    /// No player exists in this browser (no AudioContext / Opus AudioDecoder).
+    Unavailable,
+    /// The context exists but is suspended — typically waiting for the first
+    /// user gesture before the page is allowed to play audio at all.
+    Suspended,
+    /// The context is running but no decoded audio has reached play-out
+    /// recently.
+    Waiting,
+    /// The context is running and frames are being played right now.
+    Live,
+}
+
+/// The client-side facts the status badge is derived from. Shared between the
+/// audio player (writer) and the badge (reader) through one `Rc`, so the two
+/// always agree.
+#[derive(Default)]
+pub(crate) struct AudioActivity {
+    /// Whether the AudioContext last reported `Running`.
+    running: Cell<bool>,
+    /// `performance.now()` of the most recent played frame; `0.0` if none yet.
+    last_frame_at: Cell<f64>,
+}
+
+/// How often the badge re-derives its state from the activity feed.
+const BADGE_REPAINT_MS: u32 = 250;
+/// A player counts as "live" while frames have reached play-out within this
+/// window.
+const BADGE_ACTIVE_WINDOW_MS: f64 = 3000.0;
+
+/// The state shared between the badge handle and its periodic repainter.
+struct BadgeShared {
+    feed: Option<Rc<RefCell<AudioActivity>>>,
+    phase: AudioPhase,
+    dot: HtmlDivElement,
+    label: HtmlSpanElement,
+}
+
+/// What phase the feed currently implies.
+fn derive_phase(shared: &Rc<RefCell<BadgeShared>>) -> AudioPhase {
+    match &shared.borrow().feed {
+        None => AudioPhase::Unavailable,
+        Some(feed) => {
+            let feed = feed.borrow();
+            if !feed.running.get() {
+                AudioPhase::Suspended
+            } else if now_ms() - feed.last_frame_at.get() <= BADGE_ACTIVE_WINDOW_MS {
+                AudioPhase::Live
+            } else {
+                AudioPhase::Waiting
+            }
+        }
+    }
+}
+
+/// Write `phase` to the DOM and record it as the badge's current phase.
+fn paint_badge(shared: &Rc<RefCell<BadgeShared>>, phase: AudioPhase) {
+    let mut s = shared.borrow_mut();
+    s.phase = phase;
+    let (color, text) = match phase {
+        AudioPhase::Unavailable => ("#e5484d", "audio unavailable"),
+        AudioPhase::Suspended => ("#9e9e9e", "audio off — click to enable"),
+        AudioPhase::Waiting => ("#e5a13a", "audio: waiting for stream"),
+        AudioPhase::Live => ("#3fb950", "audio: live"),
+    };
+    s.dot.style().set_property("background", color).ok();
+    s.label.set_text_content(Some(text));
+}
+
+/// Repaint the badge from the shared state, skipping the DOM when the phase
+/// has not changed.
+fn repaint_badge(shared: &Rc<RefCell<BadgeShared>>) {
+    let phase = derive_phase(shared);
+    if shared.borrow().phase == phase {
+        return;
+    }
+    paint_badge(shared, phase);
+}
+
+/// The fixed bottom-right badge that tells this user, entirely on the client
+/// side, whether this session's audio player is doing anything. It is created
+/// only on the /audio page (a video session keeps the screen for the remote
+/// desktop). The server is not involved and cannot influence it. The element
+/// and its repaint timer are owned by the timer (the badge handle itself is
+/// stateless and short-lived).
+pub struct StatusBadge;
+
+impl StatusBadge {
+    /// A badge fed by a live player's activity, repainted as that activity
+    /// changes.
+    pub fn with_activity(activity: Rc<RefCell<AudioActivity>>) -> StatusBadge {
+        let (_, dot, label) = Self::build_element();
+        let shared = Rc::new(RefCell::new(BadgeShared {
+            feed: Some(activity),
+            phase: AudioPhase::Suspended,
+            dot,
+            label,
+        }));
+        Self::start(shared)
+    }
+
+    /// A badge for a session whose player could not be created. It never
+    /// changes once painted.
+    pub fn unavailable() -> StatusBadge {
+        let (_, dot, label) = Self::build_element();
+        let shared = Rc::new(RefCell::new(BadgeShared {
+            feed: None,
+            phase: AudioPhase::Unavailable,
+            dot,
+            label,
+        }));
+        Self::start(shared)
+    }
+
+    fn build_element() -> (HtmlDivElement, HtmlDivElement, HtmlSpanElement) {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let el = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlDivElement>()
+            .unwrap();
+        el.style().set_css_text(
+            "position:fixed;right:12px;bottom:12px;z-index:2147483647;display:flex;\
+             align-items:center;gap:8px;padding:6px 12px;border-radius:999px;\
+             background:#1a1a1a;border:1px solid #333;color:rgba(255,255,255,.9);\
+             font:13px/1.4 Inter,system-ui,sans-serif;pointer-events:none;user-select:none;\
+             box-shadow:0 2px 10px rgba(0,0,0,.45);",
+        );
+        let dot = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlDivElement>()
+            .unwrap();
+        dot.style().set_css_text("width:10px;height:10px;border-radius:50%;flex:none;");
+        let label = document
+            .create_element("span")
+            .unwrap()
+            .dyn_into::<HtmlSpanElement>()
+            .unwrap();
+        label.style().set_css_text("white-space:nowrap;");
+        el.append_child(&dot).unwrap();
+        el.append_child(&label).unwrap();
+        document.body().unwrap().append_child(&el).unwrap();
+        (el, dot, label)
+    }
+
+    fn start(shared: Rc<RefCell<BadgeShared>>) -> StatusBadge {
+        // Paint the initial state unconditionally: the very first frame must
+        // not skip because the sentinel phase happens to equal the derived one.
+        paint_badge(&shared, derive_phase(&shared));
+        let tick = Closure::wrap(Box::new(move || repaint_badge(&shared)) as Box<dyn FnMut()>);
+        if let Some(win) = web_sys::window() {
+            let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
+                tick.as_ref().unchecked_ref(),
+                BADGE_REPAINT_MS as i32,
+            );
+        }
+        tick.forget();
+        StatusBadge
+    }
+}
+
+/// Monotonic milliseconds since navigation start, used for the client-side
+/// "is audio being played right now" window.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
 pub struct AudioPlayer {
     decoder: AudioDecoder,
+    state: Rc<RefCell<PlaybackState>>,
     pending: RefCell<HashMap<u16, FragmentFrame>>,
     configured: Cell<bool>,
     /// Running count of decoded samples, used to derive strictly increasing,
@@ -57,8 +246,26 @@ impl AudioPlayer {
             ctx.sample_rate()
         );
 
+        // Route every decoded buffer through one analyser on its way to the
+        // speakers. The AnalyserNode is a pass-through in the Web Audio graph —
+        // it forwards what it measures, so this costs nothing audible — and it
+        // is the tap the client-side visualiser draws from. The server neither
+        // needs to know about it nor is told about it.
+        let analyser = ctx.create_analyser().ok()?;
+        analyser.set_fft_size(1024);
+        analyser.set_smoothing_time_constant(0.8);
+        let destination = ctx.destination();
+        let _ = analyser.connect_with_audio_node(&destination);
+
+        // Client-side activity feed shared with every playback path below. The
+        // /audio-page status badge is attached by the render loop, not here —
+        // a video session has no badge.
+        let activity = Rc::new(RefCell::new(AudioActivity::default()));
+
         let state = Rc::new(RefCell::new(PlaybackState {
             ctx: ctx.clone(),
+            analyser: analyser.clone(),
+            activity,
             next_time: 0.0,
             audio_ready: Cell::new(false),
             peak_max: Cell::new(0.0),
@@ -127,8 +334,10 @@ impl AudioPlayer {
         // notify immediately as well.
         fn handle_audio_state(state: &Rc<RefCell<PlaybackState>>) {
             let st = state.borrow();
+            // Keep the client-side status badge in lockstep with the context.
             match st.ctx.state() {
                 web_sys::AudioContextState::Running => {
+                    st.activity.borrow().running.set(true);
                     if !st.audio_ready.get() {
                         let channels = st.ctx.destination().channel_count() as u8;
                         let rate = st.ctx.sample_rate() as u32;
@@ -143,6 +352,7 @@ impl AudioPlayer {
                     }
                 }
                 web_sys::AudioContextState::Suspended => {
+                    st.activity.borrow().running.set(false);
                     // Auto-resume on any suspension (e.g. tab blur). Permissive
                     // environments resume immediately; restrictive web pages
                     // keep the promise pending until the first gesture, which
@@ -195,11 +405,25 @@ impl AudioPlayer {
         log::info!("audio: AudioPlayer created");
         Some(AudioPlayer {
             decoder,
+            state,
             pending: RefCell::new(HashMap::new()),
             configured: Cell::new(false),
             next_sample: Cell::new(0),
             dbg_count: Cell::new(0),
         })
+    }
+
+    /// The analyser node this player routes all playback through, for the
+    /// client-side visualiser. A player that exists always has one: it is
+    /// created in [`AudioPlayer::new`], and its absence there means no player.
+    pub fn analyser(&self) -> AnalyserNode {
+        self.state.borrow().analyser.clone()
+    }
+
+    /// The client-side activity feed the status badge (on the /audio page)
+    /// derives its state from.
+    pub fn activity(&self) -> Rc<RefCell<AudioActivity>> {
+        self.state.borrow().activity.clone()
     }
 
     fn configure(&self, channels: u8, rate: u32) {
@@ -321,13 +545,15 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
     }
     data.close();
 
-    // Feed the periodic levels reporter.
+    // Feed the periodic levels reporter, and the client-side badge's notion of
+    // "audio is actually playing".
     {
         let st = state.borrow_mut();
         if frame_peak > st.peak_max.get() {
             st.peak_max.set(frame_peak);
         }
         st.frame_count.set(st.frame_count.get() + 1);
+        st.activity.borrow().last_frame_at.set(now_ms());
     }
 
     let duration = frames as f64 / sample_rate as f64;
@@ -374,7 +600,10 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
 
     if let Ok(src) = ctx.create_buffer_source() {
         src.set_buffer(Some(&buffer));
-        let _ = src.connect_with_audio_node(&ctx.destination());
+        // Into the analyser, which passes the signal through to the speakers —
+        // it is simultaneously the tap the visualiser draws from.
+        let analyser = state.borrow().analyser.clone();
+        let _ = src.connect_with_audio_node(analyser.unchecked_ref::<AudioNode>());
         let _ = src.start_with_when(when);
     } else {
         log::error!("audio: create_buffer_source failed");

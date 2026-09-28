@@ -36,6 +36,7 @@ web-sys = { workspace = true, features = [
     "AudioContextState",
     "AudioBuffer",
     "AudioBufferSourceNode",
+    "AnalyserNode",
     "AudioData",
     "AudioDataCopyToOptions",
     "AudioSampleFormat",
@@ -79,6 +80,7 @@ web-sys = { workspace = true, features = [
     "DomRectReadOnly",
     "HtmlButtonElement",
     "HtmlDivElement",
+    "HtmlSpanElement",
     "Text",
 ] }
 shared.workspace = true

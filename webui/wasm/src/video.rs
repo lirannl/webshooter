@@ -18,6 +18,19 @@ use web_sys::{
 // Canvas
 // ---------------------------------------------------------------------------
 
+/// The page's display: the canvas encoded frames are drawn on, and the
+/// fullscreen intent waiting for the next user gesture.
+///
+/// A type rather than two loose arguments because it exists only when the
+/// session has a display at all. An audio-only page builds none of it, and
+/// every step that needs a display takes `Option<&Display>` — so "no display"
+/// is a value the type system carries rather than a `None` each call site has
+/// to remember to check.
+pub struct Display {
+    pub canvas: HtmlCanvasElement,
+    pub pending_fullscreen: Rc<Cell<bool>>,
+}
+
 pub fn setup_canvas() -> HtmlCanvasElement {
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas = document
@@ -348,6 +361,16 @@ fn assemble_delta(
 /// makes it obvious at each call site which of them this step may change.
 struct FramePath {
     decoder: web_sys::VideoDecoder,
+    /// The output/error callbacks the decoder was configured with. The decoder
+    /// holds JS references to them and can call them on every decoded frame,
+    /// so they have to stay alive for exactly as long as the decoder does — a
+    /// `Closure` frees its JS function when dropped, and dropping these with
+    /// the synchronous builder that created them would silently turn every
+    /// decoded frame into a no-op (the canvas stays black while the session
+    /// otherwise runs perfectly). Owning them here ties their lifetime to the
+    /// path's, which outlives every frame.
+    _output: Closure<dyn FnMut(VideoFrame)>,
+    _error: Closure<dyn FnMut(JsValue)>,
     /// The codec the decoder is configured for, which is not the codec of the
     /// frame being decoded: the decoder has to be reconfigured first.
     current_codec: Rc<RefCell<Option<Codec>>>,
@@ -646,13 +669,15 @@ fn decode_frame(decoder: &web_sys::VideoDecoder, frame_id: u16, payload: &[u8], 
 // Render loop
 // ---------------------------------------------------------------------------
 
-pub async fn render_loop(
-    canvas: &HtmlCanvasElement,
-    release_flag: Rc<Cell<bool>>,
-    pending_fullscreen: Rc<Cell<bool>>,
-    streams: PendingStreams,
-) -> Result<(), JsValue> {
-    let canvas = canvas.clone();
+/// Everything an encoded frame passes through on its way to the screen: the
+/// canvas, the decoder, and the ordering policy that owns the prediction
+/// chain.
+///
+/// Split out of [`render_loop`] because it is the half of the loop a session
+/// with no display does not have. A `VideoDecoder` is the expensive part, and
+/// a decoder with nothing to decode is a hardware context held open for the
+/// life of the session.
+fn frame_path(canvas: &HtmlCanvasElement) -> Result<FramePath, JsValue> {
     let ctx = canvas
         .get_context("2d")
         .ok()
@@ -696,22 +721,34 @@ pub async fn render_loop(
         }
     };
 
-    // Ordering and loss policy, which is what makes a keyframe travelling on
-    // its own stream safe to interleave with delta frames travelling as
-    // datagrams: the two are not ordered against each other, so a delta
-    // inter-predicted from a keyframe can reach us first. Loss is detected by
-    // positive evidence (a later frame_id assembled while an earlier one was
-    // never seen) rather than a timeout, so no latency is added in the steady
-    // state; on loss the server is asked for a keyframe (PLI) and the frames
-    // behind the gap are held until it arrives, instead of poisoning the
-    // prediction chain. See `shared::frame_gate`.
-    let mut path = FramePath {
+    Ok(FramePath {
         decoder,
+        // Owned here so the JS references the decoder holds outlive this
+        // builder call; see the fields' docs.
+        _output: output_cb,
+        _error: error_cb,
         // The decoder is configured on the first frame, or whenever the codec
         // changes.
         current_codec: Rc::new(RefCell::new(None)),
         gate: FrameGate::default(),
         pending: Rc::new(RefCell::new(HashMap::new())),
+    })
+}
+
+pub async fn render_loop(
+    display: Option<&Display>,
+    release_flag: Rc<Cell<bool>>,
+    streams: PendingStreams,
+) -> Result<(), JsValue> {
+    // The decode path belongs to the display, so an audio-only session has
+    // none. Every kind of session runs this loop regardless, because it is also
+    // what carries the audio and what returns when the transport dies. A video
+    // frame arriving without a decode path is one the server had no reason to
+    // send -- its capture is gated on the same signal this session withheld --
+    // so it is dropped rather than guessed at.
+    let mut path: Option<FramePath> = match display {
+        Some(display) => Some(frame_path(&display.canvas)?),
+        None => None,
     };
 
     // Audio player: decodes the Opus frames we receive and plays them through
@@ -720,7 +757,25 @@ pub async fn render_loop(
     let audio = AudioPlayer::new();
     if audio.is_none() {
         log::error!("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
+        // On the /audio page, tell this user, client-side, why there is no
+        // sound: without a player there is no activity feed to derive a state
+        // from, so the badge is fixed at "unavailable".
+        if display.is_none() {
+            crate::audio::StatusBadge::unavailable();
+        }
     }
+
+    // The visualiser and its status badge are /audio-page decorations: a video
+    // session keeps the whole screen for the remote desktop. Both bind to the
+    // player's analyser / activity feed, and neither creates nor sends
+    // anything the server could see.
+    let _audio_page_ui = match (&audio, display) {
+        (Some(player), None) => {
+            crate::audio::StatusBadge::with_activity(player.activity());
+            Some(crate::visualiser::Visualiser::new(&player.analyser()))
+        }
+        _ => None,
+    };
 
     // A datagram held back because a keyframe the server opened was still
     // being drained; see `next_message`.
@@ -765,7 +820,10 @@ pub async fn render_loop(
             && now_ms() >= deadline
         {
             repair_deadline = None;
-            if path.gate.awaiting_repair() {
+            if path
+                .as_ref()
+                .is_some_and(|path| path.gate.awaiting_repair())
+            {
                 log::debug!("repair deadline passed; asking for a keyframe");
                 send_request_keyframe().await;
             }
@@ -795,6 +853,9 @@ pub async fn render_loop(
                 continue;
             }
             ServerDatagram::ToggleFullscreen => {
+                // Broadcast to every session, including one with no display,
+                // where there is nothing to make fullscreen.
+                let Some(display) = display else { continue };
                 let window = web_sys::window().unwrap();
                 let document = window.document().unwrap();
                 if document.fullscreen_element().is_some() {
@@ -803,10 +864,10 @@ pub async fn render_loop(
                 } else if is_installed_pwa(&window) {
                     // Installed PWAs (standalone display mode) are granted
                     // fullscreen without a fresh user gesture — do it now.
-                    let _ = canvas.request_fullscreen();
+                    let _ = display.canvas.request_fullscreen();
                 } else {
                     // In-browser tabs require a gesture; defer to the next pointerdown.
-                    pending_fullscreen.set(true);
+                    display.pending_fullscreen.set(true);
                 }
                 continue;
             }
@@ -819,11 +880,15 @@ pub async fn render_loop(
                 codec,
                 payload,
             } => {
+                let Some(path) = path.as_mut() else {
+                    log::warn!("video keyframe on a session with no display, dropped");
+                    continue;
+                };
                 // Already the whole frame. The variant has no fragment fields, so
                 // there is nothing to reassemble and no way for half of one to
                 // go missing.
                 present(
-                    &mut path,
+                    path,
                     frame_id,
                     /* is_keyframe = */ true,
                     codec,
@@ -839,6 +904,10 @@ pub async fn render_loop(
                 codec,
                 payload,
             } => {
+                let Some(path) = path.as_mut() else {
+                    log::warn!("video delta on a session with no display, dropped");
+                    continue;
+                };
                 // Split across as many datagrams as it needed; whole only once
                 // the last fragment lands.
                 let Some(assembled) =
@@ -847,7 +916,7 @@ pub async fn render_loop(
                     continue;
                 };
                 present(
-                    &mut path,
+                    path,
                     frame_id,
                     /* is_keyframe = */ false,
                     codec,

@@ -26,14 +26,11 @@ port breaks every existing client.
 - Introduce port-offset logic, CLI port flags, or per-transport ports to
   "resolve a perceived conflict" between the HTTP and QUIC listeners. There
   is no conflict: TCP and UDP share one port number by design.
-- Relax or delete the port invariant tests (`config_has_a_single_port`,
-  `no_second_port_tokens_in_source`, `tcp_and_udp_share_one_port`) to get a
-  build to pass.
 
 ### MUST
 
-- Keep tests in `server/src/config.rs` and `server/src/wt.rs` (and
-  `AGENTS.md` itself) in sync with the single-port design.
+- Keep `server/src/config.rs`, `server/src/wt.rs` and `AGENTS.md` itself in
+  sync with the single-port design.
 
 If you believe a second port is genuinely required for some feature, stop
 and reconsider the design first — the transport layer is built around port

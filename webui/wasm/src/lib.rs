@@ -4,6 +4,7 @@ mod input;
 mod log;
 mod throttle;
 mod video;
+mod visualiser;
 
 use js_sys::Uint8Array;
 use shared::client_datagram::ClientDatagram;
@@ -304,8 +305,21 @@ fn show_connection_lost() -> Option<()> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Open a session and run it until the connection ends.
+///
+/// `audio_only` is how the page asks for a session with no display, and it is
+/// deliberately a *client* decision the server has no way to be told about.
+/// The server's capture is gated on the first
+/// [`ClientDatagram::ResizeDisplay`] and parks until one arrives, so a page
+/// that never announces a size never brings a virtual monitor, a portal
+/// dialog, an encoder or an input path into existence — while the transport,
+/// the keepalive, the audio sink and the control channel are all built exactly
+/// as they are for a video session. Getting this wrong in either direction
+/// costs a quiet failure rather than a loud one: an audio-only session that
+/// sent a size would capture a display nobody watches, and a video session
+/// that withheld one would wait forever.
 #[wasm_bindgen]
-pub async fn start() -> Result<(), JsValue> {
+pub async fn start(audio_only: bool) -> Result<(), JsValue> {
     init_log();
     let window = web_sys::window().ok_or("no window")?;
     let location = window.location();
@@ -407,30 +421,45 @@ pub async fn start() -> Result<(), JsValue> {
         )?;
         keepalive.forget();
 
-        // 8. Advertise decoder capabilities.
+        // 8. Advertise decoder capabilities. Sent by both kinds of session: it
+        // costs one datagram, needs no display, and the server only reads it
+        // when a capture actually starts.
         video::send_decoder_capabilities()
         .unwrap_or_else(|err| ::log::warn!("decoder capabilities not sent: {err:#?}"));
 
-        // 9. Canvas + video
-        let canvas = video::setup_canvas();
-        video::send_initial_resize(&canvas)
-        .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
-        let pending_fullscreen = video::setup_resize_prompt(&canvas);
+        // 9. The display, which is the whole of the difference between the two
+        // kinds of session. Building it is what sends the first
+        // `ResizeDisplay`, which is the server's signal to capture -- so
+        // leaving it out is what leaves a session with no virtual monitor and
+        // no input path.
+        let display = if audio_only {
+            ::log::info!("audio-only session: no display, no input");
+            None
+        } else {
+            let canvas = video::setup_canvas();
+            video::send_initial_resize(&canvas)
+            .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
+            let pending_fullscreen = video::setup_resize_prompt(&canvas);
+            Some(video::Display {
+                canvas,
+                pending_fullscreen,
+            })
+        };
 
         // 10. Render loop
         let release_flag = Rc::new(Cell::new(false));
-        let render_loop = video::render_loop(
-            &canvas,
-            release_flag.clone(),
-            pending_fullscreen.clone(),
-            streams,
-        );
+        let render_loop = video::render_loop(display.as_ref(), release_flag.clone(), streams);
 
-        // 11. Input handlers
-        input::setup_keyboard(&canvas);
-        input::setup_touch(&canvas);
-        gamepad::setup_gamepad();
-        input::setup_mouse(&canvas, release_flag);
+        // 11. Input handlers, bound to the display they are injected into, and
+        // skipped with it rather than on their own account: there is no virtual
+        // monitor on the host for the server to inject into, so an input event
+        // here would have nowhere to go but the real devices.
+        if let Some(display) = &display {
+            input::setup_keyboard(&display.canvas);
+            input::setup_touch(&display.canvas);
+            gamepad::setup_gamepad();
+            input::setup_mouse(&display.canvas, release_flag);
+        }
 
         // 12. Wait for render loop to finish (signals connection closed).
         if let Err(e) = render_loop.await {
