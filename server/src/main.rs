@@ -181,27 +181,14 @@ where
 }
 
 async fn setup_config(config_dir: &Path) -> Result<()> {
-    let config_file_name = std::fs::read_dir(&config_dir)?.find_map(|p| {
-        let name = p.ok()?.file_name().to_str()?.to_string();
-        if name.starts_with("config")
-            && ["json", "toml", "yaml", "yml"]
-                .iter()
-                .any(|ext| name.ends_with(&format!(".{ext}")))
-        {
-            Some(name)
-        } else {
-            None
-        }
-    });
-    if let Some(config_path) = config_file_name {
-        let config_path = config_dir.join(&config_path);
+    if let Some(config_path) = config::discover_config(config_dir) {
         let config = fs::read_to_string(&config_path).await?;
         if config.trim() == "" {
             update_config(Config::initialise_at(&config_path)?).await?;
         } else {
             let mut config = config::parse_config(&config_path, &config)
                 .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err))?;
-            config.path = config_path.to_owned();
+            config.path = config_path;
             *APP_CONFIG.lock().await = Some(config);
         }
     } else {
@@ -253,6 +240,11 @@ pub async fn update_config(config: Config) -> Result<()> {
     } else if name.ends_with(".yaml") || name.ends_with(".yml") {
         serde_yaml::to_string(&config)?
     } else {
+        // Not `json5::to_string`, even though JSON5 is what *reads* it: that
+        // serializer has no strict mode and always drops the quotes around
+        // object keys, so what we wrote would no longer be a valid `.json`
+        // file for the user's editor or any other JSON tool. Reading is more
+        // permissive than writing on purpose.
         serde_json::to_string_pretty(&config)?
     };
     fs::write(path, &contents).await?;

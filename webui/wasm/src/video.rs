@@ -11,7 +11,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, KeyboardEvent, VideoFrame,
+    CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, HtmlDivElement, KeyboardEvent,
+    VideoFrame,
 };
 
 // ---------------------------------------------------------------------------
@@ -191,6 +192,27 @@ fn is_installed_pwa(window: &web_sys::Window) -> bool {
         .unwrap_or(false)
 }
 
+/// The card the /audio page is built in: the status indicator and start button
+/// on top, the visualiser below, all laid out in one column so nothing is
+/// pinned over anything else.
+fn create_audio_container() -> HtmlDivElement {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let container = document
+        .create_element("div")
+        .unwrap()
+        .dyn_into::<HtmlDivElement>()
+        .unwrap();
+    container.style().set_css_text(
+        "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);\
+         width:min(560px,calc(100vw - 32px));box-sizing:border-box;padding:20px;\
+         display:flex;flex-direction:column;align-items:stretch;gap:14px;\
+         background:#16161b;border:1px solid #33333f;border-radius:14px;\
+         box-shadow:0 18px 48px rgba(0,0,0,.55);z-index:1000;pointer-events:auto;",
+    );
+    document.body().unwrap().append_child(&container).unwrap();
+    container
+}
+
 // ---------------------------------------------------------------------------
 // Codec capability probing
 // ---------------------------------------------------------------------------
@@ -244,9 +266,7 @@ async fn send_request_repair(
         let map = pending.borrow();
         missing
             .iter()
-            .filter_map(|id| {
-                map.get(id).map(|entry| (*id, entry.fragments.missing()))
-            })
+            .filter_map(|id| map.get(id).map(|entry| (*id, entry.fragments.missing())))
             // A frame the client cannot name a fragment for contributes nothing,
             // and a request naming it would be a request the server cannot answer.
             .filter(|(_, indices)| !indices.is_empty())
@@ -255,9 +275,11 @@ async fn send_request_repair(
     if frames.is_empty() {
         return false;
     }
-    log::debug!("repair: asking for {} fragment(s) of {} frame(s)",
+    log::debug!(
+        "repair: asking for {} fragment(s) of {} frame(s)",
         frames.iter().map(|(_, i)| i.len()).sum::<usize>(),
-        frames.len());
+        frames.len()
+    );
     if !crate::send_reliable(ClientDatagram::ResendDeltas { frames }).await {
         // The request is lost, which is the case the escalation deadline exists
         // for: the gap is still open and the client will ask for a keyframe when
@@ -756,23 +778,35 @@ pub async fn render_loop(
     // Opus AudioDecoder, in which case AudioFrames are ignored.
     let audio = AudioPlayer::new();
     if audio.is_none() {
-        log::error!("audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext");
+        log::error!(
+            "audio: AudioPlayer::new() returned None — no Opus AudioDecoder / AudioContext"
+        );
         // On the /audio page, tell this user, client-side, why there is no
         // sound: without a player there is no activity feed to derive a state
-        // from, so the badge is fixed at "unavailable".
+        // from, so the status element is fixed at "unavailable".
         if display.is_none() {
-            crate::audio::StatusBadge::unavailable();
+            let container = create_audio_container();
+            crate::audio::status_element_unavailable(&container);
         }
     }
 
-    // The visualiser and its status badge are /audio-page decorations: a video
-    // session keeps the whole screen for the remote desktop. Both bind to the
-    // player's analyser / activity feed, and neither creates nor sends
-    // anything the server could see.
+    // The status element, start button and visualiser are /audio-page
+    // decorations: a video session keeps the whole screen for the remote
+    // desktop. All three bind to the player's activity feed / context /
+    // analyser, and none creates or sends anything the server could see.
     let _audio_page_ui = match (&audio, display) {
         (Some(player), None) => {
-            crate::audio::StatusBadge::with_activity(player.activity());
-            Some(crate::visualiser::Visualiser::new(&player.analyser()))
+            let container = create_audio_container();
+            // The status element first: the button's click handler repaints it,
+            // so it has to exist before the button that drives it.
+            let status = crate::audio::status_element_with_activity(&container, player.activity());
+            crate::audio::audio_start_button(&container, &player.audio_context(), status);
+            // Appended last, so the card stacks below the indicator and button
+            // instead of covering them.
+            Some(crate::visualiser::Visualiser::new(
+                &player.analyser(),
+                &container,
+            ))
         }
         _ => None,
     };
@@ -830,6 +864,17 @@ pub async fn render_loop(
         }
 
         match msg {
+            ServerDatagram::AudioLevel { level } => {
+                log::debug!(
+                    "received audio level: {} ({:.1}%)",
+                    level,
+                    level as f32 / 255.0 * 100.0
+                );
+                if let Some(a) = &audio {
+                    a.set_volume(level);
+                }
+                continue;
+            }
             ServerDatagram::AudioFrame {
                 frame_id,
                 frag_idx,

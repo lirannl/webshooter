@@ -1,12 +1,11 @@
 use crate::{
     auth::{OnetimeToken, UserId, user_from_id},
-    config::{Bytes64, Config},
+    config::{Bytes64, Config, NameTemplate},
     error::WebshooterError,
-    ipc,
+    get_config, ipc,
     pipewire::audio::{AudioSink, forward_audio, start_audio_sink},
     pipewire::video,
 };
-use tokio_util::sync::CancellationToken;
 use anyhow::Result;
 use log::LevelFilter;
 use shared::client_datagram::{ClientDatagram, is_input_byte};
@@ -18,13 +17,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tokio::sync::broadcast::error::RecvError;
 use tokio::{
     io::AsyncReadExt,
     spawn,
     sync::{broadcast, mpsc, mpsc::Receiver, watch},
     time::{self},
 };
-use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, endpoint::IncomingSession};
 
 /// How long the server waits for a client datagram before deciding the peer is
@@ -81,8 +81,8 @@ impl InputFloodGuard {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * INPUT_FLOOD_RATE_PER_SEC as f64)
-            .min(INPUT_FLOOD_BURST as f64);
+        self.tokens =
+            (self.tokens + elapsed * INPUT_FLOOD_RATE_PER_SEC as f64).min(INPUT_FLOOD_BURST as f64);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -128,9 +128,29 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         let (control_tx, control_rx) = mpsc::channel::<ServerDatagram>(8);
         let disconnect = CancellationToken::new();
         let (client_tx, client_rx) = broadcast::channel::<ClientDatagram>(256);
-        let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
+        let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> =
+            Arc::new(Mutex::new(None));
         let audio_sink: Arc<Mutex<Option<AudioSink>>> = Arc::new(Mutex::new(None));
-        let session_name = video::virtual_monitor_name(&display_name, client_id);
+        // The sink's volume setting, reported by the sink node itself. The
+        // channel is session-scoped but the producer does not exist until the
+        // client's AudioContext starts, so `monitor_host_volume` has to be
+        // armed before there is anything to report.
+        let (volume_tx, volume_rx) = mpsc::channel::<u8>(8);
+
+        // Render this session's resource names once, up front. A template that
+        // fails here was already validated when the config was parsed, so this
+        // is the defensive path — and it is handled per session rather than
+        // with `?`, because one unrenderable name must not take the whole
+        // WebTransport endpoint down with it.
+        let config = get_config().await;
+        let (virtual_display, virtual_speaker) =
+            match render_session_names(&config, &display_name, client_id) {
+                Ok(names) => names,
+                Err(err) => {
+                    log::error!("dropping session {client_id}: {err:#}");
+                    continue;
+                }
+            };
 
         // Every long-lived task of this session is created up-front as a
         // local; the supervisor below takes ownership of them all, so a
@@ -141,13 +161,21 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         let mut datagrams = broadcast_datagrams(connection.clone(), client_tx.clone());
         let mut unistreams = broadcast_unistreams(connection.clone(), client_tx.clone());
         let mut client_events = client_events_task(client_rx.resubscribe(), decoder_caps.clone());
+        // Forward the host's volume setting to the client. Not a supervisor arm:
+        // it ends only when the session does.
+        tokio::spawn({
+            let wt = connection.clone();
+            let cancel = disconnect.clone();
+            async move { monitor_host_volume(wt, volume_rx, cancel).await }
+        });
         // Not a supervisor arm — see `audio_ready_task`.
         audio_ready_task(
             client_rx.resubscribe(),
-            session_name,
+            virtual_speaker.clone(),
             control_tx.clone(),
             disconnect.clone(),
             audio_sink.clone(),
+            volume_tx,
         );
 
         // Capture negotiation, the frame forwarder and the run loop run in a
@@ -162,7 +190,7 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         let mut driver = tokio::spawn(async move {
             if let Err(err) = run_session(
                 client_id,
-                display_name,
+                virtual_display,
                 control_tx,
                 control_rx,
                 connection,
@@ -241,6 +269,51 @@ async fn webtransport_auth(session: IncomingSession) -> Result<(UserId, Connecti
     }
 }
 
+/// This session's two rendered resource names: the virtual display and the
+/// virtual speaker.
+///
+/// Both are resolved against the registry *before* this session is registered,
+/// so each reflects exactly the sessions it has to stay distinct from.
+fn render_session_names(
+    config: &Config,
+    user_name: &str,
+    client_id: ipc::ClientId,
+) -> Result<(String, String)> {
+    let is_primary = ipc::lowest_client_id().is_none_or(|lowest| client_id <= lowest);
+    let render = |template: &NameTemplate| {
+        template.render(
+            &name_for(template, user_name, client_id, is_primary),
+            client_id,
+        )
+    };
+    Ok((
+        render(&config.virtual_display_name)?,
+        render(&config.virtual_speaker_name)?,
+    ))
+}
+
+/// The `name` parameter for one session: the sanitised user name, with the
+/// client id appended only when it has to be unique.
+///
+/// A template that spells `{{ client_id }}` out is naming itself, so `name` is
+/// left as the plain user name. Otherwise only a session that does not hold the
+/// lowest id needs the id to stay distinct from the sessions already live.
+/// Ids are reserved exclusively by [`ipc::next_client_id`] and this is decided
+/// once, at session start, so no two live sessions can land on the same name.
+fn name_for(
+    template: &NameTemplate,
+    user_name: &str,
+    client_id: ipc::ClientId,
+    is_primary: bool,
+) -> String {
+    let user_name = video::sanitise_name(user_name);
+    if template.references_client_id() || is_primary {
+        user_name
+    } else {
+        format!("{user_name}-{client_id}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -250,7 +323,7 @@ async fn webtransport_auth(session: IncomingSession) -> Result<(UserId, Connecti
 #[allow(clippy::too_many_arguments)]
 pub async fn run_session(
     client_id: ipc::ClientId,
-    display_name: String,
+    virtual_display: String,
     server_msg_tx: mpsc::Sender<ServerDatagram>,
     control_rx: mpsc::Receiver<ServerDatagram>,
     connection: Arc<Connection>,
@@ -272,9 +345,9 @@ pub async fn run_session(
     // Own the application audio sink at the *session* level (not inside the
     // video capture), so video context resets / display resizes never disturb
     // it.  It is created lazily by session startup's audio task once the
-    // client's AudioContext starts, named per this session
-    // (`webshooter-<user>-<id>-audio-sink`), and torn down when the session
-    // ends via the session's disconnect token.
+    // client's AudioContext starts, named by the `virtual_speaker_name`
+    // template (e.g. `alice-webshooter`), and torn down when the session ends
+    // via the session's disconnect token.
 
     // Taken before `capture` moves the original: the resend pump answers repair
     // requests, which are a client-to-server message like any other, so it needs
@@ -290,8 +363,7 @@ pub async fn run_session(
         r = video::capture(
             client_rx,
             decoder_caps.clone(),
-            display_name,
-            client_id,
+            virtual_display,
             cancel.clone(),
             server_msg_tx,
         ) => r.map(Some),
@@ -388,6 +460,7 @@ fn audio_ready_task(
     control_tx: mpsc::Sender<ServerDatagram>,
     audio_cancel: CancellationToken,
     audio_sink: Arc<Mutex<Option<AudioSink>>>,
+    volume_tx: mpsc::Sender<u8>,
 ) {
     spawn(async move {
         // Wait for the client's AudioReady signal (with its channel/rate
@@ -419,7 +492,15 @@ fn audio_ready_task(
         if audio_cancel.is_cancelled() {
             return;
         }
-        match start_audio_sink(audio_cancel.clone(), session_name, channels, rate).await {
+        match start_audio_sink(
+            audio_cancel.clone(),
+            session_name,
+            channels,
+            rate,
+            volume_tx,
+        )
+        .await
+        {
             Ok((sink, rx)) => {
                 println!("[audio] client ready — created PipeWire audio sink");
                 spawn(async move {
@@ -473,9 +554,7 @@ fn broadcast_datagrams(
                     // Cheap byte pre-filter: skip floods without paying for the
                     // full `from_bytes` parse. Extra datagrams simply linger in
                     // the (bounded) QUIC receive buffer until dropped.
-                    if datagram.first().is_some_and(|&b| is_input_byte(b))
-                        && !flood.allow_input()
-                    {
+                    if datagram.first().is_some_and(|&b| is_input_byte(b)) && !flood.allow_input() {
                         continue;
                     }
                     if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
@@ -538,7 +617,10 @@ fn frame_forwarder(
     let (keyframe_tx, keyframe_rx) = watch::channel::<Option<KeyframeMessage>>(None);
     spawn(keyframe_forwarder(keyframe_rx, wt.clone()));
     let mut pacer = datagram_pacing_bps().map(|bps| {
-        log::info!("delta datagrams paced at {bps} bit/s ({}B each)", payload_size);
+        log::info!(
+            "delta datagrams paced at {bps} bit/s ({}B each)",
+            payload_size
+        );
         Pacer::new(bps, payload_size)
     });
     if pacer.is_none() {
@@ -774,7 +856,10 @@ async fn keyframe_forwarder(mut rx: watch::Receiver<Option<KeyframeMessage>>, wt
                     // that proves the whole split path works: no line here means
                     // the client never got a reference frame, whatever the
                     // datagram traffic looks like.
-                    log::info!("first keyframe sent on its own stream ({} bytes)", bytes.len());
+                    log::info!(
+                        "first keyframe sent on its own stream ({} bytes)",
+                        bytes.len()
+                    );
                 } else {
                     log::debug!("keyframe sent on its own stream ({} bytes)", bytes.len());
                 }
@@ -815,9 +900,7 @@ fn report_link(wt: &Connection, last: &mut LinkReport) {
     let black_holes = path
         .black_holes_detected
         .wrapping_sub(last.last_black_holes);
-    let congestion = path
-        .congestion_events
-        .wrapping_sub(last.last_congestion);
+    let congestion = path.congestion_events.wrapping_sub(last.last_congestion);
     last.last_lost = path.lost_packets;
     last.last_black_holes = path.black_holes_detected;
     last.last_congestion = path.congestion_events;
@@ -1047,7 +1130,10 @@ impl DeltaRing {
     /// originally cut at, or the client reassembles a different payload than the
     /// one it was missing.
     fn fragment(&self, frame_id: u16, index: u16) -> Option<Vec<u8>> {
-        let entry = self.entries.iter().find(|entry| entry.frame_id == frame_id)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.frame_id == frame_id)?;
         let index = index as usize;
         if index >= entry.num_frags as usize {
             return None;
@@ -1118,11 +1204,7 @@ async fn send_delta(
     let started = Instant::now();
     for (idx, chunk) in payload.chunks(*payload_size).enumerate() {
         let dgram = server_datagram::ServerDatagram::delta_to_bytes(
-            frame_id,
-            idx as u16,
-            num_frags,
-            codec,
-            chunk,
+            frame_id, idx as u16, num_frags, codec, chunk,
         );
         // quinn drops the *oldest* queued datagram to make room for one that
         // does not fit, so sending into a full buffer loses a fragment that was
@@ -1232,6 +1314,49 @@ async fn send_keyframe(wt: &Connection, bytes: &[u8]) -> Result<()> {
     // keyframe is never declared sent before the client can read all of it.
     stream.finish().await?;
     Ok(())
+}
+
+/// Send an AudioLevel message on a dedicated unidirectional stream.
+async fn send_audio_level(wt: &Connection, level: u8) -> Result<()> {
+    let bytes = ServerDatagram::AudioLevel { level }.to_bytes();
+    let mut stream = wt.open_uni().await?.await?;
+    stream.write_all(&bytes).await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+/// Forward the host's volume setting for this session's virtual sink to the
+/// client as [`ServerDatagram::AudioLevel`] on a reliable stream.
+///
+/// `levels` is fed by a PipeWire listener on the sink node, so it starts
+/// reporting the sink's actual value as soon as the sink exists and then every
+/// time the user changes it. Deduplicating here rather than at the source means
+/// a value repeated by PipeWire (a re-enumeration, an unrelated param change)
+/// does not become a stream per repetition.
+async fn monitor_host_volume(
+    wt: Arc<Connection>,
+    mut levels: mpsc::Receiver<u8>,
+    cancel: CancellationToken,
+) {
+    let mut last_level: Option<u8> = None;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            level = levels.recv() => {
+                // A closed channel means the sink is gone, which ends the
+                // session that owned it; there is nothing left to report.
+                let Some(level) = level else { break };
+                if last_level == Some(level) {
+                    continue;
+                }
+                last_level = Some(level);
+                if let Err(e) = send_audio_level(&wt, level).await {
+                    log::debug!("audio: failed to send AudioLevel: {e}");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1381,7 +1506,10 @@ mod tests {
         // 1 bit/s over a full 65535-byte datagram is well under one nanosecond
         // per bit, and truncating it to zero would send every fragment at once.
         let pacer = Pacer::new(1, 65_535);
-        assert!(pacer.interval > Duration::ZERO, "a ceiling of 1 bit/s gave no wait");
+        assert!(
+            pacer.interval > Duration::ZERO,
+            "a ceiling of 1 bit/s gave no wait"
+        );
         // A higher rate legitimately gives a shorter one, so the interval must
         // actually be tracking the ceiling rather than being a constant.
         assert!(Pacer::new(7_000_000, 1192).interval < pacer.interval);
@@ -1400,7 +1528,10 @@ mod tests {
         profile.record(1_000, 40, Duration::from_millis(1));
 
         assert_eq!(profile.frames, 2);
-        assert_eq!(profile.peak_burst_bytes, 60_000, "largest burst is the wide frame");
+        assert_eq!(
+            profile.peak_burst_bytes, 60_000,
+            "largest burst is the wide frame"
+        );
         assert_eq!(profile.peak_frags, 40, "most fragments is the split frame");
     }
 
@@ -1431,7 +1562,11 @@ mod tests {
     /// must not silently take it off when the caller believed it was on.
     #[test]
     fn pacing_setting_is_read_from_the_environment() {
-        assert_eq!(parse_pacing_bps(None), Some(DEFAULT_PACING_BPS), "on by default");
+        assert_eq!(
+            parse_pacing_bps(None),
+            Some(DEFAULT_PACING_BPS),
+            "on by default"
+        );
         assert_eq!(parse_pacing_bps(Some("off".into())), None);
         assert_eq!(parse_pacing_bps(Some("OFF".into())), None);
         assert_eq!(parse_pacing_bps(Some("0".into())), None);
@@ -1485,7 +1620,10 @@ mod tests {
                 other => panic!("expected a VideoDelta, got {other:?}"),
             }
         }
-        assert_eq!(rebuilt, payload, "the resend reassembles to the original bytes");
+        assert_eq!(
+            rebuilt, payload,
+            "the resend reassembles to the original bytes"
+        );
     }
 
     /// The last fragment of a frame is short, and a resend must not pad it or run
@@ -1499,7 +1637,11 @@ mod tests {
         let dgram = ring.fragment(7, 2).expect("the last fragment is held");
         match ServerDatagram::from_bytes(&dgram).expect("parses") {
             ServerDatagram::VideoDelta { payload, .. } => {
-                assert_eq!(payload.len(), 500, "the tail fragment is 500 bytes, not 1000");
+                assert_eq!(
+                    payload.len(),
+                    500,
+                    "the tail fragment is 500 bytes, not 1000"
+                );
             }
             other => panic!("expected a VideoDelta, got {other:?}"),
         }
@@ -1513,7 +1655,10 @@ mod tests {
         let mut ring = DeltaRing::new();
         ring.insert(entry(7, &[0; 100], 1000));
         assert!(ring.fragment(8, 0).is_none(), "frame 8 was never held");
-        assert!(ring.fragment(7, 5).is_none(), "index 5 is not one of frame 7's fragments");
+        assert!(
+            ring.fragment(7, 5).is_none(),
+            "index 5 is not one of frame 7's fragments"
+        );
     }
 
     /// The ring is bounded, and the bound has to fall on the oldest frames: those
@@ -1552,7 +1697,10 @@ mod tests {
             "the ring holds {} frames",
             ring.entries.len()
         );
-        assert!(ring.fragment(0, 0).is_none(), "the oldest frames are evicted");
+        assert!(
+            ring.fragment(0, 0).is_none(),
+            "the oldest frames are evicted"
+        );
     }
 
     /// An unpaced send loop cannot rate-limit anything, and this pins the proof.
@@ -1588,7 +1736,10 @@ mod tests {
             std::hint::black_box(&dgram);
         }
         let span = started.elapsed();
-        assert!(span < Duration::from_millis(1), "the tight loop took {span:?}");
+        assert!(
+            span < Duration::from_millis(1),
+            "the tight loop took {span:?}"
+        );
 
         // The same bytes at the ceiling, and the ratio that makes the point: the
         // loop is thousands of times faster than the rate it is supposed to be
@@ -1693,5 +1844,37 @@ mod tests {
             allowed >= expected - 8,
             "must track the refill rate under load: allowed {allowed}, expected ~{expected}"
         );
+    }
+
+    /// Two sessions of one user must not both be named `alice-webshooter`: they
+    /// would collide on a single PipeWire sink and make the `.monitor` source the
+    /// capture opens ambiguous. The *first* session keeps the plain name — that
+    /// is the one the user's own volume control is pointed at — and only a second
+    /// one is disambiguated. A template that spells `{{ client_id }}` out never
+    /// needs disambiguating, because it is the thing doing the naming.
+    #[test]
+    fn only_a_non_primary_session_has_the_client_id_folded_into_its_name() {
+        let plain = NameTemplate::parse("{{ name }}-webshooter").unwrap();
+        assert_eq!(
+            name_for(&plain, "alice", 1, /* is_primary = */ true),
+            "alice"
+        );
+        assert_eq!(
+            name_for(&plain, "alice", 2, /* is_primary = */ false),
+            "alice-2"
+        );
+
+        let self_naming = NameTemplate::parse("{{ client_id }}-{{ name }}").unwrap();
+        for is_primary in [true, false] {
+            assert_eq!(
+                name_for(&self_naming, "alice", 3, is_primary),
+                "alice",
+                "a template that names itself is already unique"
+            );
+        }
+
+        // A user name that is not a safe identifier is sanitised before it is
+        // rendered, so the template's literal text is the author's business.
+        assert_eq!(name_for(&plain, "Alice O'Brien", 1, true), "Alice_O_Brien");
     }
 }

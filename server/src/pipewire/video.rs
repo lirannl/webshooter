@@ -32,7 +32,7 @@ use std::{
 };
 use tokio::{
     spawn,
-    sync::{broadcast::error::RecvError, broadcast::Receiver, mpsc},
+    sync::{broadcast::Receiver, broadcast::error::RecvError, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -42,16 +42,18 @@ use tokio_util::sync::CancellationToken;
 // Virtual monitor (KWin)
 // ---------------------------------------------------------------------------
 
-/// Build a unique, krfb-safe virtual-monitor name from the authorised user's
-/// name and this capture's id (e.g. `webshooter-alice-3`).  Non-alphanumeric
-/// characters in the username are replaced so the name stays valid as a
-/// monitor/PipeWire node identifier.
-pub fn virtual_monitor_name(user_name: &str, client_id: u64) -> String {
-    let safe: String = user_name
+/// Make `user_name` safe to use as a monitor/PipeWire node identifier by
+/// replacing every non-alphanumeric character with `_`.
+///
+/// This is applied to the `name` parameter before it is rendered into a name
+/// template, not to the rendered result: the literal text of a template is its
+/// author's, and a config that produces something PipeWire rejects is a
+/// mistake worth seeing rather than one worth silently rewriting.
+pub fn sanitise_name(user_name: &str) -> String {
+    user_name
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    format!("webshooter-{safe}-{client_id}")
+        .collect()
 }
 
 fn is_kwin() -> bool {
@@ -134,15 +136,13 @@ pub struct EncodedFrame {
 /// Open the XDG screencast portal, build a GStreamer encode pipeline, and
 /// start streaming encoded frames into the returned channel.
 ///
-/// `user_name` uniquely names this capture's virtual display / PipeWire sink so
-/// multiple simultaneous clients don't collide on the same node.  `client_id`
-/// is the registry id assigned by the WebTransport handler, used to route
-/// control datagrams back to this specific client and to name resources.
+/// `display_name` is this capture's already-rendered virtual display name (see
+/// [`crate::config::NameTemplate`]); it uniquely identifies the monitor, so
+/// multiple simultaneous clients don't collide on the same node.
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
-    user_name: String,
-    client_id: crate::ipc::ClientId,
+    display_name: String,
     cancel: CancellationToken,
     server_msg_tx: mpsc::Sender<ServerDatagram>,
 ) -> Result<(mpsc::Receiver<EncodedFrame>, JoinHandle<()>)> {
@@ -166,7 +166,6 @@ pub async fn capture(
     let task = spawn({
         let cancel = cancel.clone();
         let decoder_caps = decoder_caps.clone();
-        let user_name = user_name.clone();
         let portal_token = portal_token.clone();
         let server_msg_tx = server_msg_tx.clone();
         async move {
@@ -180,8 +179,7 @@ pub async fn capture(
                     &remote_desktop,
                     &screencast,
                     &decoder_caps,
-                    &user_name,
-                    client_id,
+                    &display_name,
                     &portal_token,
                 )
                 .await
@@ -204,8 +202,7 @@ async fn single_capture(
     remote_desktop: &RemoteDesktop,
     screencast: &Screencast,
     decoder_caps: &Mutex<Option<Vec<Codec>>>,
-    user_name: &str,
-    client_id: u64,
+    display_name: &str,
     portal_token: &PortalToken,
 ) -> Result<()> {
     loop {
@@ -251,8 +248,7 @@ async fn single_capture(
         // instead of hanging for another ResizeDisplay.
         last_dims.replace((width, height, index));
 
-        let virtual_monitor =
-            VirtualMonitor::spawn(width, height, virtual_monitor_name(user_name, client_id))?;
+        let virtual_monitor = VirtualMonitor::spawn(width, height, display_name.to_owned())?;
 
         if let VirtualMonitor::ChildProcess(_) = virtual_monitor {
             cancel

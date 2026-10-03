@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 use shared::server_datagram::ServerDatagram;
 use std::{
     collections::HashMap,
-    env, fmt::Display, io::ErrorKind, path::PathBuf, process::exit, str::FromStr,
+    env,
+    fmt::Display,
+    io::ErrorKind,
+    path::PathBuf,
+    process::exit,
+    str::FromStr,
     sync::{Arc, LazyLock},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
@@ -180,7 +185,10 @@ impl Drop for Session {
         // authorisation path skipped its teardown — so make it loud instead of
         // silently remediating by cancelling from the destructor.
         if !self.disconnect.is_cancelled() {
-            log::error!("session {} dropped without the cancel token cancelled", self.id);
+            log::error!(
+                "session {} dropped without the cancel token cancelled",
+                self.id
+            );
             debug_assert!(
                 self.disconnect.is_cancelled(),
                 "session {} dropped without async cancellation",
@@ -264,6 +272,16 @@ pub fn remove_session(id: ClientId) {
     mutate_registry(|registry| {
         registry.remove(&id);
     });
+}
+
+/// The lowest client id currently in use, or `None` when no session is
+/// registered.
+///
+/// This is what distinguishes a session's *primary* session from a second one:
+/// the lowest id is held by exactly one session at a time (see
+/// [`next_client_id`]), so comparing against it is enough.
+pub fn lowest_client_id() -> Option<ClientId> {
+    REGISTRY.borrow().keys().copied().min()
 }
 
 /// Snapshot of currently connected clients for UI (tray menu) rendering.

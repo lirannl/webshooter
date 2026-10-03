@@ -5,12 +5,11 @@ use std::rc::Rc;
 use js_sys::Float32Array;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
 
 use web_sys::{
     AnalyserNode, AudioBuffer, AudioContext, AudioData, AudioDataCopyToOptions, AudioDecoder,
     AudioDecoderConfig, AudioNode, AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit,
-    EncodedAudioChunkType, HtmlDivElement, HtmlSpanElement,
+    EncodedAudioChunkType, GainNode, HtmlButtonElement, HtmlDivElement, HtmlSpanElement,
 };
 
 use shared::fragment::{FragmentFrame, PushOutcome};
@@ -27,6 +26,9 @@ struct PlaybackState {
     /// this costs nothing audible. It feeds the client-side visualiser — the
     /// server sends the same Opus frames whether or not it is here.
     analyser: AnalyserNode,
+    /// Optional gain node for volume control. Created lazily when set_volume
+    /// is first called, inserted between analyser and destination.
+    gain: std::cell::OnceCell<GainNode>,
     /// Client-side, server-oblivious signs that the player is alive: written
     /// by the playback paths, read by the status badge.
     activity: Rc<RefCell<AudioActivity>>,
@@ -53,7 +55,7 @@ struct PlaybackState {
 /// client-side: derived from the AudioContext state and recent play-out, and
 /// the server both plays no part in it and is never told about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AudioPhase {
+pub enum AudioPhase {
     /// No player exists in this browser (no AudioContext / Opus AudioDecoder).
     Unavailable,
     /// The context exists but is suspended — typically waiting for the first
@@ -83,10 +85,10 @@ const BADGE_REPAINT_MS: u32 = 250;
 /// window.
 const BADGE_ACTIVE_WINDOW_MS: f64 = 3000.0;
 
-/// The state shared between the badge handle and its periodic repainter.
-struct BadgeShared {
+/// The state shared between the element handle and its periodic repainter.
+pub struct BadgeShared {
     feed: Option<Rc<RefCell<AudioActivity>>>,
-    phase: AudioPhase,
+    pub phase: AudioPhase,
     dot: HtmlDivElement,
     label: HtmlSpanElement,
 }
@@ -109,7 +111,7 @@ fn derive_phase(shared: &Rc<RefCell<BadgeShared>>) -> AudioPhase {
 }
 
 /// Write `phase` to the DOM and record it as the badge's current phase.
-fn paint_badge(shared: &Rc<RefCell<BadgeShared>>, phase: AudioPhase) {
+pub fn paint_badge(shared: &Rc<RefCell<BadgeShared>>, phase: AudioPhase) {
     let mut s = shared.borrow_mut();
     s.phase = phase;
     let (color, text) = match phase {
@@ -132,86 +134,139 @@ fn repaint_badge(shared: &Rc<RefCell<BadgeShared>>) {
     paint_badge(shared, phase);
 }
 
-/// The fixed bottom-right badge that tells this user, entirely on the client
+/// An inline status element that tells this user, entirely on the client
 /// side, whether this session's audio player is doing anything. It is created
 /// only on the /audio page (a video session keeps the screen for the remote
 /// desktop). The server is not involved and cannot influence it. The element
-/// and its repaint timer are owned by the timer (the badge handle itself is
-/// stateless and short-lived).
-pub struct StatusBadge;
+/// lives in the DOM and its repaint timer in a forgotten closure, so the
+/// builders below hand back only the shared state a sibling element needs —
+/// there is no handle to keep alive.
 
-impl StatusBadge {
-    /// A badge fed by a live player's activity, repainted as that activity
-    /// changes.
-    pub fn with_activity(activity: Rc<RefCell<AudioActivity>>) -> StatusBadge {
-        let (_, dot, label) = Self::build_element();
-        let shared = Rc::new(RefCell::new(BadgeShared {
-            feed: Some(activity),
-            phase: AudioPhase::Suspended,
-            dot,
-            label,
-        }));
-        Self::start(shared)
-    }
+/// An inline status element fed by a live player's activity, repainted as that
+/// activity changes, appended to `parent`. Returns the shared state so a
+/// sibling element can drive it.
+pub fn status_element_with_activity(
+    parent: &HtmlDivElement,
+    activity: Rc<RefCell<AudioActivity>>,
+) -> Rc<RefCell<BadgeShared>> {
+    let (dot, label) = build_status_element(parent);
+    let shared = Rc::new(RefCell::new(BadgeShared {
+        feed: Some(activity),
+        phase: AudioPhase::Suspended,
+        dot,
+        label,
+    }));
+    start_status_repaint(shared.clone());
+    shared
+}
 
-    /// A badge for a session whose player could not be created. It never
-    /// changes once painted.
-    pub fn unavailable() -> StatusBadge {
-        let (_, dot, label) = Self::build_element();
-        let shared = Rc::new(RefCell::new(BadgeShared {
-            feed: None,
-            phase: AudioPhase::Unavailable,
-            dot,
-            label,
-        }));
-        Self::start(shared)
-    }
+/// An inline status element for a session whose player could not be created.
+/// It never changes once painted. Appended to `parent`.
+pub fn status_element_unavailable(parent: &HtmlDivElement) {
+    let (dot, label) = build_status_element(parent);
+    let shared = Rc::new(RefCell::new(BadgeShared {
+        feed: None,
+        phase: AudioPhase::Unavailable,
+        dot,
+        label,
+    }));
+    start_status_repaint(shared);
+}
 
-    fn build_element() -> (HtmlDivElement, HtmlDivElement, HtmlSpanElement) {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let el = document
-            .create_element("div")
-            .unwrap()
-            .dyn_into::<HtmlDivElement>()
-            .unwrap();
-        el.style().set_css_text(
-            "position:fixed;right:12px;bottom:12px;z-index:2147483647;display:flex;\
-             align-items:center;gap:8px;padding:6px 12px;border-radius:999px;\
-             background:#1a1a1a;border:1px solid #333;color:rgba(255,255,255,.9);\
-             font:13px/1.4 Inter,system-ui,sans-serif;pointer-events:none;user-select:none;\
-             box-shadow:0 2px 10px rgba(0,0,0,.45);",
+/// Build the dot + label row and append it to `parent`.
+fn build_status_element(parent: &HtmlDivElement) -> (HtmlDivElement, HtmlSpanElement) {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let container = document
+        .create_element("div")
+        .unwrap()
+        .dyn_into::<HtmlDivElement>()
+        .unwrap();
+    container.style().set_css_text(
+        "display:flex;align-items:center;gap:8px;width:100%;box-sizing:border-box;\
+         padding:10px 12px;border-radius:8px;background:#1a1a1a;border:1px solid #333;\
+         color:rgba(255,255,255,.9);font:14px/1.4 Inter,system-ui,sans-serif;user-select:none;",
+    );
+    let dot = document
+        .create_element("div")
+        .unwrap()
+        .dyn_into::<HtmlDivElement>()
+        .unwrap();
+    dot.style()
+        .set_css_text("width:10px;height:10px;border-radius:50%;flex:none;");
+    let label = document
+        .create_element("span")
+        .unwrap()
+        .dyn_into::<HtmlSpanElement>()
+        .unwrap();
+    label.style().set_css_text("white-space:nowrap;");
+    container.append_child(&dot).unwrap();
+    container.append_child(&label).unwrap();
+    parent.append_child(&container).unwrap();
+    (dot, label)
+}
+
+/// Paint the element's first state, then repaint it on a timer for as long as
+/// the page lives.
+fn start_status_repaint(shared: Rc<RefCell<BadgeShared>>) {
+    // Paint the initial state unconditionally: the very first frame must
+    // not skip because the sentinel phase happens to equal the derived one.
+    paint_badge(&shared, derive_phase(&shared));
+    let tick = Closure::wrap(Box::new(move || repaint_badge(&shared)) as Box<dyn FnMut()>);
+    if let Some(win) = web_sys::window() {
+        let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
+            tick.as_ref().unchecked_ref(),
+            BADGE_REPAINT_MS as i32,
         );
-        let dot = document
-            .create_element("div")
-            .unwrap()
-            .dyn_into::<HtmlDivElement>()
-            .unwrap();
-        dot.style().set_css_text("width:10px;height:10px;border-radius:50%;flex:none;");
-        let label = document
-            .create_element("span")
-            .unwrap()
-            .dyn_into::<HtmlSpanElement>()
-            .unwrap();
-        label.style().set_css_text("white-space:nowrap;");
-        el.append_child(&dot).unwrap();
-        el.append_child(&label).unwrap();
-        document.body().unwrap().append_child(&el).unwrap();
-        (el, dot, label)
     }
+    tick.forget();
+}
 
-    fn start(shared: Rc<RefCell<BadgeShared>>) -> StatusBadge {
-        // Paint the initial state unconditionally: the very first frame must
-        // not skip because the sentinel phase happens to equal the derived one.
-        paint_badge(&shared, derive_phase(&shared));
-        let tick = Closure::wrap(Box::new(move || repaint_badge(&shared)) as Box<dyn FnMut()>);
-        if let Some(win) = web_sys::window() {
-            let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
-                tick.as_ref().unchecked_ref(),
-                BADGE_REPAINT_MS as i32,
-            );
-        }
-        tick.forget();
-        StatusBadge
+/// Append a "Start Audio" button to `parent`. Clicking it resumes `ctx` and
+/// hides the button.
+///
+/// `status` is the sibling status element; a click moves it to "waiting" so the
+/// status agrees with the request immediately rather than sitting on "audio
+/// off" until the context's `statechange` lands. The click itself is what
+/// notifies the server: it is `resume` firing `statechange`, which is what runs
+/// [`handle_audio_state`] — only the client knows when a gesture happened, so
+/// only the client can originate `AudioReady`.
+pub fn audio_start_button(
+    parent: &HtmlDivElement,
+    ctx: &web_sys::AudioContext,
+    status: Rc<RefCell<BadgeShared>>,
+) {
+    {
+        let document = web_sys::window().unwrap().document().unwrap();
+        // A `<button>` is an `HtmlButtonElement`, and `dyn_into` on a different
+        // concrete element type fails: casting it to `HtmlDivElement` traps and
+        // takes the whole render loop with it.
+        let button = document
+            .create_element("button")
+            .unwrap()
+            .dyn_into::<HtmlButtonElement>()
+            .unwrap();
+        button.style().set_css_text(
+            "width:100%;box-sizing:border-box;padding:12px 24px;border-radius:8px;\
+             border:1px solid #646cff;background:#1a1a1a;color:#646cff;\
+             font:16px/1.4 Inter,system-ui,sans-serif;cursor:pointer;\
+             transition:background 0.2s,border-color 0.2s;",
+        );
+        button.set_text_content(Some("Start Audio"));
+        button.set_attribute("type", "button").ok();
+
+        let ctx_clone = ctx.clone();
+        let button_clone = button.clone();
+        let cb = Closure::wrap(Box::new(move || {
+            let _ = ctx_clone.resume();
+            let _ = button_clone.style().set_property("display", "none");
+            if status.borrow().phase == AudioPhase::Suspended {
+                paint_badge(&status, AudioPhase::Waiting);
+            }
+        }) as Box<dyn FnMut()>);
+        let _ = button.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
+        cb.forget();
+
+        parent.append_child(&button).unwrap();
     }
 }
 
@@ -265,6 +320,7 @@ impl AudioPlayer {
         let state = Rc::new(RefCell::new(PlaybackState {
             ctx: ctx.clone(),
             analyser: analyser.clone(),
+            gain: std::cell::OnceCell::new(),
             activity,
             next_time: 0.0,
             audio_ready: Cell::new(false),
@@ -365,42 +421,24 @@ impl AudioPlayer {
             }
         }
 
-        // The gesture listeners are the fallback for restrictive web pages:
-        // each interaction attempts a resume, which also completes any resume
-        // promise left pending since construction.
-        let resume_ctx = ctx.clone();
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            let resume_cb = Closure::wrap(Box::new(move || {
-                let _ = resume_ctx.resume();
-            }) as Box<dyn FnMut()>);
-            for ev in ["pointerdown", "keydown", "click", "touchstart"] {
-                let _ =
-                    doc.add_event_listener_with_callback(ev, resume_cb.as_ref().unchecked_ref());
-            }
-            resume_cb.forget();
-        }
-
-        // Drive `handle_audio_state` from every path the context can transition
-        // on: `statechange` events, the initial up-front `resume()` attempt
-        // resolving (permissive environments), and an already-Running
-        // construction. Keeping the resume promise alive from a spawned future
-        // avoids it being garbage-collected mid-flight.
+        // Drive `handle_audio_state` off `statechange`, which is the only path
+        // that can transition the context: the "Start Audio" button calls
+        // `resume()` from an explicit user gesture, and that fires the event.
+        // Deliberately no up-front `resume()` here — an audio-only session must
+        // not begin capturing until this user asks for it, and a context created
+        // outside a gesture is left suspended.
         let ready_state = state.clone();
         let ready_cb =
             Closure::wrap(Box::new(move || handle_audio_state(&ready_state)) as Box<dyn FnMut()>);
         ctx.set_onstatechange(Some(ready_cb.as_ref().unchecked_ref()));
         ready_cb.forget();
 
-        if let Ok(promise) = ctx.resume() {
-            let state = state.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = JsFuture::from(promise).await;
-                handle_audio_state(&state);
-            });
+        // An environment that hands out an already-running context needs no
+        // resume to get there, so report that honestly rather than pretending
+        // the session is still waiting.
+        if ctx.state() == web_sys::AudioContextState::Running {
+            handle_audio_state(&state);
         }
-
-        // In case it is already running from the outset (fully permissive).
-        handle_audio_state(&state);
 
         log::info!("audio: AudioPlayer created");
         Some(AudioPlayer {
@@ -424,6 +462,30 @@ impl AudioPlayer {
     /// derives its state from.
     pub fn activity(&self) -> Rc<RefCell<AudioActivity>> {
         self.state.borrow().activity.clone()
+    }
+
+    /// Get the AudioContext for manual resume from an explicit user gesture.
+    pub fn audio_context(&self) -> web_sys::AudioContext {
+        self.state.borrow().ctx.clone()
+    }
+
+    /// Set the output volume (0-255, representing 0-100%).
+    /// Uses the Web Audio API gain node to adjust the volume.
+    pub fn set_volume(&self, level: u8) {
+        let state = self.state.borrow();
+        let gain = state.gain.get_or_init(|| {
+            let gain = state.ctx.create_gain().unwrap();
+            gain.gain().set_value(1.0);
+            // Insert gain node between analyser and destination
+            let _ = state.analyser.disconnect();
+            let _ = state
+                .analyser
+                .connect_with_audio_node(gain.unchecked_ref::<AudioNode>());
+            let _ = gain.connect_with_audio_node(&state.ctx.destination());
+            gain
+        });
+        let volume = (level as f32 / 255.0).clamp(0.0, 1.0);
+        gain.gain().set_value(volume);
     }
 
     fn configure(&self, channels: u8, rate: u32) {
@@ -496,9 +558,7 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
     let frames = data.number_of_frames();
     let sample_rate = data.sample_rate();
     if channels == 0 || frames == 0 {
-        log::debug!(
-            "audio: empty AudioData dropped (channels={channels} frames={frames})"
-        );
+        log::debug!("audio: empty AudioData dropped (channels={channels} frames={frames})");
         data.close();
         return;
     }
@@ -536,9 +596,7 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
             static PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = PEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
-                log::debug!(
-                    "audio: pcm ch0 peak={peak:.4} frames={frames} rate={sample_rate}"
-                );
+                log::debug!("audio: pcm ch0 peak={peak:.4} frames={frames} rate={sample_rate}");
             }
         }
         let _ = buffer.copy_to_channel(&vec, ch as i32);

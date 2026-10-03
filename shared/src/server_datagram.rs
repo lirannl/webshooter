@@ -1,6 +1,6 @@
 use crate::codec::Codec;
-use log::LevelFilter;
 use anyhow::Result;
+use log::LevelFilter;
 use named_constants::named_constants;
 
 /// 1 discriminant + 1×u16 frame id + 1 codec. A keyframe is never fragmented,
@@ -83,6 +83,13 @@ pub enum ServerDatagram {
     /// newest input state, just not more often than this interval.
     Throttle {
         interval_ms: u16,
+    },
+    /// Host system output volume setting as a fraction of maximum (0-255).
+    /// Sent on a reliable stream at session start and whenever the host volume
+    /// setting changes. The client may use this to synchronise its device
+    /// volume to match the host's output volume.
+    AudioLevel {
+        level: u8,
     },
     /// A delta frame, split across as many datagrams as it needs.
     ///
@@ -176,6 +183,9 @@ impl ServerDatagram {
                 buf.extend_from_slice(&interval_ms.to_be_bytes());
                 buf
             }
+            Self::AudioLevel { level } => {
+                vec![ServerDatagramVariants::AUDIO_LEVEL.0, *level]
+            }
         }
     }
 
@@ -252,6 +262,12 @@ impl ServerDatagram {
                 let interval_ms = u16::from_be_bytes([bytes[1], bytes[2]]);
                 Ok(Self::Throttle { interval_ms })
             }
+            ServerDatagramVariants::AUDIO_LEVEL => {
+                if bytes.len() < 2 {
+                    anyhow::bail!("AudioLevel datagram too short: {} bytes", bytes.len());
+                }
+                Ok(Self::AudioLevel { level: bytes[1] })
+            }
             n => anyhow::bail!("Invalid server datagram discriminant: {}", n.0),
         }
     }
@@ -281,7 +297,14 @@ mod tests {
                     codec: Codec::Av1,
                     payload: vec![0xAA, 0xBB],
                 },
-                vec![0x00, 0x12, 0x34, 0x00, 0xAA, 0xBB],
+                vec![
+                    ServerDatagramVariants::VIDEO_KEY_FRAME.0,
+                    0x12,
+                    0x34,
+                    Codec::Av1.to_byte(),
+                    0xAA,
+                    0xBB,
+                ],
             ),
             (
                 ServerDatagram::VideoDelta {
@@ -291,15 +314,35 @@ mod tests {
                     codec: Codec::Av1,
                     payload: vec![0xAA, 0xBB],
                 },
-                vec![0x06, 0x12, 0x34, 0x00, 0x56, 0x00, 0x03, 0x00, 0xAA, 0xBB],
+                vec![
+                    ServerDatagramVariants::VIDEO_DELTA.0,
+                    0x12,
+                    0x34,
+                    0x00,
+                    0x56,
+                    0x00,
+                    0x03,
+                    Codec::Av1.to_byte(),
+                    0xAA,
+                    0xBB,
+                ],
             ),
-            (ServerDatagram::ReleaseMouse, vec![0x01]),
-            (ServerDatagram::ToggleFullscreen, vec![0x02]),
+            (
+                ServerDatagram::ReleaseMouse,
+                vec![ServerDatagramVariants::RELEASE_MOUSE.0],
+            ),
+            (
+                ServerDatagram::ToggleFullscreen,
+                vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
+            ),
             (
                 ServerDatagram::LogLevel {
                     level: log::LevelFilter::Info,
                 },
-                vec![0x03, 0x03],
+                vec![
+                    ServerDatagramVariants::LOG_LEVEL.0,
+                    crate::log_level::filter_to_byte(log::LevelFilter::Info),
+                ],
             ),
             (
                 ServerDatagram::AudioFrame {
@@ -311,11 +354,30 @@ mod tests {
                     format: AudioFormat::Opus,
                     payload: vec![0x11],
                 },
-                vec![0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x11],
+                vec![
+                    ServerDatagramVariants::AUDIO_FRAME.0,
+                    0x00,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x01,
+                    0x02,
+                    0x00,
+                    0x00,
+                    0xBB,
+                    0x80,
+                    AudioFormat::Opus.to_byte(),
+                    0x11,
+                ],
             ),
             (
                 ServerDatagram::Throttle { interval_ms: 300 },
-                vec![0x05, 0x01, 0x2C],
+                vec![ServerDatagramVariants::THROTTLE.0, 0x01, 0x2C],
+            ),
+            (
+                ServerDatagram::AudioLevel { level: 128 },
+                vec![ServerDatagramVariants::AUDIO_LEVEL.0, 0x80],
             ),
         ];
         for (dgram, expected) in cases {

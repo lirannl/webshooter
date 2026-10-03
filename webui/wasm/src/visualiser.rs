@@ -10,10 +10,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
 
-use web_sys::{AnalyserNode, CanvasRenderingContext2d, HtmlCanvasElement};
+use web_sys::{AnalyserNode, CanvasRenderingContext2d, HtmlCanvasElement, HtmlDivElement};
 
 /// Draw cadence (about 30 fps). A visualiser does not need the full display
 /// refresh rate, and a fixed interval avoids the requestAnimationFrame
@@ -23,7 +23,7 @@ const DRAW_INTERVAL_MS: u32 = 33;
 /// How many bars to draw across the window.
 const BARS: usize = 64;
 
-/// The full-window audio visualiser for the audio-only page.
+/// The audio visualiser card for the audio-only page.
 ///
 /// The canvas and the draw timer are owned by the timer (via a forgotten
 /// closure), so the handle itself only carries the flag that stops the drawing
@@ -33,19 +33,34 @@ pub struct Visualiser {
 }
 
 impl Visualiser {
-    pub fn new(analyser: &AnalyserNode) -> Visualiser {
+    /// Append a bordered card holding the canvas to `parent`. The canvas fills
+    /// the card rather than the window: the visualiser is one element of the
+    /// /audio page, so it is laid out by that page rather than pinned over it.
+    pub fn new(analyser: &AnalyserNode, parent: &HtmlDivElement) -> Visualiser {
         let window = web_sys::window().unwrap();
         let document = window.document().unwrap();
+        // The card is what gives the canvas an edge; a transparent canvas on a
+        // transparent page has nothing to read against, so the bars need a
+        // surface of their own to sit on.
+        let card = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlDivElement>()
+            .unwrap();
+        card.style().set_css_text(
+            "width:100%;height:180px;box-sizing:border-box;overflow:hidden;\
+             border:1px solid #33333f;border-radius:10px;background:#0d0d10;",
+        );
         let canvas = document
             .create_element("canvas")
             .unwrap()
             .dyn_into::<HtmlCanvasElement>()
             .unwrap();
-        canvas.style().set_css_text(
-            "position:fixed;inset:0;width:100%;height:100%;background:transparent;\
-             pointer-events:none;z-index:1;",
-        );
-        document.body().unwrap().append_child(&canvas).unwrap();
+        canvas
+            .style()
+            .set_css_text("display:block;width:100%;height:100%;background:transparent;");
+        card.append_child(&canvas).unwrap();
+        parent.append_child(&card).unwrap();
         let ctx = canvas
             .get_context("2d")
             .ok()
