@@ -513,9 +513,11 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
         }
     };
     let short = crate::auth::format_id(&id);
-    let mut config = crate::get_config().await;
+    let mut config_with_path =
+        crate::get_config_with_path().await;
+    let config = &mut config_with_path.config;
     if let Some(doomed) = config.users.extract_if(|user| id == *user).last() {
-        crate::update_config(config).await?;
+        crate::update_config(config_with_path).await?;
         conn.write(&format!("Deauthorised \"{}\"", doomed.display_name))
             .await?;
     } else {

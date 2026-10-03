@@ -18,7 +18,7 @@ mod tray;
 mod wt;
 use anyhow::Result;
 use auth::negotiate_wt;
-use config::Config;
+use config::{Config, ConfigWithPath};
 use error::WebshooterError;
 use ipc::setup_ipc;
 use poem::{
@@ -55,7 +55,7 @@ use crate::{
     frontend::clear_icons_raster_cache,
 };
 
-pub static APP_CONFIG: LazyLock<Mutex<Option<Config>>> = Default::default();
+pub static APP_CONFIG: LazyLock<Mutex<Option<ConfigWithPath>>> = Default::default();
 pub static RESET_TRIGGER: LazyLock<Mutex<Option<Sender<()>>>> = Default::default();
 
 pub fn reset_app() {
@@ -108,12 +108,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let (tx, mut rx) = mpsc::channel::<()>(1);
     RESET_TRIGGER.lock().await.replace(tx);
 
-    // Desktop tray (Linux only): menu to toggle fullscreen / release mouse.
+    #[cfg(target_os = "linux")]
     tray::setup_tray();
 
     loop {
         clear_icons_raster_cache();
-        let config = get_config().await;
+        let config_with_path = get_config_with_path().await;
+        let config = &config_with_path.config;
         logging::set_level(config.log_level);
 
         setup_ipc(config.clone()).await?;
@@ -139,7 +140,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             ),
         );
 
-        watch_config(&config.path).await;
+        watch_config(&config_with_path.path).await;
 
         let permitted_domains = cert_watcher::sans_from_cert(&config.ssl.paths.cert)?;
         let identity = Identity::self_signed(&permitted_domains)?;
@@ -156,10 +157,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .at("/*", frontend::frontend);
 
         let handle_0 = tokio::spawn(restart_on_error(Server::new(listener).run(app)));
-        let handle_1 = tokio::spawn(restart_on_error(setup_wt(
-            config.clone(),
-            identity,
-        )));
+        let handle_1 = tokio::spawn(restart_on_error(setup_wt(config.clone(), identity)));
         // Wait for a reset signal
         rx.recv().await;
         handle_0.abort();
@@ -182,17 +180,30 @@ where
 
 async fn setup_config(config_dir: &Path) -> Result<()> {
     if let Some(config_path) = config::discover_config(config_dir) {
-        let config = fs::read_to_string(&config_path).await?;
-        if config.trim() == "" {
-            update_config(Config::initialise_at(&config_path)?).await?;
+        let config_str = fs::read_to_string(&config_path).await?;
+        if config_str.trim() == "" {
+            let config = Config::default();
+            update_config(ConfigWithPath {
+                config,
+                path: config_path,
+            })
+            .await?;
         } else {
-            let mut config = config::parse_config(&config_path, &config)
+            let config = config::parse_config(&config_path, &config_str)
                 .map_err(|err| WebshooterError::InvalidConfig(config_path.clone(), err))?;
-            config.path = config_path;
-            *APP_CONFIG.lock().await = Some(config);
+            *APP_CONFIG.lock().await = Some(ConfigWithPath {
+                config,
+                path: config_path,
+            });
         }
     } else {
-        update_config(Config::initialise_at(&config_dir.join("config.json"))?).await?;
+        let config_path = config_dir.join("config.json");
+        let config = Config::default();
+        update_config(ConfigWithPath {
+            config,
+            path: config_path,
+        })
+        .await?;
     }
     Ok(())
 }
@@ -229,23 +240,23 @@ pub async fn setup_config_dir() -> Result<PathBuf> {
     Ok(config_dir)
 }
 
-pub async fn update_config(config: Config) -> Result<()> {
+pub async fn update_config(config: ConfigWithPath) -> Result<()> {
     let path = &config.path;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(WebshooterError::InvalidConfigPath(format!("{path:?}")))?;
     let contents = if name.ends_with(".toml") {
-        toml::to_string_pretty(&config)?
+        toml::to_string_pretty(&config.config)?
     } else if name.ends_with(".yaml") || name.ends_with(".yml") {
-        serde_yaml::to_string(&config)?
+        serde_yaml::to_string(&config.config)?
     } else {
         // Not `json5::to_string`, even though JSON5 is what *reads* it: that
         // serializer has no strict mode and always drops the quotes around
         // object keys, so what we wrote would no longer be a valid `.json`
         // file for the user's editor or any other JSON tool. Reading is more
         // permissive than writing on purpose.
-        serde_json::to_string_pretty(&config)?
+        serde_json::to_string_pretty(&config.config)?
     };
     fs::write(path, &contents).await?;
     *APP_CONFIG.lock().await = Some(config);
@@ -253,6 +264,10 @@ pub async fn update_config(config: Config) -> Result<()> {
 }
 
 pub async fn get_config() -> Config {
+    APP_CONFIG.lock().await.clone().unwrap().config
+}
+
+pub async fn get_config_with_path() -> ConfigWithPath {
     APP_CONFIG.lock().await.clone().unwrap()
 }
 

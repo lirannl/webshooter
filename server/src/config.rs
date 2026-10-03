@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use data_encoding::BASE64;
 use log::LevelFilter;
+use macros::name_template;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ssl_controller::{
     AsyncFilesystemMode, CertKeyPaths, GenerationMethod, SslControllerConfiguration,
@@ -24,8 +25,6 @@ pub static CONFIG_DIR: OnceLock<PathBuf> = Default::default();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(skip)]
-    pub path: PathBuf,
     #[serde(default = "default_version")]
     version: String,
     #[serde(default)]
@@ -45,25 +44,24 @@ pub struct Config {
     /// How this session's virtual display is named. Must substitute
     /// `{{ name }}`; `{{ client_id }}` is optional and decides whether the
     /// session id is folded into `name`.
-    #[serde(default = "default_virtual_display_name")]
+    #[serde(default = "default_virtual_device_name")]
     pub virtual_display_name: NameTemplate,
     /// How this session's virtual speaker (the PipeWire sink application audio
     /// is captured from) is named. Same template rules as the display.
-    #[serde(default = "default_virtual_speaker_name")]
+    #[serde(default = "default_virtual_device_name")]
     pub virtual_speaker_name: NameTemplate,
 }
 
-/// The default for both name templates. Parsed through the same path as a
-/// hand-written one, so a default can never be a template that would be
-/// rejected.
-const DEFAULT_NAME_TEMPLATE: &str = "{{ name }}-webshooter";
-
-fn default_virtual_display_name() -> NameTemplate {
-    NameTemplate::parse(DEFAULT_NAME_TEMPLATE).expect("the default name template must parse")
+/// A config loaded from disk, paired with its source path for hot-reload and
+/// write-back. The path is not part of the serializable config.
+#[derive(Clone, Debug)]
+pub struct ConfigWithPath {
+    pub config: Config,
+    pub path: PathBuf,
 }
 
-fn default_virtual_speaker_name() -> NameTemplate {
-    NameTemplate::parse(DEFAULT_NAME_TEMPLATE).expect("the default name template must parse")
+fn default_virtual_device_name() -> NameTemplate {
+    name_template!("{{ name }}-webshooter")
 }
 
 fn default_version() -> String {
@@ -74,21 +72,19 @@ fn default_log_level() -> LevelFilter {
     LevelFilter::Info
 }
 
-impl Config {
-    pub fn initialise_at(path: &Path) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or(anyhow!("The config path must be a file"))?;
+impl Default for Config {
+    /// Create a new default configuration. The `path` parameter is only used
+    /// to derive default certificate paths; it is not stored in the config.
+    fn default() -> Self {
         let host = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        Ok(Self {
-            path: path.to_owned(),
+        Self {
             version: default_version(),
             host,
             port: 443,
             ssl: SslControllerConfiguration::new(
                 CertKeyPaths {
-                    cert: parent.join("cert.pem"),
-                    key: parent.join("key.pem"),
+                    cert: PathBuf::from("cert.pem"),
+                    key: PathBuf::from("key.pem"),
                 },
                 GenerationMethod::SelfSigned {
                     sans: vec!["localhost".to_string(), host.to_string()],
@@ -100,9 +96,9 @@ impl Config {
             auth_timeout: Default::default(),
             rate_limit: Default::default(),
             log_level: default_log_level(),
-            virtual_display_name: default_virtual_display_name(),
-            virtual_speaker_name: default_virtual_speaker_name(),
-        })
+            virtual_display_name: default_virtual_device_name(),
+            virtual_speaker_name: default_virtual_device_name(),
+        }
     }
 }
 
@@ -117,8 +113,6 @@ const TEMPLATE_KEY: &str = "self";
 /// really substituted that parameter.
 const NAME_PROBE: &str = "\u{1}ws-name\u{1}";
 
-/// The same, for the optional `client_id` hole.
-const CLIENT_ID_PROBE: &str = "\u{1}ws-client-id\u{1}";
 
 /// A configured name template, compiled and validated once when the config is
 /// parsed.
@@ -224,10 +218,8 @@ fn render_probe(template: upon::TemplateRef<'_>) -> Result<String> {
 
 impl Clone for NameTemplate {
     fn clone(&self) -> Self {
-        // `upon::Engine` is not `Clone`, and rebuilding it from the source is
-        // the same work the original parse did — so this cannot fail, because
-        // this template has already been through that exact parse once.
-        Self::parse(self.source()).expect("an already-parsed name template re-parses")
+        // SAFETY: Since the NameTemplate was built succesfully its source is necessarily valid
+        unsafe { Self::parse(self.source()).unwrap_unchecked() }
     }
 }
 
@@ -257,6 +249,9 @@ impl<'de> Deserialize<'de> for NameTemplate {
         Self::parse(&source).map_err(serde::de::Error::custom)
     }
 }
+
+/// The same, for the optional `client_id` hole.
+const CLIENT_ID_PROBE: &str = "\u{1}ws-client-id\u{1}";
 
 /// Bytes in base64
 #[derive(Clone, Debug, Hash, Eq)]
@@ -416,8 +411,7 @@ pub fn parse_config(path: &Path, contents: &str) -> Result<Config> {
         )),
     };
     by_extension.or_else(|extension_err| {
-        toml::from_str(contents)
-            .map_err(anyhow::Error::from)
+        (|_| toml::from_str(contents).map_err(anyhow::Error::from))(())
             // JSON5 before YAML: both accept a flow mapping, and `serde_yaml`
             // only fails a JSON5 config on the `//` or `/* */` comments and
             // trailing commas this dialect exists to accept. Serde ignores
@@ -436,6 +430,8 @@ pub fn parse_config(path: &Path, contents: &str) -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
+    use macros::name_template;
+
     use super::*;
 
     /// Every round-trippable format loads through its extension, unknown or
@@ -445,8 +441,7 @@ mod tests {
     /// so `config.yaml` is exercised via the fallback path instead.)
     #[test]
     fn parse_config_dispatch_and_fallback() {
-        let reference =
-            Config::initialise_at(Path::new("/tmp/webshooter-test/config.json")).unwrap();
+        let reference = Config::default();
         let toml = toml::to_string(&reference).unwrap();
         let json = serde_json::to_string(&reference).unwrap();
 
@@ -483,17 +478,24 @@ mod tests {
     /// as rather than as something re-derived.
     #[test]
     fn name_templates_default_and_round_trip() {
-        let config = Config::initialise_at(Path::new("/tmp/webshooter-test/config.toml")).unwrap();
+        let default_virtual_device_name = default_virtual_device_name();
+        let config = Config::default();
         for template in [&config.virtual_display_name, &config.virtual_speaker_name] {
-            assert_eq!(template.source(), DEFAULT_NAME_TEMPLATE);
+            assert_eq!(template.source(), default_virtual_device_name.source());
             assert!(!template.references_client_id());
             assert_eq!(template.render("alice", 1).unwrap(), "alice-webshooter");
         }
 
         let serialised = toml::to_string(&config).unwrap();
         let parsed = parse_config(Path::new("config.toml"), &serialised).unwrap();
-        assert_eq!(parsed.virtual_display_name.source(), DEFAULT_NAME_TEMPLATE);
-        assert_eq!(parsed.virtual_speaker_name.source(), DEFAULT_NAME_TEMPLATE);
+        assert_eq!(
+            parsed.virtual_display_name.source(),
+            default_virtual_device_name.source()
+        );
+        assert_eq!(
+            parsed.virtual_speaker_name.source(),
+            default_virtual_device_name.source()
+        );
     }
 
     /// A name template that never substitutes `{{ name }}` is a parse error, not
@@ -548,7 +550,7 @@ mod tests {
     /// spells it out renders it, and is recognised as doing so.
     #[test]
     fn client_id_is_always_bound() {
-        let template = NameTemplate::parse("{{ client_id }}-{{ name }}").unwrap();
+        let template = name_template!("{{ client_id }}-{{ name }}");
         assert!(template.references_client_id());
         assert_eq!(template.render("alice", 42).unwrap(), "42-alice");
     }
@@ -611,8 +613,7 @@ mod tests {
     /// every other JSON tool in the world accepts.
     #[test]
     fn strict_json_still_loads_under_every_json_extension() {
-        let reference =
-            Config::initialise_at(Path::new("/tmp/webshooter-test/config.json")).unwrap();
+        let reference = Config::default();
         let json = serde_json::to_string(&reference).unwrap();
         for name in JSON_EXTENSIONS.iter().map(|ext| format!("config.{ext}")) {
             let parsed = parse_config(Path::new(&name), &json).unwrap();
@@ -620,7 +621,7 @@ mod tests {
             assert_eq!(parsed.port, reference.port, "{name}");
             assert_eq!(
                 parsed.virtual_display_name.source(),
-                DEFAULT_NAME_TEMPLATE,
+                default_virtual_device_name().source(),
                 "{name}"
             );
         }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["macros","server", "shared", "webui/wasm"]
+members = ["macros", "server", "shared", "webui/wasm"]
 default-members = ["server"]
 
 [workspace.package]
@@ -11,6 +11,7 @@ license = "LICENSE"
 
 [workspace.dependencies]
 shared = { path = "shared", package = "webshooter-shared" }
+macros = { path = "macros", package = "webshooter-macros" }
 
 anyhow = "1"
 ashpd = "0.13"

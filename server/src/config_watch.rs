@@ -49,7 +49,8 @@ pub fn watch_respond(file: PathBuf) -> JoinHandle<Result<()>> {
         // but crashed on restart because startup and reload ordered formats
         // differently).
         if let Ok(config) = crate::config::parse_config(&file, &string) {
-            *APP_CONFIG.lock().await = Some(config);
+            let config_with_path = crate::config::ConfigWithPath { config, path: file };
+            *APP_CONFIG.lock().await = Some(config_with_path);
         }
         Ok(())
     })

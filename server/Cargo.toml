@@ -60,6 +60,7 @@ wtransport.workspace = true
 x509-parser.workspace = true
 pipewire.workspace = true
 shared.workspace = true
+macros.workspace = true
 tokio-util.workspace = true
 gstreamer.workspace = true
 gstreamer-app.workspace = true

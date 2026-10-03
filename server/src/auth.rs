@@ -20,7 +20,7 @@ use wtransport::tls::Sha256Digest;
 
 use crate::error::WebshooterError;
 use crate::ipc::{IPCMessage, ipc_recv, ipc_send};
-use crate::{get_config, update_config};
+use crate::{get_config, get_config_with_path, update_config};
 
 pub static AUTH_SESSIONS: LazyLock<Mutex<HashMap<UserId, Session>>> = Default::default();
 
@@ -315,7 +315,8 @@ pub async fn register(
 }
 
 async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
-    let mut config = get_config().await;
+    let mut config_with_path = get_config_with_path().await;
+    let config = &&config_with_path.config;
 
     let id = UserId(params.id.clone());
     if config.users.iter().any(|user| id == *user) {
@@ -379,11 +380,11 @@ async fn register_inner(params: RegisterParams) -> Result<Bytes64> {
 
     let cookie = verify_challenge_and_issue_cookie(id, &params.id, &params.signature).await?;
 
-    config.users.insert(User {
+    config_with_path.config.users.insert(User {
         verification_key: params.id,
         display_name,
     });
-    update_config(config)
+    update_config(config_with_path)
         .await
         .map_err(|err| Error::from_string(err.to_string(), StatusCode::INTERNAL_SERVER_ERROR))?;
 
