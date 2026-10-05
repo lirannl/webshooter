@@ -63,3 +63,9 @@ web-sys = "0.3"
 wtransport = { version = "0.7", features = ["quinn"] }
 named_constants = { git = "https://github.com/lirannl/named_constants", rev = "16bbad860fe868ec63030ae1ece0fa7bab341f42" }
 log = { version = "0.4.34", features = [ "serde", "alloc" ] }
+moq-net = "0.3.8"
+# Reached through `wtransport`, whose `quinn` feature re-exports these types, but
+# named directly: the poll-based MoQ adapter drives stream I/O through quinn's
+# poll API (see `server/src/moq/transport.rs`).
+quinn = "0.11"
+web-transport-trait = "0.4"

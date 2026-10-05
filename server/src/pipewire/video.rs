@@ -33,7 +33,6 @@ use std::{
 use tokio::{
     spawn,
     sync::{broadcast::Receiver, broadcast::error::RecvError, mpsc},
-    task::JoinHandle,
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
@@ -139,15 +138,20 @@ pub struct EncodedFrame {
 /// `display_name` is this capture's already-rendered virtual display name (see
 /// [`crate::config::NameTemplate`]); it uniquely identifies the monitor, so
 /// multiple simultaneous clients don't collide on the same node.
+///
+/// `frame_tx` is the session's media channel, created by the caller rather than
+/// here so the MoQ publisher draining it is already running before the first
+/// frame can arrive. The channel outlives any single pipeline: a resize rebuilds
+/// the encoder underneath it, and frames that gap are the ones a decoder would
+/// throw away regardless.
 pub async fn capture(
     mut client_rx: Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<Codec>>>>,
     display_name: String,
     cancel: CancellationToken,
     server_msg_tx: mpsc::Sender<ServerDatagram>,
-) -> Result<(mpsc::Receiver<EncodedFrame>, JoinHandle<()>)> {
-    let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(8);
-
+    frame_tx: mpsc::Sender<EncodedFrame>,
+) -> Result<()> {
     // Per-capture portal token, seeded from the startup token so the
     // first `select_devices` dialog is still skipped, but kept private to this
     // capture so concurrent captures can't clobber each other.
@@ -163,34 +167,26 @@ pub async fn capture(
     // ResizeDisplay (which was consumed on the first call).
     let mut next_size: Option<(u16, u16, u8)> = None;
 
-    let task = spawn({
-        let cancel = cancel.clone();
-        let decoder_caps = decoder_caps.clone();
-        let portal_token = portal_token.clone();
-        let server_msg_tx = server_msg_tx.clone();
-        async move {
-            while !cancel.is_cancelled() {
-                if let Err(e) = single_capture(
-                    &mut client_rx,
-                    frame_tx.clone(),
-                    server_msg_tx.clone(),
-                    &cancel,
-                    &mut next_size,
-                    &remote_desktop,
-                    &screencast,
-                    &decoder_caps,
-                    &display_name,
-                    &portal_token,
-                )
-                .await
-                {
-                    log::error!("Capture error: {:#?}", e);
-                }
-            }
+    while !cancel.is_cancelled() {
+        if let Err(e) = single_capture(
+            &mut client_rx,
+            frame_tx.clone(),
+            server_msg_tx.clone(),
+            &cancel,
+            &mut next_size,
+            &remote_desktop,
+            &screencast,
+            &decoder_caps,
+            &display_name,
+            &portal_token,
+        )
+        .await
+        {
+            log::error!("Capture error: {:#?}", e);
         }
-    });
+    }
 
-    Ok((frame_rx, task))
+    Ok(())
 }
 
 async fn single_capture(
@@ -221,7 +217,7 @@ async fn single_capture(
                     biased;
                     _ = cancel.cancelled() => return Ok(()),
                     msg = client_rx.recv() => match msg {
-                        Ok(ClientDatagram::ResizeDisplay { width, height, index }) => {
+                        Ok(ClientDatagram::DisplayParameters { width, height, index }) => {
                             // A resize is not a cheap message: the loop below closes
                             // the portal session and rebuilds the entire pipeline,
                             // encoder included, and a new encoder's first frame owes
@@ -533,7 +529,7 @@ async fn single_capture(
                     break Some((width, height, index));
                 },
                 msg = client_rx.recv() => match msg {
-                    Ok(ClientDatagram::ResizeDisplay { width, height, .. }) => {
+                    Ok(ClientDatagram::DisplayParameters { width, height, .. }) => {
                         log::info!("resize: rebuilding capture at {width}x{height}");
                         break Some((width, height, index));
                     }

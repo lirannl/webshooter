@@ -54,7 +54,9 @@ web-sys = { workspace = true, features = [
     "WebTransport",
     "WebTransportOptions",
     "WebTransportDatagramDuplexStream",
+    "WebTransportBidirectionalStream",
     "WebTransportSendStream",
+    "WebTransportReceiveStream",
     "ReadableStream",
     "ReadableStreamDefaultReader",
     "WritableStream",
@@ -76,8 +78,10 @@ web-sys = { workspace = true, features = [
     "console",
     "Request",
     "Response",
+    "RequestInit",
     "Headers",
     "CloseEvent",
+    "WebTransportCloseInfo",
     "Storage",
     "DomRect",
     "DomRectReadOnly",
@@ -91,3 +95,13 @@ log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen.workspace = true
+bytes.workspace = true
+moq-net.workspace = true
+
+# `moq-net` reaches `getrandom`, which does not build for `wasm32-unknown-unknown`
+# until a backend is named. It is chosen here rather than by naming the backend in
+# rustflags because an environment `RUSTFLAGS` (which a wasm-pack invocation may
+# set) replaces the config's flags wholesale, and this way the choice travels with
+# the manifest. Under `target_family = "wasm"` only, so nothing native links it.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

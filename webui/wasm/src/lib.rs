@@ -2,21 +2,21 @@ mod audio;
 mod gamepad;
 mod input;
 mod log;
+mod moq;
 mod throttle;
 mod video;
 mod visualiser;
 
 use js_sys::Uint8Array;
 use shared::client_datagram::ClientDatagram;
+use shared::server_datagram::ServerDatagram;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    HtmlDivElement, ReadableStream, ReadableStreamDefaultReader, WebTransport,
-    WebTransportDatagramDuplexStream, WebTransportOptions, WritableStream,
-    WritableStreamDefaultWriter,
+    HtmlDivElement, WebTransport, WebTransportDatagramDuplexStream, WebTransportOptions,
+    WritableStream, WritableStreamDefaultWriter,
 };
 
 use crate::log::init as init_log;
@@ -28,7 +28,6 @@ use crate::log::init as init_log;
 #[allow(dead_code)]
 pub(crate) struct GlobalWt {
     pub writer: WritableStreamDefaultWriter,
-    pub reader: ReadableStreamDefaultReader,
     pub wt: WebTransport,
 }
 
@@ -36,19 +35,233 @@ thread_local! {
     static GLOBAL_WT: RefCell<Option<GlobalWt>> = const { RefCell::new(None) };
 }
 
-/// Try to forward an error message to the server over the WebTransport
-/// error channel, tagged with its severity. Returns `false` when the
-/// transport is not initialised (e.g. before connection setup or after it
-/// was torn down).
-pub(crate) fn try_send_error(level: ::log::Level, msg: &str) -> bool {
-    let buf = crate::log::encode_error(level, msg);
-    GLOBAL_WT.with(|cell| match cell.borrow_mut().as_mut() {
-        Some(gwt) => {
-            let _ = gwt.writer.write_with_chunk(buf.as_ref());
-            true
+// ---------------------------------------------------------------------------
+// MoQ client connection
+// ---------------------------------------------------------------------------
+
+/// One [`moq_net::Driver`] ran by [`moq_net::time::run`]: the in-session
+/// driver *and* the origin driver have to keep moving for subscriptions to
+/// land on the model. `time::run` contents one driver at a time, so we fuse.
+struct Both {
+    session: moq_net::Driver<moq::BrowserSession>,
+    origin: moq_net::origin::Driver,
+}
+
+impl moq_net::time::Driver for Both {
+    fn poll(
+        &mut self,
+        now: moq_net::time::Instant,
+        waiter: &moq_net::kio::Waiter,
+    ) -> Result<Option<moq_net::time::Instant>, moq_net::Error> {
+        let session_deadline = self.session.poll(now, waiter)?;
+        let origin_deadline = self.origin.poll(now, waiter)?;
+        Ok(match (session_deadline, origin_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(at), None) | (None, Some(at)) => Some(at),
+            (None, None) => None,
+        })
+    }
+}
+
+/// Run the MoQ client over the session the control path already owns.
+///
+/// Three loops, in the order they become possible:
+///
+/// * the two `moq-net` drivers, which is the only thing that moves bytes or
+///   subscriptions once [`moq_net::Client::connect_lite`] returns — it hands
+///   back a driver rather than a completed handshake;
+/// * one task per media track, each blocking on its own group reads;
+/// * the control-message dispatch below, awaited *by this function* rather than
+///   spawned, so that this function — and so `start` — lives exactly as long as
+///   the session does. Every control message is one the session must act on
+///   before it can end, so parking here is what parks the whole page; the track
+///   tasks are spawned because a track ending is not the session ending.
+async fn run_moq(
+    session: moq::BrowserSession,
+    app: moq::AppSide,
+    display: Option<video::Display>,
+    audio: Option<Rc<crate::audio::AudioPlayer>>,
+    release_flag: Rc<Cell<bool>>,
+) {
+    // The origin the session inserts the server's broadcasts into, and its own
+    // driver: the session driver moves the protocol and the origin driver moves
+    // the content, so a subscription on the model below only lands when both
+    // are stepped.
+    let (sub_origin, origin_driver) =
+        moq_net::origin::Producer::new(moq_net::origin::Config::default());
+    let client = moq_net::Client::new().with_subscriber(sub_origin.clone());
+    let consumer = sub_origin.consume();
+
+    // `connect_lite` does not handshake: it reports which ALPN the transport
+    // claims, builds the machine, and returns the driver to run. `_sess` is kept
+    // alive for the rest of this function on purpose — it is one of the handles
+    // that keeps the session's content alive.
+    let (_sess, driver) = match client
+        .connect_lite(moq_net::time::Instant::now(), session)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            ::log::error!("MoQ handshake refused: {err:#?}");
+            return;
         }
-        None => false,
-    })
+    };
+    let both = Both {
+        session: driver,
+        origin: origin_driver,
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = moq_net::time::run(both).await;
+        // A client session only "finishes" because it died, so the reason it
+        // died is an always-want-to-know. Logged at error level because the
+        // client's own log floor is `info`.
+        ::log::error!("MoQ client session finished: {outcome}");
+    });
+
+    // Wait for the announcement, *then* ask for the broadcast. `request_broadcast`
+    // is a question with an immediate answer: a path nothing has announced comes
+    // back `Unroutable` rather than "not yet" — and the server cannot have
+    // announced anything before it has read this client's SETUP, which is still in
+    // flight. Asking first is how this page used to tear itself down on arrival.
+    let mut announced = consumer.announced();
+    loop {
+        let Some(update) = announced.next().await else {
+            // The origin is finished: the session is over, not merely quiet. A
+            // server that never announces ends the page here rather than parking
+            // on a subscription that can never resolve.
+            ::log::error!("MoQ session ended before the server announced its media");
+            return;
+        };
+        // An announcement covers the broadcast when it *is* the broadcast or a
+        // shorter prefix of it — the root included, which is how an announcement
+        // of everything is spelled.
+        let covers = update
+            .prefix
+            .strip_prefix(shared::track_names::BROADCAST)
+            .is_some();
+        if update.kind.is_active() && covers {
+            break;
+        }
+    }
+    let broadcast = match consumer
+        .request_broadcast(shared::track_names::BROADCAST)
+        .await
+    {
+        Ok(broadcast) => broadcast,
+        Err(err) => {
+            ::log::error!("MoQ broadcast unavailable: {err:#?}");
+            return;
+        }
+    };
+
+    // The audio track exists before the announcement, so this subscription is
+    // established immediately; it then waits for groups, and each group waits
+    // for the sink the server only creates once AudioReady arrives.
+    if let Some(audio) = audio.clone() {
+        let broadcast = broadcast.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            audio_track_loop(broadcast, audio).await;
+        });
+    }
+
+    // Control messages. The video track's name depends on a codec the server
+    // only picks once it has an encoder, so it arrives here rather than being
+    // knowable at setup; each one starts that codec's track task.
+    use crate::video::is_installed_pwa;
+    while let Some(bytes) = app.next_control().await {
+        let Ok(msg) = ServerDatagram::from_bytes(&bytes) else {
+            ::log::warn!("unparsable server message, ignored");
+            continue;
+        };
+        match msg {
+            ServerDatagram::AudioLevel { level } => {
+                if let Some(audio) = &audio {
+                    audio.set_volume(level);
+                }
+            }
+            ServerDatagram::LogLevel { level } => crate::log::apply_server_level(level),
+            ServerDatagram::ReleaseMouse => release_flag.set(true),
+            ServerDatagram::Throttle { interval_ms } => crate::throttle::set_throttle(interval_ms),
+            ServerDatagram::ToggleFullscreen => {
+                let Some(display) = display.as_ref() else {
+                    continue;
+                };
+                let document = web_sys::window().unwrap().document().unwrap();
+                if document.fullscreen_element().is_some() {
+                    document.exit_fullscreen();
+                } else if is_installed_pwa(&web_sys::window().unwrap()) {
+                    let _entered_fullscreen = display.canvas.request_fullscreen();
+                } else {
+                    // Not a gesture yet: the resize prompt's pointerdown applies it.
+                    display.pending_fullscreen.set(true);
+                }
+            }
+            ServerDatagram::VideoTrack { codec } => {
+                let Some(display) = display.as_ref() else {
+                    continue;
+                };
+                let Ok(path) = video::frame_path(&display.canvas) else {
+                    continue;
+                };
+                let broadcast = broadcast.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    video::run_video_track(&broadcast, codec, path).await;
+                });
+            }
+        }
+    }
+}
+
+/// Drain the audio track: each group is a run of Opus packets, and each packet
+/// is a whole frame of audio, so a group ends at the publisher's boundary
+/// rather than at anything the decoder cares about.
+async fn audio_track_loop(
+    broadcast: moq_net::broadcast::Consumer,
+    audio: Rc<crate::audio::AudioPlayer>,
+) {
+    let track = match broadcast.track(shared::track_names::AUDIO_TRACK) {
+        Ok(track) => track,
+        Err(err) => {
+            ::log::error!("audio track not in the broadcast: {err:#?}");
+            return;
+        }
+    };
+    let mut subscribed = match track
+        .subscribe(moq_net::track::Subscription::default())
+        .await
+    {
+        Ok(subscribed) => subscribed,
+        Err(err) => {
+            ::log::error!("audio subscribe failed: {err:#?}");
+            return;
+        }
+    };
+    loop {
+        let mut group = match subscribed.recv_group().await {
+            Ok(Some(group)) => group,
+            Ok(None) => {
+                ::log::debug!("audio track finished");
+                return;
+            }
+            Err(err) => {
+                ::log::warn!("audio track ended: {err:#?}");
+                return;
+            }
+        };
+        loop {
+            match group.read_frame().await {
+                Ok(Some(frame)) => audio.push(frame.payload.to_vec()),
+                // The group is done: its next sibling is a different group.
+                Ok(None) => break,
+                // One group's stream failed. The next group is a new stream, so
+                // carrying on loses at most the rest of this group.
+                Err(err) => {
+                    ::log::warn!("audio group stream error: {err:#?}");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn with_wt<F, R>(f: F) -> R
@@ -97,7 +310,10 @@ pub(crate) async fn send_reliable(d: shared::client_datagram::ClientDatagram) ->
         Ok(w) => w,
         Err(_) => return false,
     };
-    if JsFuture::from(writer.write_with_chunk(&JsValue::from(buf))).await.is_err() {
+    if JsFuture::from(writer.write_with_chunk(&JsValue::from(buf)))
+        .await
+        .is_err()
+    {
         return false;
     }
     JsFuture::from(writer.close()).await.is_ok()
@@ -106,93 +322,6 @@ pub(crate) async fn send_reliable(d: shared::client_datagram::ClientDatagram) ->
 // ---------------------------------------------------------------------------
 // Server-initiated streams
 // ---------------------------------------------------------------------------
-
-/// Streams the server has opened, waiting for the render loop to drain them.
-pub(crate) type PendingStreams = Rc<RefCell<VecDeque<ReadableStream>>>;
-
-/// How much of a server stream to drain before yielding to the event loop.
-/// Small enough that the yield's own latency is negligible next to the drain,
-/// large enough that a multi-megabyte keyframe does not pay for dozens of them.
-const DRAIN_YIELD_BYTES: usize = 256 * 1024;
-
-/// Read a named field off a JS object, treating missing and null fields alike.
-fn field(obj: &JsValue, name: &str) -> Option<JsValue> {
-    js_sys::Reflect::get(obj, &JsValue::from_str(name))
-        .ok()
-        .filter(|value| !value.is_undefined() && !value.is_null())
-}
-
-/// Whether a `ReadableStreamDefaultReader` result reports end-of-stream.
-fn at_end(result: &JsValue) -> bool {
-    field(result, "done")
-        .and_then(|done| done.as_bool())
-        .unwrap_or(false)
-}
-
-/// `getReader()` is typed as a bare `Object` by `web-sys`, so the reader has to
-/// be downcast before its `read()` is reachable.
-fn stream_reader(stream: ReadableStream) -> Result<ReadableStreamDefaultReader, JsValue> {
-    stream
-        .get_reader()
-        .dyn_into()
-        .map_err(|_| JsValue::from_str("getReader() did not return a ReadableStreamDefaultReader"))
-}
-
-/// Hand control back to the browser's event loop, letting *tasks* run.
-///
-/// Every `await` in the receive path is a microtask, and a chain of awaits over
-/// already-buffered reads resolves without ever yielding to the macrotask queue.
-/// Draining a multi-megabyte keyframe is such a chain, and so is a render loop
-/// working through a backlog of datagrams faster than the decoder consumes them
-/// — which is exactly what a congested link produces.
-///
-/// The keepalive that tells the server we are still here is a `setInterval`,
-/// i.e. a task. A client that is busy receiving therefore stops sending it, and
-/// the server cannot distinguish that from a client that has gone away. Yielding
-/// on a task source keeps the liveness signal independent of how much video is
-/// in flight.
-///
-/// The `setTimeout` in the executor is what makes this a task; awaiting an
-/// already-resolved promise would resume in a microtask, which is the very queue
-/// the caller cannot leave. The browser clamps a zero-delay timeout to 4 ms once
-/// timers start nesting, which is why the call sites yield on a byte or message
-/// budget rather than every iteration.
-pub(crate) async fn yield_to_event_loop() {
-    let make_timer = js_sys::Function::new_no_args(
-        "return new Promise((resolve) => setTimeout(resolve, 0))",
-    );
-    if let Ok(timer) = make_timer.call0(&JsValue::UNDEFINED) {
-        let _ = JsFuture::from(timer.unchecked_into::<js_sys::Promise>()).await;
-    }
-}
-
-/// Drain a stream into one buffer, concatenating its chunks. The end of the
-/// stream is what delimits a message, so a server stream needs no length
-/// prefix and the very same [`shared::server_datagram::ServerDatagram`] bytes
-/// work on either transport.
-///
-/// A keyframe is megabytes, so the drain yields to the event loop every
-/// [`DRAIN_YIELD_BYTES`]; see [`yield_to_event_loop`] for why that matters.
-pub(crate) async fn read_to_end(stream: ReadableStream) -> Result<Vec<u8>, JsValue> {
-    let reader = stream_reader(stream)?;
-    let mut buf = Vec::new();
-    let mut since_yield = 0usize;
-    loop {
-        let result = JsFuture::from(reader.read()).await?;
-        if at_end(&result) {
-            return Ok(buf);
-        }
-        let chunk = field(&result, "value")
-            .ok_or_else(|| JsValue::from_str("stream chunk has no value"))?;
-        let chunk = Uint8Array::new(&chunk).to_vec();
-        since_yield += chunk.len();
-        buf.extend_from_slice(&chunk);
-        if since_yield >= DRAIN_YIELD_BYTES {
-            since_yield = 0;
-            yield_to_event_loop().await;
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Deferred reporting
@@ -215,9 +344,7 @@ fn defer_report(msg: &str) {
         .and_then(|window| window.session_storage().ok().flatten())
         .is_some_and(|storage| storage.set_item(DEFERRED_REPORT_KEY, msg).is_ok());
     if !stored {
-        web_sys::console::warn_1(
-            &"(previous session's close reason could not be deferred)".into(),
-        );
+        web_sys::console::warn_1(&"(previous session's close reason could not be deferred)".into());
     }
 }
 
@@ -233,52 +360,6 @@ fn flush_deferred_report() {
     if let Some(parked) = parked {
         ::log::error!("from the previous session: {parked}");
     }
-}
-
-/// Start accepting the server's unidirectional streams, returning the queue
-/// they land in.
-///
-/// Each stream carries exactly one [`shared::server_datagram::ServerDatagram`].
-/// Keyframes are far too large to fragment across datagrams — a single lost
-/// fragment discards the whole frame, and the keyframe is precisely the frame a
-/// client cannot decode without — so the server sends them here, where the
-/// transport retransmits them instead of dropping them.
-///
-/// Only the *opening* of a stream is handled here; the contents are deliberately
-/// left unread for the render loop, which is what keeps a keyframe ahead of the
-/// delta frames the server sent after it. Draining a megabyte of keyframe on
-/// this task would publish it only once it had landed, by which time those
-/// deltas would already have been decoded without the reference frame they are
-/// predicted from. Ordering that survives the two transports racing each other
-/// is the render loop's job — see [`video::next_message`].
-fn accept_server_streams(wt: &WebTransport) -> Result<PendingStreams, JsValue> {
-    let streams = stream_reader(wt.incoming_unidirectional_streams())?;
-
-    let pending: PendingStreams = Rc::new(RefCell::new(VecDeque::new()));
-    let sink = pending.clone();
-    wasm_bindgen_futures::spawn_local(async move {
-        loop {
-            let next = JsFuture::from(streams.read()).await;
-            let next = match next {
-                Ok(next) => next,
-                Err(err) => {
-                    ::log::info!("server stream acceptor stopped: {err:?}");
-                    break;
-                }
-            };
-            // The stream list only ends when the session itself does.
-            if at_end(&next) {
-                ::log::info!("server stream list closed");
-                break;
-            }
-            let Some(stream) = field(&next, "value").and_then(|value| value.dyn_into().ok()) else {
-                ::log::warn!("server stream list yielded a non-stream entry");
-                break;
-            };
-            sink.borrow_mut().push_back(stream);
-        }
-    });
-    Ok(pending)
 }
 
 fn show_connection_lost() -> Option<()> {
@@ -385,25 +466,14 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
     // 4. Open datagram streams.
     let datagrams: WebTransportDatagramDuplexStream = wt.datagrams();
     let writer = datagrams.writable().get_writer().unwrap();
-    let reader: ReadableStreamDefaultReader = datagrams
-        .readable()
-        .get_reader()
-        .dyn_into()
-        .expect("get_reader() did not return a ReadableStreamDefaultReader");
 
     // 5. Store in global handle.
     GLOBAL_WT.with(|cell| {
         *cell.borrow_mut() = Some(GlobalWt {
             writer,
-            reader,
             wt: wt.clone(),
         });
     });
-
-    // 6. Start accepting the server's unidirectional streams. Keyframes come
-    // this way, so the acceptor has to be running before the render loop asks
-    // for its first message.
-    let streams = accept_server_streams(&wt)?;
 
     // Anything the last session could not report over its own dying transport,
     // now that this one can carry it.
@@ -425,7 +495,7 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
         // costs one datagram, needs no display, and the server only reads it
         // when a capture actually starts.
         video::send_decoder_capabilities()
-        .unwrap_or_else(|err| ::log::warn!("decoder capabilities not sent: {err:#?}"));
+            .unwrap_or_else(|err| ::log::warn!("decoder capabilities not sent: {err:#?}"));
 
         // 9. The display, which is the whole of the difference between the two
         // kinds of session. Building it is what sends the first
@@ -438,7 +508,7 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
         } else {
             let canvas = video::setup_canvas();
             video::send_initial_resize(&canvas)
-            .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
+                .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
             let pending_fullscreen = video::setup_resize_prompt(&canvas);
             Some(video::Display {
                 canvas,
@@ -446,9 +516,51 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
             })
         };
 
-        // 10. Render loop
+        // 10. MoQ rides the session the control path already holds. From here
+        // the pumps own both of its reads and route each message by its first
+        // byte, so nothing below may read the WebTransport itself: a second
+        // reader would take messages from whichever half polled first.
         let release_flag = Rc::new(Cell::new(false));
-        let render_loop = video::render_loop(display.as_ref(), release_flag.clone(), streams);
+        // The datagram writer is handed to MoQ rather than kept private: both
+        // protocols' datagrams go out through the one writer the stream admits.
+        let writer = with_wt(|wt| wt.writer.clone());
+        let (session, app_side) = moq::attach(wt.clone(), writer);
+        // One player, shared: the track task decodes into it and the control
+        // loop changes its volume, and a cloned player would not be the same
+        // object for both.
+        let audio = crate::audio::AudioPlayer::new().map(Rc::new);
+        if audio.is_none() {
+            ::log::error!(
+                "audio: AudioPlayer::new returned None — no Opus AudioDecoder / AudioContext"
+            );
+        }
+        // The status element, start button and visualiser are /audio-page
+        // decorations: a video session keeps the whole screen for the remote
+        // desktop.
+        let _audio_page_ui = match (&audio, &display) {
+            (Some(player), None) => {
+                let container = video::create_audio_container();
+                let status =
+                    crate::audio::status_element_with_activity(&container, player.activity());
+                crate::audio::audio_start_button(&container, &player.audio_context(), status);
+                Some(crate::visualiser::Visualiser::new(
+                    &player.analyser(),
+                    &container,
+                ))
+            }
+            _ => None,
+        };
+        if audio.is_none() && display.is_none() {
+            let container = video::create_audio_container();
+            crate::audio::status_element_unavailable(&container);
+        }
+        let mq_client = run_moq(
+            session,
+            app_side,
+            display.clone(),
+            audio,
+            release_flag.clone(),
+        );
 
         // 11. Input handlers, bound to the display they are injected into, and
         // skipped with it rather than on their own account: there is no virtual
@@ -461,11 +573,11 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
             input::setup_mouse(&display.canvas, release_flag);
         }
 
-        // 12. Wait for render loop to finish (signals connection closed).
-        if let Err(e) = render_loop.await {
-            ::log::error!("render_loop error: {e:?}");
-            show_connection_lost();
-        }
+        // 12. `mq_client` parks on the control path, which only ends when the
+        // session does — the same terminal signal the render loop used to give,
+        // and the one the input handlers above stay live for.
+        mq_client.await;
+        show_connection_lost();
 
         window.clear_interval_with_handle(keepalive_id);
         Ok::<(), JsValue>(())

@@ -1,5 +1,4 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use js_sys::Float32Array;
@@ -11,8 +10,6 @@ use web_sys::{
     AudioDecoderConfig, AudioNode, AudioSampleFormat, EncodedAudioChunk, EncodedAudioChunkInit,
     EncodedAudioChunkType, GainNode, HtmlButtonElement, HtmlDivElement, HtmlSpanElement,
 };
-
-use shared::fragment::{FragmentFrame, PushOutcome};
 
 /// How far ahead (seconds) audio frames are scheduled relative to the running
 /// play-head, to absorb jitter in datagram arrival.
@@ -38,10 +35,6 @@ struct PlaybackState {
     /// context ever suspends again, so each return to Running re-notifies the
     /// server rather than being a permanent once-only latch.
     audio_ready: Cell<bool>,
-    /// Highest sample magnitude seen since the last periodic report.
-    peak_max: Cell<f32>,
-    /// Number of decoded frames since the last periodic report.
-    frame_count: Cell<u32>,
     /// End time (AudioContext clock) of the last buffer we scheduled, used to
     /// detect gaps/overlaps in the playback timeline (a cause of choppiness).
     last_end: Cell<f64>,
@@ -279,10 +272,13 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Deliberately not `Clone`. Two clones would share the context but each hold
+/// its own `configured` / `next_sample` cells, so the two halves would disagree
+/// about what has been decoded — a silent, hard-to-trace fault. Share one player
+/// through an `Rc` instead.
 pub struct AudioPlayer {
     decoder: AudioDecoder,
     state: Rc<RefCell<PlaybackState>>,
-    pending: RefCell<HashMap<u16, FragmentFrame>>,
     configured: Cell<bool>,
     /// Running count of decoded samples, used to derive strictly increasing,
     /// accurate chunk timestamps (one Opus packet may hold several 20 ms
@@ -324,36 +320,8 @@ impl AudioPlayer {
             activity,
             next_time: 0.0,
             audio_ready: Cell::new(false),
-            peak_max: Cell::new(0.0),
-            frame_count: Cell::new(0),
             last_end: Cell::new(0.0),
         }));
-
-        // Periodically report received audio levels so we can tell whether the
-        // server is actually streaming real audio, independent of any silence
-        // at capture start (the host player doesn't autoplay and the user
-        // can't start it the instant the sink appears).
-        {
-            let report_state = state.clone();
-            let report_cb = Closure::wrap(Box::new(move || {
-                let (peak, frames, ctx_state) = {
-                    let st = report_state.borrow();
-                    (st.peak_max.get(), st.frame_count.get(), st.ctx.state())
-                };
-                log::debug!(
-                    "audio: levels report peak={peak:.4} frames_in_window={frames} ctx={ctx_state:?}"
-                );
-                report_state.borrow().peak_max.set(0.0);
-                report_state.borrow().frame_count.set(0);
-            }) as Box<dyn FnMut()>);
-            if let Some(win) = web_sys::window() {
-                let _ = win.set_interval_with_callback_and_timeout_and_arguments_0(
-                    report_cb.as_ref().unchecked_ref(),
-                    10_000,
-                );
-            }
-            report_cb.forget();
-        }
 
         let st = state.clone();
         let output_cb = Closure::wrap(Box::new(move |data: AudioData| {
@@ -444,7 +412,6 @@ impl AudioPlayer {
         Some(AudioPlayer {
             decoder,
             state,
-            pending: RefCell::new(HashMap::new()),
             configured: Cell::new(false),
             next_sample: Cell::new(0),
             dbg_count: Cell::new(0),
@@ -488,7 +455,15 @@ impl AudioPlayer {
         gain.gain().set_value(volume);
     }
 
-    fn configure(&self, channels: u8, rate: u32) {
+    /// Point the decoder at Opus, once, from the shape the context already
+    /// declared to the server in `AudioReady` — the same channel count and rate
+    /// the sink was created with, read from the same place the notice was built
+    /// from. An `AudioDecoder` holds one configuration for its lifetime, so this
+    /// is not something to renegotiate per packet.
+    fn configure_from_context(&self) {
+        let ctx = &self.state.borrow().ctx;
+        let channels = ctx.destination().channel_count() as u8;
+        let rate = ctx.sample_rate() as u32;
         let head = opus_identification_header(channels, rate);
         let mut config = AudioDecoderConfig::new("opus", channels as u32, rate);
         let arr = js_sys::Uint8Array::from(&head[..]);
@@ -496,46 +471,32 @@ impl AudioPlayer {
         self.decoder.configure(&config);
     }
 
-    pub fn push(
-        &self,
-        frame_id: u16,
-        frag_idx: u16,
-        num_frags: u16,
-        channels: u8,
-        rate: u32,
-        payload: Vec<u8>,
-    ) {
+    /// Feed one captured Opus packet to the decoder.
+    ///
+    /// A packet is complete in itself — it arrives whole, on a MoQ group stream
+    /// that reassembles nothing — so the fragment table and the reassembler that
+    /// used to sit in front of this are gone, and each packet is keyed to the
+    /// play-head by its own length rather than by a frame id.
+    pub fn push(&self, payload: Vec<u8>) {
         if !self.configured.get() {
-            self.configure(channels, rate);
+            self.configure_from_context();
             self.configured.set(true);
         }
 
-        let mut map = self.pending.borrow_mut();
-        let entry = map
-            .entry(frame_id)
-            .or_insert_with(|| FragmentFrame::new(num_frags as usize));
-
-        // Only a completed frame is consumed; everything else (incomplete,
-        // duplicate, out-of-range fragment) keeps the entry for later.
-        let assembled = match entry.push(frag_idx as usize, payload) {
-            PushOutcome::Complete(assembled) => assembled,
-            _ => return,
-        };
-        map.remove(&frame_id);
-        drop(map);
+        let ctx = &self.state.borrow().ctx;
+        let rate = ctx.sample_rate();
 
         // One Opus packet can contain several 20 ms frames, so derive the
         // chunk timestamp from the *actual* number of samples carried by this
         // packet (parsed from its TOC header) rather than assuming 20 ms.
-        let rate = rate as u64;
-        let samples = opus_packet_samples(&assembled, rate as u32) as u64;
-        let ts = self.next_sample.get() * 1_000_000 / rate;
+        let samples = opus_packet_samples(&payload, rate as u32) as u64;
+        let ts = self.next_sample.get() * 1_000_000 / rate as u64;
         self.next_sample.set(self.next_sample.get() + samples);
 
         let count = self.dbg_count.get();
         self.dbg_count.set(count + 1);
 
-        let arr = js_sys::Uint8Array::from(&assembled[..]);
+        let arr = js_sys::Uint8Array::from(&payload[..]);
         let init = EncodedAudioChunkInit::new(
             arr.unchecked_ref::<js_sys::Object>(),
             ts as f64,
@@ -582,7 +543,6 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
         }
     };
 
-    let mut frame_peak = 0.0_f32;
     for ch in 0..channels {
         let f32arr = Float32Array::new_with_length(frames);
         let mut opts = AudioDataCopyToOptions::new(ch);
@@ -591,28 +551,21 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
         data.copy_to_with_buffer_source(f32arr.unchecked_ref::<js_sys::Object>(), &opts);
         let vec = f32arr.to_vec();
         let peak = vec.iter().fold(0.0_f32, |m, &s| m.max(s.abs()));
-        frame_peak = frame_peak.max(peak);
         if ch == 0 && frames > 0 {
+            // First buffer only of each PCM stream: confirms audio is arriving
+            // at sane levels without logging every buffer.
             static PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = PEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
-                log::debug!("audio: pcm ch0 peak={peak:.4} frames={frames} rate={sample_rate}");
+                log::debug!("audio: first pcm buffer peak={peak:.4} frames={frames} rate={sample_rate}");
             }
         }
         let _ = buffer.copy_to_channel(&vec, ch as i32);
     }
     data.close();
 
-    // Feed the periodic levels reporter, and the client-side badge's notion of
-    // "audio is actually playing".
-    {
-        let st = state.borrow_mut();
-        if frame_peak > st.peak_max.get() {
-            st.peak_max.set(frame_peak);
-        }
-        st.frame_count.set(st.frame_count.get() + 1);
-        st.activity.borrow().last_frame_at.set(now_ms());
-    }
+    // Feed the client-side badge's notion of "audio is actually playing".
+    state.borrow().activity.borrow().last_frame_at.set(now_ms());
 
     let duration = frames as f64 / sample_rate as f64;
     let when = {

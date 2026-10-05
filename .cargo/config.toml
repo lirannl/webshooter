@@ -1,2 +1,16 @@
 [build]
-rustflags = ["--cfg=web_sys_unstable_apis"]
+# `--cfg=web_sys_unstable_apis` is needed by the browser client's
+# `WebTransport`/`RTCRtpScriptTransform` bindings.
+#
+# `-Zmin-recursion-limit` raises the depth at which rustc's *auto-trait* solver
+# gives up. It is not the ordinary recursion limit and does not affect how deeply
+# code may recurse at run time; it only bounds how far the compiler will chase
+# "is this `Send`?" through a type graph. moq-net's driver nests deeply enough to
+# exceed the default, and hitting the ceiling emits `overflow evaluating the
+# requirement ...: std::marker::Send` on every build. The requirement really is
+# satisfied — with the limit raised the warning disappears and nothing else
+# changes — but the warning is what makes it look like it might not be.
+rustflags = [
+    "--cfg=web_sys_unstable_apis",
+    "-Zmin-recursion-limit=512",
+]

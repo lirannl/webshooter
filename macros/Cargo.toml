@@ -6,7 +6,7 @@ repository.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["proc-macro"]
+proc-macro = true
 
 [dependencies]
 upon.workspace = true

@@ -4,19 +4,20 @@ use gstreamer_app as gst_app;
 use pipewire as pw;
 use pipewire::proxy::ProxyT;
 use pw::spa::utils::ChoiceEnum;
-use shared::server_datagram::{AudioFormat, ServerDatagram};
 use std::ptr::NonNull;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// One captured (already-encoded) audio chunk, ready to be wrapped in a
-/// [`ServerDatagram::AudioFrame`] and forwarded to the client.
+/// One captured (already-encoded) audio chunk, ready to become a MoQ frame.
+///
+/// There is nothing on this but the bytes, and that is the point: the capture
+/// encodes Opus unconditionally, an Opus packet declares its own channel count in
+/// its header, and Opus always decodes at 48 kHz. So the negotiated channel count
+/// and rate need not travel with each packet — a subscriber learns everything
+/// there is to know from the track name (`audio/opus`) and the bytes themselves.
 pub struct AudioPacket {
-    pub channels: u8,
-    pub rate: u32,
-    pub format: AudioFormat,
     pub data: Vec<u8>,
 }
 
@@ -251,15 +252,7 @@ pub async fn start_audio_sink(
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                if tx
-                    .try_send(AudioPacket {
-                        channels,
-                        rate,
-                        format: AudioFormat::Opus,
-                        data: map.to_vec(),
-                    })
-                    .is_err()
-                {
+                if tx.try_send(AudioPacket { data: map.to_vec() }).is_err() {
                     return Err(gst::FlowError::Error);
                 }
                 Ok(gst::FlowSuccess::Ok)
@@ -367,37 +360,6 @@ fn sink_thread(
 
     // `_sink` and `core` are dropped here, removing the sink from the graph.
     Ok(())
-}
-
-/// Drain encoded audio chunks and forward them to the client as fragmented
-/// [`ServerDatagram::AudioFrame`]s through the server→client message channel.
-pub async fn forward_audio(
-    mut rx: mpsc::Receiver<AudioPacket>,
-    server_msg_tx: mpsc::Sender<ServerDatagram>,
-) {
-    let mut frame_id: u16 = 0;
-    let budget = shared::server_datagram::MAX_AUDIO_DATAGRAM_PAYLOAD;
-    while let Some(pkt) = rx.recv().await {
-        if pkt.data.is_empty() {
-            continue;
-        }
-        let num_frags = pkt.data.len().div_ceil(budget).max(1) as u16;
-        for (i, chunk) in pkt.data.chunks(budget).enumerate() {
-            let dgram = ServerDatagram::AudioFrame {
-                frame_id,
-                frag_idx: i as u16,
-                num_frags,
-                channels: pkt.channels,
-                rate: pkt.rate,
-                format: pkt.format,
-                payload: chunk.to_vec(),
-            };
-            if server_msg_tx.send(dgram).await.is_err() {
-                return;
-            }
-        }
-        frame_id = frame_id.wrapping_add(1);
-    }
 }
 
 #[cfg(test)]

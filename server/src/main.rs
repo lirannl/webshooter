@@ -12,6 +12,7 @@ mod frontend;
 mod ipc;
 mod keyboard;
 mod logging;
+mod moq;
 #[cfg(target_os = "linux")]
 mod pipewire;
 mod tray;
@@ -20,12 +21,16 @@ use anyhow::Result;
 use auth::negotiate_wt;
 use config::{Config, ConfigWithPath};
 use error::WebshooterError;
+use log::Level;
+use serde::Deserialize;
 use ipc::setup_ipc;
 use poem::{
     EndpointExt, IntoResponse, Response, Route, Server, get, handler,
     listener::{Listener, TcpListener},
     post,
+    web::Json,
 };
+use poem::http::StatusCode;
 use ssl_controller::{AsyncFilesystem, CertificateManager};
 use std::{
     env,
@@ -154,6 +159,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             )
             .at("/login", post(login))
             .at("/register", post(register))
+            .at("/client_logs", post(client_logs))
             .at("/*", frontend::frontend);
 
         let handle_0 = tokio::spawn(restart_on_error(Server::new(listener).run(app)));
@@ -274,4 +280,81 @@ pub async fn get_config_with_path() -> ConfigWithPath {
 #[handler]
 fn check_auth(Authenticated(user): Authenticated) -> impl IntoResponse {
     Response::builder().body(format!("Authenticated as: {}", user.display_name))
+}
+
+/// One client-side log record, as posted to [`client_logs`].
+#[derive(Deserialize)]
+struct ClientLogRecord {
+    level: Level,
+    message: String,
+}
+
+/// Records arriving from a client's own logging, as a batch.
+///
+/// Batched because the interesting case is a client that is failing: the records
+/// that matter are the ones it emits while tearing down, and one request per
+/// record would turn a burst of failures into a burst of requests, each of which
+/// is another thing that can fail first.
+#[derive(Deserialize)]
+struct ClientLogBatch {
+    records: Vec<ClientLogRecord>,
+}
+
+/// Bounds on one batch, so an authenticated client cannot make the server log an
+/// unbounded amount of text.
+const CLIENT_LOG_MAX_RECORDS: usize = 64;
+const CLIENT_LOG_MAX_MESSAGE: usize = 8 * 1024;
+
+/// Receive a client's log records and log them beside its WebTraffic records.
+///
+/// A plain HTTP route rather than the session's own channel because a client has
+/// to be able to report *why a session is failing*, which includes the window
+/// before the session exists and after it has gone — the two moments its datagram
+/// channel cannot carry anything over. Authentication is the same cookie every
+/// other route uses, so this is the same client and the same session: the records
+/// are attributed the same way and land on the same `webshooter::client` target as
+/// a record that arrived over the transport.
+#[handler]
+fn client_logs(
+    Authenticated(user): Authenticated,
+    Json(batch): Json<ClientLogBatch>,
+) -> impl IntoResponse {
+    if batch.records.is_empty() {
+        return StatusCode::OK;
+    }
+    let dropped = batch.records.len().saturating_sub(CLIENT_LOG_MAX_RECORDS);
+    for record in batch.records.into_iter().take(CLIENT_LOG_MAX_RECORDS) {
+        log::log!(
+            target: "webshooter::client",
+            record.level,
+            "[{}] {}",
+            user.display_name,
+            truncate(&record.message, CLIENT_LOG_MAX_MESSAGE),
+        );
+    }
+    if dropped > 0 {
+        log::log!(
+            target: "webshooter::client",
+            Level::Warn,
+            "[{}] dropped {dropped} client log records over the batch limit",
+            user.display_name,
+        );
+    }
+    StatusCode::OK
+}
+
+/// Cut `message` to at most `limit` bytes, on a UTF-8 boundary.
+///
+/// A log line is the one thing a client may legitimately send that can contain
+/// arbitrary bytes, so the bound has to be on characters rather than on a byte
+/// index into the middle of one.
+fn truncate(message: &str, limit: usize) -> &str {
+    if message.len() <= limit {
+        return message;
+    }
+    let mut end = limit;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }

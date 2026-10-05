@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn gate_treats_control_datagrams_as_unthrottled() {
         assert!(!is_input_datagram(&ClientDatagram::KeepAlive));
-        assert!(!is_input_datagram(&ClientDatagram::ResizeDisplay {
+        assert!(!is_input_datagram(&ClientDatagram::DisplayParameters {
             index: 0,
             width: 800,
             height: 600

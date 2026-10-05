@@ -3,25 +3,27 @@ use crate::{
     config::{Bytes64, Config, NameTemplate},
     error::WebshooterError,
     get_config, ipc,
-    pipewire::audio::{AudioSink, forward_audio, start_audio_sink},
+    moq::{
+        self, AppSide,
+        publish::{AudioFrame, Publisher, VideoFrame},
+        transport::WtSession,
+    },
+    pipewire::audio::{AudioPacket, AudioSink, start_audio_sink},
     pipewire::video,
 };
 use anyhow::Result;
 use log::LevelFilter;
 use shared::client_datagram::{ClientDatagram, is_input_byte};
-use shared::server_datagram;
 use shared::server_datagram::ServerDatagram;
 use std::{
-    collections::VecDeque,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::{
-    io::AsyncReadExt,
     spawn,
-    sync::{broadcast, mpsc, mpsc::Receiver, watch},
+    sync::{broadcast, mpsc},
     time::{self},
 };
 use tokio_util::sync::CancellationToken;
@@ -61,7 +63,7 @@ const INPUT_FLOOD_BURST: u32 = 32;
 /// A token bucket bounding the rate at which *input* datagrams are accepted
 /// from the network. One token is consumed per input datagram; tokens refill
 /// at [`INPUT_FLOOD_RATE_PER_SEC`] and accumulate up to [`INPUT_FLOOD_BURST`].
-/// Per-pump state: each session's `broadcast_datagrams` task owns its own.
+/// Per-pump state: each session's `client_pump` task owns its own.
 struct InputFloodGuard {
     tokens: f64,
     last_refill: std::time::Instant,
@@ -136,6 +138,14 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         // client's AudioContext starts, so `monitor_host_volume` has to be
         // armed before there is anything to report.
         let (volume_tx, volume_rx) = mpsc::channel::<u8>(8);
+        // Encoded audio, from the capture pipeline to the MoQ publisher.
+        //
+        // Created here, before the producer exists, for the same reason as the
+        // volume channel: the audio task only starts once the client says its
+        // AudioContext is up, and by then the media pump that drains this must
+        // already be running. `audio_ready_task` gets the sender and hands over
+        // the packets when the sink comes up.
+        let (session_audio_tx, session_audio_rx) = mpsc::channel::<AudioPacket>(256);
 
         // Render this session's resource names once, up front. A template that
         // fails here was already validated when the config was parsed, so this
@@ -152,14 +162,18 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
                 }
             };
 
-        // Every long-lived task of this session is created up-front as a
-        // local; the supervisor below takes ownership of them all, so a
-        // registered session is always fully built.  The pumps forward the
-        // client's transport in and end the moment the peer is gone; the audio
-        // task (not raced) waits for the client's AudioContext; the driver owns
-        // capture negotiation and the run loop.
-        let mut datagrams = broadcast_datagrams(connection.clone(), client_tx.clone());
-        let mut unistreams = broadcast_unistreams(connection.clone(), client_tx.clone());
+        // MoQ is attached to the connection *before* anything reads from it: the
+        // mux pump this spawns becomes the session's only reader, and both halves
+        // of what it finds — MoQ's and webshooter's — come out of it. Nothing else
+        // may read from the connection again.
+        //
+        // Sending needs no such rule. The mux is one-way because only MoQ writes
+        // MoQ bytes and only webshooter writes webshooter's, so webshooter's own
+        // outgoing streams and datagrams stay unambiguous — they lead with a
+        // discriminant the client routes on, and the peer does the routing.
+        let (moq, app_side) = moq::attach(connection.clone());
+        let audio_tx = mpsc::Sender::clone(&session_audio_tx);
+        let mut client_pump = client_pump(app_side, client_tx.clone());
         let mut client_events = client_events_task(client_rx.resubscribe(), decoder_caps.clone());
         // Forward the host's volume setting to the client. Not a supervisor arm:
         // it ends only when the session does.
@@ -172,7 +186,7 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
         audio_ready_task(
             client_rx.resubscribe(),
             virtual_speaker.clone(),
-            control_tx.clone(),
+            audio_tx,
             disconnect.clone(),
             audio_sink.clone(),
             volume_tx,
@@ -194,6 +208,8 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
                 control_tx,
                 control_rx,
                 connection,
+                moq,
+                session_audio_rx,
                 driver_token,
                 audio_sink,
                 client_rx,
@@ -221,8 +237,7 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
             // genuinely failed, so the name is trustworthy; the audio arm is
             // absent for exactly that reason (see `audio_ready_task`).
             let ended = tokio::select! {
-                _ = &mut datagrams => "datagram pump",
-                _ = &mut unistreams => "client unistream pump",
+                _ = &mut client_pump => "client pump",
                 _ = &mut client_events => "client event pump",
                 _ = &mut driver => "driver",
             };
@@ -327,6 +342,8 @@ pub async fn run_session(
     server_msg_tx: mpsc::Sender<ServerDatagram>,
     control_rx: mpsc::Receiver<ServerDatagram>,
     connection: Arc<Connection>,
+    moq: WtSession,
+    audio_rx: mpsc::Receiver<AudioPacket>,
     cancel: CancellationToken,
     audio_sink: Arc<Mutex<Option<AudioSink>>>,
     client_rx: broadcast::Receiver<ClientDatagram>,
@@ -334,13 +351,16 @@ pub async fn run_session(
     max_log_level: LevelFilter,
 ) -> Result<()> {
     // Tell the client how verbose we are so it stops generating records we
-    // would discard anyway.
-    let _ = connection.send_datagram(
-        &shared::server_datagram::ServerDatagram::LogLevel {
-            level: max_log_level,
-        }
-        .to_bytes(),
-    );
+    // would discard anyway. Best effort: a session that has already gone is a
+    // session whose next message cannot be delivered either, and the pumps below
+    // report its end.
+    let notice = ServerDatagram::LogLevel {
+        level: max_log_level,
+    }
+    .to_bytes();
+    if let Err(err) = connection.send_datagram(&notice) {
+        log::debug!("could not send the log level notice: {err:#?}");
+    }
 
     // Own the application audio sink at the *session* level (not inside the
     // video capture), so video context resets / display resizes never disturb
@@ -349,46 +369,50 @@ pub async fn run_session(
     // template (e.g. `alice-webshooter`), and torn down when the session ends
     // via the session's disconnect token.
 
-    // Taken before `capture` moves the original: the resend pump answers repair
-    // requests, which are a client-to-server message like any other, so it needs
-    // its own view of the bus rather than a borrow of the one capture owns.
-    let resend_rx = client_rx.resubscribe();
+    // Encoded video, from the capture pipeline to the MoQ publisher. Created here
+    // rather than inside `capture` so the media pump — which owns the publisher
+    // and must be running before anything can be appended to a track — is started
+    // once, in front of capture, instead of being built around whatever receiver
+    // capture happens to hand back.
+    //
+    // Eight slots is deliberate: the publisher copies each frame into a group
+    // immediately, so the only thing a longer wait buys is memory pinned on
+    // encoder output, and a frame that has been waiting that long is a frame the
+    // client could not use anyway.
+    let (frame_tx, frame_rx) = mpsc::channel::<video::EncodedFrame>(8);
+    let mut media = media_pump(
+        moq,
+        server_msg_tx.clone(),
+        connection.clone(),
+        frame_rx,
+        audio_rx,
+        cancel.clone(),
+    );
+    let mut control_sender = control_sender(control_rx, connection.clone());
 
     // Race start_capture against session cancellation so a
     // refresh/disconnect while waiting for the initial resize doesn't leave a
     // zombie capture; a peer closure reaches this via the supervisor (a pump
     // ends, which cancels the session token).  A capture error is logged
     // rather than bailed: every exit still flows through the teardown below.
-    let started = tokio::select! {
-        r = video::capture(
-            client_rx,
-            decoder_caps.clone(),
-            virtual_display,
-            cancel.clone(),
-            server_msg_tx,
-        ) => r.map(Some),
-        _ = cancel.cancelled() => { log::info!("Disconnect requested"); Ok(None) }
-    };
-    let started = match started {
-        Ok(started) => started,
-        Err(err) => {
-            log::error!("capture failed: {err:#?}");
-            None
-        }
-    };
-    if let Some((frame_rx, _capture_task)) = started {
-        // Shared with the forwarder, which fills it, and with the resend task,
-        // which reads it. A repair request can only be answered while the frame
-        // is still here, so this is the one piece of state that has to be visible
-        // to both sides of the request.
-        let delta_ring = Arc::new(Mutex::new(DeltaRing::new()));
-        let mut frame_forwarder =
-            frame_forwarder(frame_rx, control_rx, connection.clone(), delta_ring.clone());
-        let mut resends = resend_task(resend_rx, connection.clone(), delta_ring);
-        tokio::select! {
-            _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
-            _ = &mut frame_forwarder => { log::info!("capture pipeline stopped"); }
-            _ = &mut resends => { log::info!("resend pump ended"); }
+    let mut capture = tokio::spawn(video::capture(
+        client_rx,
+        decoder_caps.clone(),
+        virtual_display,
+        cancel.clone(),
+        server_msg_tx,
+        frame_tx,
+    ));
+    tokio::select! {
+        _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
+        _ = &mut media => { log::info!("media pipeline stopped"); }
+        _ = &mut control_sender => { log::info!("control sender stopped"); }
+        started = &mut capture => {
+            match started {
+                Ok(Ok(())) => log::info!("capture pipeline stopped"),
+                Ok(Err(err)) => log::error!("capture failed: {err:#?}"),
+                Err(err) => log::error!("capture task panicked: {err}"),
+            }
         }
     }
 
@@ -439,8 +463,7 @@ fn client_events_task(
 }
 
 /// Wait for the client's AudioReady signal (with its channel/rate caps), then
-/// create the PipeWire audio sink and forward packets to the client's control
-/// channel.
+/// create the PipeWire audio sink and hand its packets to the media pump.
 ///
 /// Deliberately *not* one of the session supervisor's race arms. It is a one-shot
 /// initialisation: create the sink, hand the forwarder its own spawned task, then
@@ -457,7 +480,7 @@ fn client_events_task(
 fn audio_ready_task(
     mut audio_rx: broadcast::Receiver<ClientDatagram>,
     session_name: String,
-    control_tx: mpsc::Sender<ServerDatagram>,
+    media_tx: mpsc::Sender<AudioPacket>,
     audio_cancel: CancellationToken,
     audio_sink: Arc<Mutex<Option<AudioSink>>>,
     volume_tx: mpsc::Sender<u8>,
@@ -501,10 +524,20 @@ fn audio_ready_task(
         )
         .await
         {
-            Ok((sink, rx)) => {
+            Ok((sink, mut rx)) => {
                 println!("[audio] client ready — created PipeWire audio sink");
+                // Packets go to the media pump as they are: the encoder already
+                // produced a self-contained Opus packet, so there is nothing to
+                // frame, split or stamp on this side any more — MoQ's group is the
+                // only framing left. Forwarding rather than sharing the sender is
+                // what keeps `start_audio_sink` independent of where media ends up.
                 spawn(async move {
-                    forward_audio(rx, control_tx).await;
+                    while let Some(packet) = rx.recv().await {
+                        if media_tx.send(packet).await.is_err() {
+                            // The media pump is gone, so is the session.
+                            return;
+                        }
+                    }
                 });
                 *audio_sink.lock().unwrap() = Some(sink);
                 // Park until the session winds down; see why this task is not
@@ -521,25 +554,22 @@ fn audio_ready_task(
     });
 }
 
-fn broadcast_unistreams(
-    connection_clone: Arc<Connection>,
-    broadcaster_clone: broadcast::Sender<ClientDatagram>,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        while let Ok(mut stream) = connection_clone.accept_uni().await {
-            let mut vec = Vec::new();
-            if stream.read_to_end(&mut vec).await.is_ok()
-                && let Ok(datagram) = ClientDatagram::from_bytes(&vec)
-            {
-                let _ = broadcaster_clone.send(datagram);
-            }
-        }
-    })
-}
-
-fn broadcast_datagrams(
-    connection: Arc<Connection>,
-    broadcaster: broadcast::Sender<ClientDatagram>,
+/// Forward everything the client sends that is *ours* to the message bus.
+///
+/// The mux pump ([`moq`]) owns the connection's reads and routes each message by
+/// its first byte; this is the other end of the webshooter half of that split.
+/// Both carriers are drained here rather than in two tasks, because one task
+/// draining both is what makes "the mux pump is the session's only reader" a
+/// property of the code rather than a convention: there is exactly one place that
+/// touches the app side of the mux.
+///
+/// Unidirectional streams are read to their end and parsed as one message. A
+/// stream carries a whole message by construction — the end of the stream *is*
+/// the delimiter — which is why the messages that must not be lost travel this
+/// way rather than as datagrams, and why no framing is needed on top.
+fn client_pump(
+    app: AppSide,
+    client_tx: broadcast::Sender<ClientDatagram>,
 ) -> tokio::task::JoinHandle<()> {
     spawn(async move {
         // Input datagrams are flood-limited before the full parse + broadcast;
@@ -547,10 +577,31 @@ fn broadcast_datagrams(
         // are always parsed and forwarded.
         let mut flood = InputFloodGuard::new();
         let mut received: u64 = 0;
+        // Armed before the first message and rearmed by each one. A silent client
+        // ends the session; see `KEEPALIVE_TIMEOUT` for why this is generous
+        // rather than tight.
+        // Pinned because `Sleep` is `!Unpin` and `select!` re-polls it by
+        // reference; re-arming it goes through `as_mut().reset(..)`.
+        let quiet = tokio::time::sleep(KEEPALIVE_TIMEOUT);
+        tokio::pin!(quiet);
+        let mut quiet = quiet.as_mut();
         loop {
-            match time::timeout(KEEPALIVE_TIMEOUT, connection.receive_datagram()).await {
-                Ok(Ok(datagram)) => {
+            tokio::select! {
+                biased;
+                _ = &mut quiet => {
+                    log::info!(
+                        "client pump ended after {received} datagrams: \
+                         nothing from the client for {KEEPALIVE_TIMEOUT:?}"
+                    );
+                    break;
+                }
+                datagram = app.recv_datagram() => {
+                    // `None` is the mux pump saying the connection is finished.
+                    // It is not a slow connection — that is `Pending`, and it never
+                    // arrives here.
+                    let Some(datagram) = datagram else { break };
                     received += 1;
+                    quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
                     // Cheap byte pre-filter: skip floods without paying for the
                     // full `from_bytes` parse. Extra datagrams simply linger in
                     // the (bounded) QUIC receive buffer until dropped.
@@ -558,318 +609,155 @@ fn broadcast_datagrams(
                         continue;
                     }
                     if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
-                        let _ = broadcaster.send(datagram);
+                        let _ = client_tx.send(datagram);
                     }
                 }
-                // Timed out or connection error — peer is gone. The two are
-                // different failures: silence means the client stopped talking
-                // (or was blocked), an error means the transport itself died.
-                Ok(Err(err)) => {
-                    log::info!(
-                        "datagram pump ended after {received} datagrams: transport error: {err}"
-                    );
-                    break;
+                stream = app.recv_unistream() => {
+                    let Some(stream) = stream else { break };
+                    quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
+                    // The mux pump has already read the stream's first byte — that
+                    // is how it decided the stream was ours — and handed it back, so
+                    // the message parses as if nothing had touched it.
+                    //
+                    // Bounded because the read is the one place this task awaits
+                    // something the peer controls: the pump only guarantees a *first*
+                    // byte, so a client that sends one and then stops would otherwise
+                    // wedge the whole session's input behind it.
+                    match time::timeout(KEEPALIVE_TIMEOUT, stream.read_to_end()).await {
+                        Ok(Ok(bytes)) => {
+                            if let Ok(datagram) = ClientDatagram::from_bytes(&bytes) {
+                                let _ = client_tx.send(datagram);
+                            }
+                        }
+                        Ok(Err(err)) => log::debug!("client unistream failed: {err}"),
+                        Err(_) => log::debug!("client unistream sent a byte and then nothing"),
+                    }
                 }
-                Err(_) => {
-                    log::info!(
-                        "datagram pump ended after {received} datagrams: \
-                         no datagram from the client for {KEEPALIVE_TIMEOUT:?}"
-                    );
-                    break;
-                }
+            }
+        }
+        log::info!("client pump ended after {received} datagrams");
+    })
+}
+
+/// Put control messages on the wire.
+///
+/// Control messages stay on their own datagrams and their own streams. They used
+/// to share the video forwarder's send loop, which made the throttle that protects
+/// the session apply to the messages the session needs to keep working — the
+/// opposite of what a throttle is for. Giving them a task of their own means a
+/// saturated media path cannot delay a `Throttle`, and it means a media path that
+/// dies entirely takes nothing else with it.
+fn control_sender(
+    mut control_rx: mpsc::Receiver<ServerDatagram>,
+    connection: Arc<Connection>,
+) -> tokio::task::JoinHandle<()> {
+    spawn(async move {
+        while let Some(msg) = control_rx.recv().await {
+            let bytes = msg.to_bytes();
+            // A datagram is the right carrier here and not merely the convenient
+            // one: every control message is small, latency-sensitive, and worthless
+            // if it arrives late. The reliable alternative is reserved for
+            // `AudioLevel`, which is not.
+            if connection.send_datagram(&bytes).is_err() {
+                log::warn!("send_datagram (control) failed: connection closed");
+                break;
             }
         }
     })
 }
 
-/// One encoded frame waiting to go out on its own unidirectional stream.
+/// Drain encoded video and audio into the MoQ publisher.
 ///
-/// The bytes are already a complete [`ServerDatagram::VideoKeyFrame`]; `Arc`
-/// lets the forwarder hand them over to the sending task without copying a
-/// multi-megabyte keyframe a second time.
-type KeyframeMessage = Arc<Vec<u8>>;
-
-/// Encode a keyframe as the single message its unidirectional stream carries.
-///
-/// The end of the stream delimits the message, and
-/// [`ServerDatagram::VideoKeyFrame`] has no fragment fields, so a keyframe
-/// cannot be split even by mistake.
-fn key_frame_message(frame_id: u16, codec: shared::codec::Codec, payload: &[u8]) -> Vec<u8> {
-    ServerDatagram::key_frame_to_bytes(frame_id, codec, payload)
-}
-
-fn frame_forwarder(
-    mut frame_rx: Receiver<video::EncodedFrame>,
-    mut server_msg_rx: mpsc::Receiver<shared::server_datagram::ServerDatagram>,
-    wt: Arc<Connection>,
-    ring: Arc<Mutex<DeltaRing>>,
+/// One task owns the [`Publisher`], so the track and group state behind it needs
+/// no lock and the two streams of media are interleaved by the publisher rather
+/// than by whoever won a race for it. Nothing here writes to the transport: the
+/// publisher hands frames to the model and moq-net decides what that costs on the
+/// wire, including dropping whatever has fallen behind the live edge.
+fn media_pump(
+    moq: WtSession,
+    control_tx: mpsc::Sender<ServerDatagram>,
+    connection: Arc<Connection>,
+    mut frame_rx: mpsc::Receiver<video::EncodedFrame>,
+    mut audio_rx: mpsc::Receiver<AudioPacket>,
+    cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    let payload_size = wt
-        .max_datagram_size()
-        .unwrap_or(1200)
-        .saturating_sub(server_datagram::ServerDatagram::video_header_size())
-        .max(1);
-    // Keyframes travel on a stream rather than a datagram, and a
-    // multi-megabyte write must not stall the control datagrams this task also
-    // owns, so they get a task of their own. The channel has a single slot: a
-    // keyframe still waiting when a newer one arrives is redundant — only the
-    // newest can resynchronise the client — so the newest replaces it.
-    let (keyframe_tx, keyframe_rx) = watch::channel::<Option<KeyframeMessage>>(None);
-    spawn(keyframe_forwarder(keyframe_rx, wt.clone()));
-    let mut pacer = datagram_pacing_bps().map(|bps| {
-        log::info!(
-            "delta datagrams paced at {bps} bit/s ({}B each)",
-            payload_size
-        );
-        Pacer::new(bps, payload_size)
-    });
-    if pacer.is_none() {
-        log::info!("delta datagrams unpaced: a frame's fragments go out back to back");
-    }
-    // Every delta payload is kept for a bounded time so a repair request can be
-    // answered. The copy the paced send already makes is the one that goes in, so
-    // this costs no extra memcpy — only the memory the bound allows. The lock is
-    // taken per frame rather than held, because a `std::sync::Mutex` guard cannot
-    // be held across the `await` points inside the send loop.
-    let mut frame_id: u16 = 0;
-    let mut frames_seen: u64 = 0;
-    let mut frames_sent: u64 = 0;
-    let mut link = LinkReport::default();
-    let mut profile = SendProfile::default();
     spawn(async move {
-        // Fixed-cadence report of whether the link is keeping up. Declared before
-        // the loop because a fresh `interval` restarts on every construction.
+        // The handshake waits for the client's SETUP, which it sends as soon as the
+        // session is up. It is raced against cancellation because it is the one
+        // await in this task that waits on the peer rather than on the pipeline: a
+        // peer that connects and never says anything must not hold the task (and
+        // with it the media pumps behind it) open until QUIC's idle timeout.
+        let mut publisher = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                log::info!("media pipeline stopped before the MoQ handshake");
+                return;
+            }
+            started = Publisher::start(moq, control_tx) => match started {
+                Ok(publisher) => publisher,
+                Err(err) => {
+                    log::warn!("MoQ handshake failed, no media will flow: {err:#}");
+                    return;
+                }
+            },
+        };
+
+        let mut link = LinkReport::default();
         let mut report = tokio::time::interval(Duration::from_secs(5));
         report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::pin!(report);
         loop {
             tokio::select! {
                 biased;
-                // Ahead of the frame arm deliberately: with `biased` the first
-                // ready arm wins, and while frames are always available this
-                // one would never be polled at all — exactly when the report
-                // matters most.
-                _ = report.tick() => {
-                    // Frames the encoder produced vs. frames actually put on the
-                    // wire. The two are reconciled here because the difference is
-                    // invisible everywhere else: a hole in the id sequence looks
-                    // exactly like a lost frame at the client, which answers by
-                    // sending a keyframe that is among the most expensive things
-                    // on the link. If this ever differs, the loss is ours.
-                    if frames_seen > frames_sent {
-                        log::info!(
-                            "id holes: {} frames produced but only {} sent in 5s",
-                            frames_seen,
-                            frames_sent
-                        );
-                    }
-                    if profile.frames > 0 {
-                        // Reported unconditionally while a session is running,
-                        // unlike the link line below, because this is the baseline
-                        // the next report is compared against: a mean rate that
-                        // sits at the pacing ceiling says the pacer is the thing
-                        // limiting the send, which is the whole point of it.
-                        log::info!(
-                            "deltas: {} frames, {} fragments, largest burst {}B/{}frags, \
-                             mean rate {}Mbit/s",
-                            profile.frames,
-                            profile.fragments,
-                            profile.peak_burst_bytes,
-                            profile.peak_frags,
-                            profile.mean_rate_bps() / 1_000_000,
-                        );
-                    }
-                    frames_seen = 0;
-                    frames_sent = 0;
-                    profile.frames = 0;
-                    profile.fragments = 0;
-                    profile.peak_burst_bytes = 0;
-                    profile.peak_frags = 0;
-                    profile.total_bytes = 0;
-                    profile.total_span = Duration::ZERO;
-                    report_link(&wt, &mut link);
-                }
+                // Ahead of the media arms deliberately: with `biased` the first ready
+                // arm wins, and while frames are always available this one would
+                // never be polled at all — exactly when the report matters most.
+                _ = report.tick() => report_link(&connection, &mut link),
                 frame = frame_rx.recv() => {
+                    // `None` is the capture pipeline ending, which ends the session:
+                    // there is no video left to publish.
                     let Some(frame) = frame else { break };
-                    frames_seen += 1;
-                    let mapped = match frame.data.map_readable() {
-                        Ok(m) => m,
-                        Err(_) => {
-                            // This frame's id is consumed and never sent, which
-                            // is indistinguishable at the client from a frame
-                            // lost in transit — it sees a hole and pays a
-                            // keyframe for it. Previously silent.
-                            log::debug!("frame {frame_id} unreadable, its id is now a hole");
-                            frame_id = frame_id.wrapping_add(1);
-                            continue;
-                        }
+                    // The buffer is mapped rather than copied: the publisher takes
+                    // the bytes synchronously, so the mapping never outlives this
+                    // arm and never pins encoder memory across an await.
+                    let Ok(mapped) = frame.data.map_readable() else {
+                        // A frame that cannot be read is dropped, and the group
+                        // keeps going: cutting it here would make the *next* group
+                        // start on a delta, which is the one thing a group must
+                        // never do. The GOP ends at its next keyframe either way,
+                        // and that keyframe is what the client decodes from.
+                        log::debug!("encoded frame unreadable, cutting the video group");
+                        continue;
                     };
-                    let data = mapped.as_slice();
-                    if frame_goes_on_a_stream(frame.is_keyframe) {
-                        // A keyframe is the one frame the client cannot decode
-                        // without, so it is the one frame that must never be
-                        // dropped. Streams are ordered and retransmitted, so it
-                        // goes on one of its own, whole.
-                        keyframe_tx.send_replace(Some(Arc::new(key_frame_message(
-                            frame_id,
-                            frame.codec,
-                            data,
-                        ))));
-                        frames_sent += 1;
-                    } else {
-                        // Deltas go on datagrams, split to fit. A delta lost this
-                        // way costs one frame and a resynchronisation, which is a
-                        // fair price for keeping a stream per frame off the
-                        // connection — at 30-60 fps those streams are a constant
-                        // stream-credit and flow-control churn, and the deltas they
-                        // carry are individually worthless the moment they are
-                        // late.
-                        //
-                        // The payload is copied out before it is sent because the
-                        // paced loop below awaits, and holding a readable mapping
-                        // of an encoder buffer across an await would pin that
-                        // memory for as long as the frame takes to trickle out.
-                        // A few hundred kilobytes is nothing next to a pinned
-                        // DMABUF, and the copy is what the frames are going to
-                        // need regardless once they outlive the send.
-                        let data = data.to_vec();
-                        drop(mapped);
-                        let num_frags = data.len().div_ceil(payload_size) as u16;
-                        // The payload goes into the ring and the send loop gets a
-                        // handle to the same allocation, so a frame is copied out of
-                        // the encoder exactly once. The guard is dropped at the end
-                        // of this block, before the first `await` in the loop below.
-                        let payload = {
-                            let mut ring = ring.lock().expect("delta ring is session-scoped");
-                            ring.insert(DeltaEntry {
-                                frame_id,
-                                codec: frame.codec,
-                                num_frags,
-                                payload_size,
-                                payload: Arc::new(data),
-                            });
-                            ring.entries.back().expect("inserted above").payload.clone()
-                        };
-                        let mut ctx = SendCtx {
-                            wt: &wt,
-                            payload_size,
-                            pacer: &mut pacer,
-                            profile: &mut profile,
-                        };
-                        if send_delta(&mut ctx, frame_id, frame.codec, num_frags, &payload).await {
-                            frames_sent += 1;
-                        }
+                    if let Err(err) = publisher.push_video(VideoFrame {
+                        payload: mapped.as_slice(),
+                        codec: frame.codec,
+                        is_keyframe: frame.is_keyframe,
+                    }) {
+                        // A track that has rejected a frame cannot be appended to
+                        // again without producing a stream the client cannot decode,
+                        // so this ends the media path rather than the frames' worth.
+                        log::warn!("MoQ video track failed: {err:#}");
+                        break;
                     }
-                    frame_id = frame_id.wrapping_add(1);
                 }
-                msg = server_msg_rx.recv() => {
-                    let Some(dgram) = msg else { break };
-                    let bytes = dgram.to_bytes();
-                    if wt.send_datagram(&bytes).is_err() {
-                        log::warn!("send_datagram (control) failed: connection closed");
+                packet = audio_rx.recv() => {
+                    // The audio capture is created only once the client's
+                    // AudioContext reports itself, and it may never be, so this
+                    // receiver simply never yields. That is not an error.
+                    let Some(packet) = packet else { break };
+                    if packet.data.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) = publisher.push_audio(AudioFrame { payload: &packet.data }) {
+                        log::warn!("MoQ audio track failed: {err:#}");
                         break;
                     }
                 }
             }
         }
+        log::info!("media pipeline stopped");
     })
-}
-
-/// Answer [`ClientDatagram::ResendDeltas`] by putting the named fragments back on
-/// the wire.
-///
-/// This is the cheap half of the answer to a gap, and the reason it is worth
-/// having a ring at all: a client short one fragment of a frame can name that
-/// fragment, and the cost of sending it again is one datagram against the
-/// keyframe — tens of packets — that the same gap would otherwise cost. It also
-/// repairs more than a keyframe does, because the frame goes back where it
-/// belongs and the frames between the loss and a keyframe stay decodable.
-///
-/// A request for a frame the ring has already dropped is not an error and is not
-/// retried: the client gives every gap a deadline and asks for a keyframe when
-/// it passes, so an unanswerable request is simply the case that fallback exists
-/// for. It is logged, because a ring that cannot answer is a ring that is too
-/// small or a client that is too slow, and both are worth knowing about.
-fn resend_task(
-    mut client_rx: broadcast::Receiver<ClientDatagram>,
-    wt: Arc<Connection>,
-    ring: Arc<Mutex<DeltaRing>>,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        loop {
-            let msg = match client_rx.recv().await {
-                Ok(msg) => msg,
-                Err(RecvError::Lagged(skipped)) => {
-                    // A repair request in the records just missed is not
-                    // recoverable here, but it is not lost either: the client
-                    // re-requests on the next gap and escalates on the deadline,
-                    // so falling behind degrades a repair rather than the session.
-                    log::debug!("resend pump lagged, skipped {skipped} records");
-                    continue;
-                }
-                Err(RecvError::Closed) => break,
-            };
-            let ClientDatagram::ResendDeltas { frames } = msg else {
-                continue;
-            };
-            let mut answered = 0usize;
-            let mut unknown = 0usize;
-            for (frame_id, indices) in &frames {
-                let mut ring = ring.lock().expect("delta ring is session-scoped");
-                match ring.resend(&wt, *frame_id, indices) {
-                    0 => unknown += 1,
-                    resent => answered += resent,
-                }
-            }
-            if answered > 0 || unknown > 0 {
-                log::info!(
-                    "repair: {answered} fragment(s) resent, {unknown} frame(s) no longer held",
-                );
-            }
-        }
-    })
-}
-
-/// Put each queued keyframe on a unidirectional stream of its own.
-///
-/// Streams are ordered and retransmitted, so a keyframe is guaranteed to reach
-/// the client whole, which is what makes them worth the extra transport
-/// bookkeeping: a delta frame is disposable, a keyframe is the one frame that
-/// can resynchronise a client which has lost its prediction chain.
-///
-/// The task ends when the forwarder drops the sender, or as soon as a write
-/// fails on the closed connection.
-///
-async fn keyframe_forwarder(mut rx: watch::Receiver<Option<KeyframeMessage>>, wt: Arc<Connection>) {
-    let mut sent = 0usize;
-    while rx.changed().await.is_ok() {
-        // The slot holds at most one entry and `changed` only wakes on a fresh
-        // one, so this is always the newest keyframe.
-        let Some(bytes) = rx.borrow_and_update().clone() else {
-            continue;
-        };
-        match send_keyframe(&wt, &bytes).await {
-            Ok(()) => {
-                sent += 1;
-                if sent == 1 {
-                    // The first one is reported at info because it is the one
-                    // that proves the whole split path works: no line here means
-                    // the client never got a reference frame, whatever the
-                    // datagram traffic looks like.
-                    log::info!(
-                        "first keyframe sent on its own stream ({} bytes)",
-                        bytes.len()
-                    );
-                } else {
-                    log::debug!("keyframe sent on its own stream ({} bytes)", bytes.len());
-                }
-            }
-            Err(err) => {
-                sent = 0;
-                log::warn!("keyframe stream failed: {err:#?}");
-            }
-        }
-    }
 }
 
 /// What the last link report counted from, so the next one can report deltas.
@@ -933,389 +821,6 @@ fn report_link(wt: &Connection, last: &mut LinkReport) {
     last.primed = true;
 }
 
-/// Whether a datagram can be sent without losing an older queued one.
-///
-/// quinn guarantees that a send of at most the available space will not evict
-/// anything already queued; anything larger drops the oldest datagram to make
-/// room. So this is an exact test, not a guess at how full is too full.
-fn datagram_fits(dgram: &[u8], buffer_space: usize) -> bool {
-    dgram.len() <= buffer_space
-}
-
-/// Free space in quinn's outgoing datagram buffer.
-///
-/// Read through [`Connection::quic_connection`] because wtransport 0.7 exposes
-/// `max_datagram_size` but not this, and the send buffer is the only way to know
-/// a datagram send will not silently evict an older one.
-fn datagram_send_buffer_space(wt: &Connection) -> usize {
-    wt.quic_connection().datagram_send_buffer_space()
-}
-
-/// The ceiling on how fast datagrams may leave, in bits per second.
-///
-/// This is the encoder's nominal bitrate, which is the rate the video actually
-/// needs; the point is not to send less, it is to stop sending a frame's worth
-/// in a single instant. See [`Pacer`] for why the datagram path needs this
-/// imposed on it from the outside.
-const DEFAULT_PACING_BPS: u64 = 7_000_000;
-
-/// Read the datagram pacing ceiling, in bits per second, from the environment.
-///
-/// `WEBSHOOTER_DATAGRAM_PACING=off` restores the unpaced send, which is the
-/// behaviour this pacing was added to measure against. Any other value is taken
-/// as a ceiling in bits per second, so the average can be held below the
-/// encoder's nominal rate as well as smoothed above it.
-fn datagram_pacing_bps() -> Option<u64> {
-    parse_pacing_bps(std::env::var("WEBSHOOTER_DATAGRAM_PACING").ok())
-}
-
-/// The parsing half of [`datagram_pacing_bps`], split out so it can be tested
-/// without the process-wide environment.
-fn parse_pacing_bps(raw: Option<String>) -> Option<u64> {
-    let Some(raw) = raw else {
-        return Some(DEFAULT_PACING_BPS);
-    };
-    if raw.eq_ignore_ascii_case("off") {
-        return None;
-    }
-    match raw.parse::<u64>() {
-        // Zero is a request to send nothing, which is never what a caller of a
-        // pacing ceiling means, so it is read the way it is usually meant.
-        Ok(0) => None,
-        Ok(bps) => Some(bps),
-        Err(_) => {
-            log::warn!("WEBSHOOTER_DATAGRAM_PACING={raw:?} is not a bitrate, pacing off");
-            None
-        }
-    }
-}
-
-/// Space datagrams out so one frame's fragments leave as a trickle, not a burst.
-///
-/// The reason this has to exist here rather than being left to the transport is
-/// that quinn does not congestion-control datagrams. In
-/// `quinn-proto`'s `Connection::poll_transmit` the congestion-window and pacer
-/// checks sit behind `if ack_eliciting`, and that flag is computed before any
-/// frame is written, from pending *stream* frames, a pending ping, or a pending
-/// immediate-ack. A packet built only to carry `DATAGRAM` frames therefore
-/// carries `ack_eliciting = false` and skips both checks — it is neither paced
-/// nor refused when the window is full.
-///
-/// The consequence is specific and load-bearing: our keyframes go on streams, so
-/// quinn paces and congestion-controls them, while our deltas go on datagrams,
-/// so quinn paces and congestion-controls *nothing* about them. A delta path can
-/// flood a link far past what the link can carry, with no backoff, and the only
-/// limit in its way is the size of quinn's own send buffer — a figure chosen to
-/// be larger than any path, not smaller. The `cwnd` in the link report is the
-/// congestion window of the *stream* traffic; the deltas that filled the path
-/// were never measured against it.
-///
-/// So the ceiling is imposed here, at the one place that knows how much video
-/// there is to send.
-struct Pacer {
-    /// When the next datagram becomes due.
-    next: Instant,
-    /// The gap between consecutive datagrams.
-    interval: Duration,
-}
-
-impl Pacer {
-    /// Pace at `bps`, measured over datagrams of `payload_size` bytes.
-    fn new(bps: u64, payload_size: usize) -> Self {
-        // seconds per datagram, in nanoseconds. The multiply cannot overflow for
-        // any datagram that fits in a `u16` MTU, and the divisor is a ceiling in
-        // bits per second, so a smaller rate gives a longer interval.
-        let nanos = (payload_size as u64)
-            .saturating_mul(8)
-            .saturating_mul(1_000_000_000)
-            / bps;
-        Self {
-            next: Instant::now(),
-            interval: Duration::from_nanos(nanos.max(1)),
-        }
-    }
-
-    /// Wait for the next datagram's slot, then take the one after it.
-    async fn tick(&mut self) {
-        let now = Instant::now();
-        if self.next > now {
-            tokio::time::sleep_until(self.next.into()).await;
-            self.next += self.interval;
-        } else {
-            // Behind schedule, which is what congestion looks like from here.
-            // Resynchronise instead of letting the interval run down: catching
-            // up by sending the backlog with no delay at all would reproduce
-            // exactly the burst this exists to prevent.
-            self.next = now + self.interval;
-        }
-    }
-}
-
-/// One delta frame's payload, kept so a lost fragment can be sent again.
-struct DeltaEntry {
-    frame_id: u16,
-    codec: shared::codec::Codec,
-    /// How many fragments the frame was split into when it went out.
-    num_frags: u16,
-    /// The payload size those fragments were cut at, stored so a resend reproduces
-    /// the original boundaries exactly rather than whatever the path's MTU happens
-    /// to be now.
-    payload_size: usize,
-    /// Shared rather than owned, because the send loop needs the same bytes and a
-    /// `std::sync::Mutex` guard cannot be held across the `await` points inside
-    /// it. Cloning an `Arc` is a refcount, not a copy of the payload.
-    payload: Arc<Vec<u8>>,
-}
-
-/// Recent delta payloads, so a repair request can be answered.
-///
-/// A client that is short a fragment of a frame knows *which* fragment, and can
-/// ask for just that. The server can only honour the request while it still holds
-/// the frame, so a delta's payload outlives its send by a bounded amount of time.
-///
-/// The bound is what makes this cheap rather than a second video buffer: a delta is
-/// a few kilobytes, so even a generous allowance is a few hundred kilobytes, which
-/// is nothing next to the keyframe a repair replaces — and a request for a frame
-/// this has already dropped is a request the client gave up on and escalated past.
-struct DeltaRing {
-    /// Oldest first.
-    entries: VecDeque<DeltaEntry>,
-    /// Bytes held, so the bound can be on memory rather than on a frame count that
-    /// says nothing about how much a frame cost.
-    bytes: usize,
-}
-
-/// How much delta payload the ring may hold.
-///
-/// A repair request is answered within a round trip of being sent, so anything
-/// older than that is a frame the client has already stopped waiting for. A second
-/// of deltas at this project's bitrate is a few hundred kilobytes; this is several
-/// times that, so the count bound below is the one that binds in practice.
-const DELTA_RING_BYTES: usize = 512 * 1024;
-
-/// How many frames the ring may hold, as a second bound.
-///
-/// A run of very large frames could otherwise grow the ring past the point where
-/// searching it is free, which matters because a repair request is answered on the
-/// client's message path.
-const DELTA_RING_FRAMES: usize = 256;
-
-impl DeltaRing {
-    fn new() -> Self {
-        Self {
-            entries: VecDeque::new(),
-            bytes: 0,
-        }
-    }
-
-    /// Keep `payload` so a later request for one of its fragments can be answered.
-    fn insert(&mut self, entry: DeltaEntry) {
-        self.bytes += entry.payload.len();
-        self.entries.push_back(entry);
-        // Evict from the front: the oldest frames are the ones a request is least
-        // likely to name, and the newest are the ones still worth answering.
-        while self.bytes > DELTA_RING_BYTES || self.entries.len() > DELTA_RING_FRAMES {
-            let Some(oldest) = self.entries.pop_front() else {
-                break;
-            };
-            self.bytes -= oldest.payload.len();
-        }
-    }
-
-    /// The datagram that carries fragment `index` of `frame_id`, or `None` if the
-    /// frame is not held or the index is not one of its fragments.
-    ///
-    /// Split out from the send so the reconstruction can be tested without a live
-    /// connection: the boundaries have to be exactly the ones the frame was
-    /// originally cut at, or the client reassembles a different payload than the
-    /// one it was missing.
-    fn fragment(&self, frame_id: u16, index: u16) -> Option<Vec<u8>> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.frame_id == frame_id)?;
-        let index = index as usize;
-        if index >= entry.num_frags as usize {
-            return None;
-        }
-        let start = index * entry.payload_size;
-        let end = ((index + 1) * entry.payload_size).min(entry.payload.len());
-        let chunk = entry.payload.get(start..end)?;
-        Some(server_datagram::ServerDatagram::delta_to_bytes(
-            frame_id,
-            index as u16,
-            entry.num_frags,
-            entry.codec,
-            chunk,
-        ))
-    }
-
-    /// Send the named fragments of `frame_id` again, if the frame is still held.
-    ///
-    /// Returns how many were actually resent, which is worth logging: a request
-    /// the ring cannot answer is a request the client will escalate to a keyframe
-    /// for, and that is the case this whole path exists to avoid.
-    fn resend(&mut self, wt: &Connection, frame_id: u16, indices: &[u16]) -> usize {
-        let mut resent = 0;
-        for index in indices {
-            // The send is fire-and-forget by design: a repair that is itself lost
-            // is not an error, it is the case the client's escalation deadline
-            // exists for. Pacing it would be wrong too — a repair is a few
-            // datagrams, and delaying them costs the one round trip the whole
-            // scheme is trying to save.
-            if let Some(dgram) = self.fragment(frame_id, *index)
-                && wt.send_datagram(&dgram).is_ok()
-            {
-                resent += 1;
-            }
-        }
-        resent
-    }
-}
-
-/// What [`send_delta`] needs, bundled so the call does not take more arguments
-/// than a reader can hold in their head at once.
-struct SendCtx<'a> {
-    wt: &'a Connection,
-    payload_size: usize,
-    pacer: &'a mut Option<Pacer>,
-    profile: &'a mut SendProfile,
-}
-
-/// Put one delta frame's fragments on the wire, paced.
-///
-/// Returns whether the frame was sent. It is not when the connection is gone,
-/// which the caller must treat as the end of the session rather than a reason
-/// to keep a frame the peer will never see.
-async fn send_delta(
-    ctx: &mut SendCtx<'_>,
-    frame_id: u16,
-    codec: shared::codec::Codec,
-    num_frags: u16,
-    payload: &Arc<Vec<u8>>,
-) -> bool {
-    let SendCtx {
-        wt,
-        payload_size,
-        pacer,
-        profile,
-    } = ctx;
-    let mut sent_bytes = 0usize;
-    let started = Instant::now();
-    for (idx, chunk) in payload.chunks(*payload_size).enumerate() {
-        let dgram = server_datagram::ServerDatagram::delta_to_bytes(
-            frame_id, idx as u16, num_frags, codec, chunk,
-        );
-        // quinn drops the *oldest* queued datagram to make room for one that
-        // does not fit, so sending into a full buffer loses a fragment that was
-        // never on the wire. Skipping this one instead loses only the frame we
-        // were already going to lose, and only while the link is behind.
-        if !datagram_fits(&dgram, datagram_send_buffer_space(wt)) {
-            log::debug!(
-                "delta {frame_id} fragment {idx} skipped: \
-                 send buffer holds {} bytes, fragment is {}",
-                datagram_send_buffer_space(wt),
-                dgram.len()
-            );
-            continue;
-        }
-        if let Some(pacer) = pacer.as_mut() {
-            pacer.tick().await;
-        }
-        if wt.send_datagram(&dgram).is_err() {
-            log::warn!("send_datagram failed: connection closed");
-            return false;
-        }
-        sent_bytes += dgram.len();
-        profile.fragments += 1;
-    }
-    profile.record(sent_bytes, num_frags, started.elapsed());
-    true
-}
-
-/// What the datagram path actually did, read back in the five-second report.
-///
-/// This exists to tell two causes of loss apart, because they are
-/// indistinguishable from the client's side and need opposite fixes. Frames lost
-/// on the wire want a smaller payload or forward error correction. Frames lost
-/// because the path was handed more than it could take, in one instant, want
-/// pacing — and no amount of parity or retransmission helps, because the
-/// overflow happens on the way out of the socket and the parity shard is
-/// dropped alongside the shard it was meant to repair.
-#[derive(Default)]
-struct SendProfile {
-    /// Delta frames whose fragments were handed over.
-    frames: u64,
-    /// Datagrams sent for those frames.
-    fragments: u64,
-    /// The largest number of bytes handed over for a single frame.
-    peak_burst_bytes: usize,
-    /// The most fragments any single frame was split into.
-    ///
-    /// Reported alongside the byte count because the two say different things: a
-    /// frame can be large because it is one wide frame or because it is many
-    /// fragments, and it is the fragment count that decides how many chances the
-    /// path has to lose part of it.
-    peak_frags: u16,
-    /// Bytes handed over in total, and the time the send loops took.
-    ///
-    /// The mean of the two is the rate the path is actually asked to sustain
-    /// while sending, which is the number the pacing ceiling is compared against.
-    /// A peak rate is deliberately *not* reported: a one-fragment frame has a
-    /// send span of microseconds, so a maximum over per-frame rates is a maximum
-    /// over noise and reads as a burst that never happened.
-    total_bytes: u64,
-    total_span: Duration,
-}
-
-impl SendProfile {
-    /// Fold in one frame's send, given its total bytes, its fragment count, and
-    /// how long the loop that sent them took.
-    fn record(&mut self, bytes: usize, frags: u16, span: Duration) {
-        self.frames += 1;
-        self.total_bytes += bytes as u64;
-        self.total_span += span;
-        self.peak_burst_bytes = self.peak_burst_bytes.max(bytes);
-        self.peak_frags = self.peak_frags.max(frags);
-    }
-
-    /// The rate the path was asked to sustain while sending, in bits per second.
-    fn mean_rate_bps(&self) -> u64 {
-        if self.total_span.is_zero() {
-            return 0;
-        }
-        (self.total_bytes as u128 * 8 * 1_000_000_000 / self.total_span.as_nanos().max(1)) as u64
-    }
-}
-
-/// Whether a frame travels on a reliable stream rather than a datagram.
-///
-/// Only a keyframe does. It is the one frame the client cannot decode without,
-/// so it is the one frame that must never be dropped, and only a stream
-/// guarantees that: a datagram is discarded the moment the send buffer is full,
-/// and one split across several is lost as soon as any fragment is.
-///
-/// A delta is deliberately not treated the same way. It is worth one lost frame
-/// and a resynchronisation, and keeping a stream per frame off the connection
-/// matters more at 30-60 fps — that is steady stream-credit and flow-control
-/// churn for data that is worthless the moment it is late.
-fn frame_goes_on_a_stream(is_keyframe: bool) -> bool {
-    is_keyframe
-}
-
-/// Open a unidirectional stream carrying one complete [`ServerDatagram`] and
-/// wait for the peer to acknowledge it.
-async fn send_keyframe(wt: &Connection, bytes: &[u8]) -> Result<()> {
-    // Two awaits: the first reserves the stream, the second completes the
-    // WebTransport handshake that makes it usable.
-    let mut stream = wt.open_uni().await?.await?;
-    stream.write_all(bytes).await?;
-    // `finish` completes once the peer has acknowledged everything, so a
-    // keyframe is never declared sent before the client can read all of it.
-    stream.finish().await?;
-    Ok(())
-}
-
 /// Send an AudioLevel message on a dedicated unidirectional stream.
 async fn send_audio_level(wt: &Connection, level: u8) -> Result<()> {
     let bytes = ServerDatagram::AudioLevel { level }.to_bytes();
@@ -1363,393 +868,6 @@ async fn monitor_host_volume(
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    /// A keyframe is the one frame the client cannot decode without, so it is
-    /// the one frame that must never be dropped — which is why it is the only
-    /// kind of frame that goes on a stream. A delta may be lost and recovered
-    /// from, and keeping a stream per frame off the connection matters more at
-    /// 30-60 fps than the occasional delta is worth.
-    #[test]
-    fn only_keyframes_travel_on_a_stream() {
-        assert!(frame_goes_on_a_stream(/* is_keyframe = */ true));
-        assert!(!frame_goes_on_a_stream(/* is_keyframe = */ false));
-    }
-
-    /// A datagram is only safe to send while it fits the space quinn has queued.
-    /// One byte over and quinn evicts the *oldest* datagram to make room, losing
-    /// a fragment that never reached the wire — self-inflicted loss, with no
-    /// congestion event and nothing in the client's gap log to explain it.
-    #[test]
-    fn a_datagram_is_only_sent_while_it_fits_the_buffer() {
-        let roomy = usize::MAX;
-        assert!(datagram_fits(&[0; 1191], roomy));
-        // Exactly the space available: the boundary case, and the one an
-        // off-by-one on the header would break.
-        assert!(datagram_fits(&[0; 1191], 1191));
-        assert!(!datagram_fits(&[0; 1191], 1190));
-        // Nothing queued at all, as on a freshly opened connection.
-        assert!(!datagram_fits(&[0; 1191], 0));
-        // A datagram is never zero bytes, but the test must not depend on that.
-        assert!(datagram_fits(&[], 0));
-    }
-
-    /// A keyframe goes out as one whole `ServerDatagram::VideoKeyFrame`. Pin
-    /// every part the client switches on: the frame id, the codec, and a
-    /// payload far larger than any datagram, so this cannot quietly regress
-    /// into the fragmented delta path. The variant carries no fragment fields
-    /// at all, so there is nothing here to split it with.
-    #[test]
-    fn a_keyframe_is_one_whole_server_datagram() {
-        let payload = vec![0xAB; 5000];
-        let bytes = key_frame_message(0x0201, shared::codec::Codec::Av1, &payload);
-        match ServerDatagram::from_bytes(&bytes).expect("keyframe message parses") {
-            ServerDatagram::VideoKeyFrame {
-                frame_id,
-                codec,
-                payload: got,
-            } => {
-                assert_eq!(frame_id, 0x0201);
-                assert_eq!(codec, shared::codec::Codec::Av1);
-                assert_eq!(got, payload, "the whole keyframe must survive the hop");
-            }
-            other => panic!("expected a VideoKeyFrame, got {other:?}"),
-        }
-    }
-
-    /// A delta wide enough for several datagrams is split across them, and every
-    /// fragment has to agree on the frame it belongs to, its own place in the
-    /// split, and how many places there are — the client reassembles on exactly
-    /// those three numbers, and a frame missing one is dropped whole.
-    #[test]
-    fn a_wide_delta_is_split_across_datagrams_that_reassemble() {
-        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-        let payload_size = 1191;
-        let num_frags = payload.len().div_ceil(payload_size) as u16;
-        assert!(
-            num_frags > 1,
-            "this test is about a delta wider than one datagram"
-        );
-
-        let mut rebuilt = Vec::new();
-        for (idx, chunk) in payload.chunks(payload_size).enumerate() {
-            let bytes = ServerDatagram::delta_to_bytes(
-                0x0402,
-                idx as u16,
-                num_frags,
-                shared::codec::Codec::Av1,
-                chunk,
-            );
-            // Each fragment must fit the datagram it travels in, or the link
-            // would have to fragment it again.
-            assert!(
-                bytes.len() <= 1200,
-                "fragment {idx} is {} bytes, over the datagram budget",
-                bytes.len()
-            );
-            match ServerDatagram::from_bytes(&bytes).expect("delta fragment parses") {
-                ServerDatagram::VideoDelta {
-                    frame_id,
-                    frag_idx,
-                    num_frags: declared,
-                    codec,
-                    payload: got,
-                } => {
-                    assert_eq!(frame_id, 0x0402, "every fragment names its frame");
-                    assert_eq!(frag_idx, idx as u16, "fragments are in order");
-                    assert_eq!(declared, num_frags, "every fragment agrees on the count");
-                    assert_eq!(codec, shared::codec::Codec::Av1);
-                    rebuilt.extend_from_slice(&got);
-                }
-                // The keyframe variant is a distinct message type, so a delta
-                // cannot be mistaken for a reference frame — and therefore
-                // cannot reset the client's prediction chain.
-                other => panic!("expected a VideoDelta, got {other:?}"),
-            }
-        }
-        assert_eq!(rebuilt, payload, "the split must be lossless");
-    }
-
-    /// Pacing must hold the *average* rate at the ceiling, not merely slow some
-    /// fragments down. A pacer that stalls and then catches up by bursting has
-    /// moved the problem rather than fixed it, so the interval is pinned against
-    /// the arithmetic a whole frame depends on.
-    #[test]
-    fn pacing_interval_is_the_ceiling_over_the_datagram_size() {
-        // 1192 bytes is the payload a 1200-byte datagram leaves after the delta
-        // header, and 7 Mbit/s is the encoder's nominal rate.
-        let interval = Pacer::new(7_000_000, 1192).interval;
-        // 1192 * 8 / 7_000_000 seconds, which is 1.362285714 ms truncated to
-        // whole nanoseconds.
-        let exact = Duration::from_nanos(1192 * 8 * 1_000_000_000 / 7_000_000);
-        assert_eq!(interval, exact);
-
-        // A whole 14-fragment delta, sent at that interval, must land on the
-        // ceiling. Truncating each interval to a whole nanosecond can only make
-        // it marginally shorter, so the implied average sits a hair *over* the
-        // ceiling — 3.7 bit/s out of seven million here. That is the real bound
-        // of integer pacing, and it is asserted as such rather than wished away
-        // with a tolerance that would hide a genuine overshoot.
-        let frame = 14 * interval;
-        let implied_bps = 14.0 * 1192.0 * 8.0 / frame.as_secs_f64();
-        let overage = implied_bps - 7_000_000.0;
-        assert!(
-            overage < 1e-3 * 7_000_000.0,
-            "14 fragments in {frame:?} implies {implied_bps} bit/s, \
-             over the ceiling by {overage} bit/s"
-        );
-    }
-
-    /// A rate so low that the arithmetic would round to zero nanoseconds must
-    /// still produce a wait, or the ceiling silently becomes no ceiling at all.
-    #[test]
-    fn pacing_never_rounds_to_an_instant_send() {
-        // 1 bit/s over a full 65535-byte datagram is well under one nanosecond
-        // per bit, and truncating it to zero would send every fragment at once.
-        let pacer = Pacer::new(1, 65_535);
-        assert!(
-            pacer.interval > Duration::ZERO,
-            "a ceiling of 1 bit/s gave no wait"
-        );
-        // A higher rate legitimately gives a shorter one, so the interval must
-        // actually be tracking the ceiling rather than being a constant.
-        assert!(Pacer::new(7_000_000, 1192).interval < pacer.interval);
-    }
-
-    /// The largest burst and the largest fragment count have to be tracked
-    /// independently: a frame can be wide because it is one large frame or because
-    /// it is many fragments, and the fragment count is what decides how many
-    /// chances the path has to lose part of it.
-    #[test]
-    fn send_profile_keeps_the_largest_burst_and_the_fragment_count_apart() {
-        let mut profile = SendProfile::default();
-        // A wide frame in few fragments.
-        profile.record(60_000, 3, Duration::from_millis(60));
-        // A smaller frame in many fragments.
-        profile.record(1_000, 40, Duration::from_millis(1));
-
-        assert_eq!(profile.frames, 2);
-        assert_eq!(
-            profile.peak_burst_bytes, 60_000,
-            "largest burst is the wide frame"
-        );
-        assert_eq!(profile.peak_frags, 40, "most fragments is the split frame");
-    }
-
-    /// The mean rate is the rate the path is asked to sustain while sending, and
-    /// it is the number the pacing ceiling is compared against — so it has to be
-    /// the total bytes over the total time, not a maximum over per-frame rates.
-    #[test]
-    fn the_mean_rate_is_the_total_bytes_over_the_total_time() {
-        let mut profile = SendProfile::default();
-        // Two frames of 1000 bytes each, each taking 10ms: 2000 bytes in 20ms,
-        // which is 800 kbit/s. A per-frame maximum would report the same here, so
-        // the two frames are given different spans to tell the formulae apart.
-        profile.record(1_000, 1, Duration::from_millis(10));
-        profile.record(1_000, 1, Duration::from_millis(30));
-        // 2000 bytes in 40ms is 400 kbit/s. A max-of-per-frame-rates would report
-        // 800 kbit/s (the faster frame), which is not the rate being sustained.
-        assert_eq!(profile.mean_rate_bps(), 400_000);
-    }
-
-    /// A frame that took no measurable time must not divide by zero.
-    #[test]
-    fn send_profile_survives_an_empty_window() {
-        let profile = SendProfile::default();
-        assert_eq!(profile.mean_rate_bps(), 0, "no frames means no rate");
-    }
-
-    /// The environment must not be the only way to turn pacing off, and a typo
-    /// must not silently take it off when the caller believed it was on.
-    #[test]
-    fn pacing_setting_is_read_from_the_environment() {
-        assert_eq!(
-            parse_pacing_bps(None),
-            Some(DEFAULT_PACING_BPS),
-            "on by default"
-        );
-        assert_eq!(parse_pacing_bps(Some("off".into())), None);
-        assert_eq!(parse_pacing_bps(Some("OFF".into())), None);
-        assert_eq!(parse_pacing_bps(Some("0".into())), None);
-        assert_eq!(parse_pacing_bps(Some("2000000".into())), Some(2_000_000));
-        // Unparseable is read as off, and is logged, so the log says the ceiling
-        // is gone rather than the log staying quiet about it.
-        assert_eq!(parse_pacing_bps(Some("fast".into())), None);
-    }
-
-    /// A ring entry as the forwarder builds it.
-    fn entry(frame_id: u16, payload: &[u8], payload_size: usize) -> DeltaEntry {
-        DeltaEntry {
-            frame_id,
-            codec: shared::codec::Codec::Av1,
-            num_frags: payload.len().div_ceil(payload_size) as u16,
-            payload_size,
-            payload: Arc::new(payload.to_vec()),
-        }
-    }
-
-    /// A resend has to reproduce the exact datagram the frame was originally cut
-    /// into, because the client reassembles by concatenating fragments in index
-    /// order and comparing the count against its own record of the frame. A
-    /// boundary that has drifted produces a payload that is the right length and
-    /// the wrong bytes.
-    #[test]
-    fn a_resend_reproduces_the_original_fragment_boundaries() {
-        // 2500 bytes at 1000 a fragment is three fragments: 1000, 1000, 500.
-        let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
-        let mut ring = DeltaRing::new();
-        ring.insert(entry(7, &payload, 1000));
-
-        let mut rebuilt = Vec::new();
-        for index in 0..3 {
-            let dgram = ring
-                .fragment(7, index)
-                .expect("the frame is held and the index is in range");
-            match ServerDatagram::from_bytes(&dgram).expect("parses") {
-                ServerDatagram::VideoDelta {
-                    frame_id,
-                    frag_idx,
-                    num_frags,
-                    payload: chunk,
-                    ..
-                } => {
-                    assert_eq!(frame_id, 7);
-                    assert_eq!(frag_idx, index);
-                    assert_eq!(num_frags, 3, "the fragment count is unchanged");
-                    rebuilt.extend_from_slice(&chunk);
-                }
-                other => panic!("expected a VideoDelta, got {other:?}"),
-            }
-        }
-        assert_eq!(
-            rebuilt, payload,
-            "the resend reassembles to the original bytes"
-        );
-    }
-
-    /// The last fragment of a frame is short, and a resend must not pad it or run
-    /// off the end of the payload — either would change the reassembled length.
-    #[test]
-    fn a_resend_of_the_last_fragment_is_the_short_one() {
-        let payload: Vec<u8> = (0..2500u32).map(|i| (i % 251) as u8).collect();
-        let mut ring = DeltaRing::new();
-        ring.insert(entry(7, &payload, 1000));
-
-        let dgram = ring.fragment(7, 2).expect("the last fragment is held");
-        match ServerDatagram::from_bytes(&dgram).expect("parses") {
-            ServerDatagram::VideoDelta { payload, .. } => {
-                assert_eq!(
-                    payload.len(),
-                    500,
-                    "the tail fragment is 500 bytes, not 1000"
-                );
-            }
-            other => panic!("expected a VideoDelta, got {other:?}"),
-        }
-    }
-
-    /// A frame the ring has dropped cannot be resent, and that is the normal case
-    /// rather than an error: the client escalates to a keyframe on a deadline, so
-    /// an unanswerable request is the fallback working as designed.
-    #[test]
-    fn a_resend_of_an_unheld_frame_is_refused() {
-        let mut ring = DeltaRing::new();
-        ring.insert(entry(7, &[0; 100], 1000));
-        assert!(ring.fragment(8, 0).is_none(), "frame 8 was never held");
-        assert!(
-            ring.fragment(7, 5).is_none(),
-            "index 5 is not one of frame 7's fragments"
-        );
-    }
-
-    /// The ring is bounded, and the bound has to fall on the oldest frames: those
-    /// are the ones a request is least likely to name, and a repair is only useful
-    /// while the client is still waiting for the frame.
-    #[test]
-    fn the_ring_evicts_the_oldest_frames_first() {
-        let mut ring = DeltaRing::new();
-        // 600 entries of 1000 bytes is 600 KB, well past the 512 KB bound, so the
-        // bound has to be what stops the growth rather than the frame count.
-        for id in 0..600u16 {
-            ring.insert(entry(id, &[0; 1000], 1000));
-        }
-        assert!(
-            ring.bytes <= DELTA_RING_BYTES,
-            "the byte bound is what stops the growth, not the frame count"
-        );
-        assert!(ring.fragment(0, 0).is_none(), "the oldest frame is evicted");
-        assert!(
-            ring.fragment(599, 0).is_some(),
-            "the newest frame is still held"
-        );
-    }
-
-    /// The frame-count bound has to hold too, because a run of large frames could
-    /// otherwise grow the ring past the point where searching it is free.
-    #[test]
-    fn the_ring_is_bounded_by_frame_count_as_well_as_bytes() {
-        let mut ring = DeltaRing::new();
-        // One byte each, so the byte bound is nowhere near binding.
-        for id in 0..DELTA_RING_FRAMES as u16 + 10 {
-            ring.insert(entry(id, &[0], 1000));
-        }
-        assert!(
-            ring.entries.len() <= DELTA_RING_FRAMES,
-            "the ring holds {} frames",
-            ring.entries.len()
-        );
-        assert!(
-            ring.fragment(0, 0).is_none(),
-            "the oldest frames are evicted"
-        );
-    }
-
-    /// An unpaced send loop cannot rate-limit anything, and this pins the proof.
-    ///
-    /// Splitting a realistic delta — 15,636 bytes, the mean measured on a real
-    /// session — into its fourteen fragments and serialising each one costs a
-    /// couple of microseconds, because that is a memcpy. Paced at the encoder's
-    /// nominal rate the same bytes take eighteen milliseconds. So the tight loop
-    /// provides no rate limit whatsoever: whatever ceiling the path enforces is
-    /// the only ceiling there is, and quinn imposes none on datagrams (see
-    /// [`Pacer`]). The bound is a whole millisecond rather than the couple of
-    /// microseconds actually observed, because the claim under test is the
-    /// orders-of-magnitude gap and a debug build on a loaded machine must not be
-    /// able to fail it.
-    #[test]
-    fn an_unpaced_delta_send_loop_costs_far_too_little_to_be_a_rate_limit() {
-        let payload: Vec<u8> = (0..15_636u32).map(|i| (i % 251) as u8).collect();
-        let payload_size = 1192usize;
-        let num_frags = payload.len().div_ceil(payload_size) as u16;
-        assert_eq!(num_frags, 14, "a realistic delta is fourteen fragments");
-
-        let started = Instant::now();
-        let mut bytes = 0usize;
-        for (idx, chunk) in payload.chunks(payload_size).enumerate() {
-            let dgram = ServerDatagram::delta_to_bytes(
-                7,
-                idx as u16,
-                num_frags,
-                shared::codec::Codec::Av1,
-                chunk,
-            );
-            bytes += dgram.len();
-            std::hint::black_box(&dgram);
-        }
-        let span = started.elapsed();
-        assert!(
-            span < Duration::from_millis(1),
-            "the tight loop took {span:?}"
-        );
-
-        // The same bytes at the ceiling, and the ratio that makes the point: the
-        // loop is thousands of times faster than the rate it is supposed to be
-        // sending at, so it will always overrun anything but an uncongested path.
-        let paced = Duration::from_nanos(bytes as u64 * 8 * 1_000_000_000 / DEFAULT_PACING_BPS);
-        assert!(
-            span * 1000 < paced,
-            "unpaced {span:?} versus paced {paced:?}: the loop is not the limit"
-        );
-    }
 
     /// A consumer that falls behind the client-message bus must keep going.
     ///

@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "build:wasm": "RUSTFLAGS='--cfg=web_sys_unstable_apis' wasm-pack build wasm --target web --out-dir pkg",
+    "build:wasm": "wasm-pack build wasm --target web --out-dir pkg",
     "prebuild": "pnpm build:wasm",
     "dev": "pnpm build:wasm && vite",
     "build": "vite build",

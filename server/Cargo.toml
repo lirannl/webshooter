@@ -69,3 +69,6 @@ reis = { workspace = true, features = ["tokio"] }
 log.workspace = true
 ksni = { version = "0.3.6", features = ["tokio"] }
 resvg = { version = "0.48.1", default-features = false }
+moq-net.workspace = true
+quinn.workspace = true
+web-transport-trait.workspace = true

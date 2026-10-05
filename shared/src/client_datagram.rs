@@ -142,7 +142,11 @@ pub fn coalesce_input(queue: &mut VecDeque<ClientDatagram>, msg: ClientDatagram)
             }
         }
         ClientDatagram::Touchscreen { index, x, y } => {
-            if let Some(ClientDatagram::Touchscreen { index: pi, x: px, y: py }) = queue.back_mut()
+            if let Some(ClientDatagram::Touchscreen {
+                index: pi,
+                x: px,
+                y: py,
+            }) = queue.back_mut()
                 && pi == index
             {
                 *px = *x;
@@ -166,14 +170,19 @@ pub fn coalesce_input(queue: &mut VecDeque<ClientDatagram>, msg: ClientDatagram)
 
 #[named_constants(preserve_original)]
 #[repr(u8)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Reflection)]
 pub enum ClientDatagram {
-    KeepAlive,
+    /// The first discriminant is not zero on purpose: the first byte of
+    /// every message on this WebTransport session also decides which protocol
+    /// owns the message, and MoQ owns everything at or below
+    /// [`crate::mux::MOQ_LAST_BYTE`]. See `crate::mux` for why one byte is
+    /// enough to route it.
+    KeepAlive = crate::mux::APP_FIRST_BYTE,
     Keyboard {
         keycode: String,
         modifiers: Modifiers,
     },
-    ResizeDisplay {
+    DisplayParameters {
         index: u8,
         width: u16,
         height: u16,
@@ -249,44 +258,7 @@ pub enum ClientDatagram {
     /// because a back-channel already exists; bounded recovery instead of
     /// waiting for the next scheduled keyframe.
     RequestKeyframe,
-    /// Ask for specific delta fragments to be sent again.
-    ///
-    /// This is the cheaper half of the answer to a gap, and the one that should
-    /// usually win. A delta is split across datagrams and carries its own
-    /// fragment count, so a client short one fragment knows *which* fragment is
-    /// missing — and a keyframe, the alternative, is orders of magnitude larger
-    /// than the fragment that went missing. It also repairs more: resending a
-    /// lost delta puts the frame back where it belongs, so the frames between
-    /// the loss and a keyframe stay decodable instead of being discarded.
-    ///
-    /// Batched, because gaps arrive in runs and one message covering a whole run
-    /// costs a single round trip where one message per frame would cost a round
-    /// trip each. Entries are `(frame_id, missing fragment indices)`, and the
-    /// server ignores any frame it no longer holds.
-    ///
-    /// A request that is itself lost is not fatal: the client gives the gap a
-    /// deadline and asks for a keyframe when it passes, so repair is an attempt
-    /// rather than a dependency.
-    ResendDeltas {
-        frames: Vec<(u16, Vec<u16>)>,
-    },
 }
-
-/// Most frames a single [`ClientDatagram::ResendDeltas`] may name.
-///
-/// The client's own pending map is what it draws from, so in practice a run of
-/// lost frames fits many times over. The cap is not there to limit a well-behaved
-/// client — it bounds what a malformed one can make the server allocate, and it
-/// keeps the encoded request to a size that is never the reason a repair fails.
-pub const MAX_RESEND_FRAMES: usize = 16;
-
-/// Most fragment indices one frame may name in a [`ClientDatagram::ResendDeltas`].
-///
-/// A delta is a handful of datagrams, so this is generous for any real frame; the
-/// real bound on cost is [`MAX_RESEND_FRAMES`], and this stops one frame's worth of
-/// indices from dominating the message.
-pub const MAX_RESEND_FRAGS: usize = 32;
-
 
 impl ClientDatagram {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -300,13 +272,13 @@ impl ClientDatagram {
                 buf.extend_from_slice(key_bytes);
                 buf
             }
-            Self::ResizeDisplay {
+            Self::DisplayParameters {
                 index,
                 width,
                 height,
             } => {
                 let mut buf = Vec::with_capacity(1 + 1 + 2 * size_of::<u16>());
-                buf.push(ClientDatagramVariants::RESIZE_DISPLAY.0);
+                buf.push(ClientDatagramVariants::DISPLAY_PARAMETERS.0);
                 buf.push(*index);
                 buf.extend_from_slice(&width.to_be_bytes());
                 buf.extend_from_slice(&height.to_be_bytes());
@@ -336,9 +308,13 @@ impl ClientDatagram {
             } => {
                 // 1 discriminant + 1 id + 1 buttons (u32) + 6 sticks/triggers
                 // (i16) + 1 motion flag, plus the optional 6 motion i16s.
-                let mut buf =
-                    Vec::with_capacity(1 + 1 + size_of::<u32>() + 6 * size_of::<i16>() + 1
-                        + 6 * size_of::<i16>() * motion.is_some() as usize);
+                let mut buf = Vec::with_capacity(
+                    1 + 1
+                        + size_of::<u32>()
+                        + 6 * size_of::<i16>()
+                        + 1
+                        + 6 * size_of::<i16>() * motion.is_some() as usize,
+                );
                 buf.push(ClientDatagramVariants::GAMEPAD.0);
                 buf.push(*id);
                 buf.extend_from_slice(&buttons.to_be_bytes());
@@ -416,33 +392,6 @@ impl ClientDatagram {
                 buf
             }
             Self::RequestKeyframe => vec![ClientDatagramVariants::REQUEST_KEYFRAME.0],
-            Self::ResendDeltas { frames } => {
-                // Counted rather than trusted: the list is built from the client's
-                // own pending map, but a client that reports more entries than it
-                // can hold must not be able to make this allocate on their say-so.
-                let frames: Vec<&(u16, Vec<u16>)> = frames
-                    .iter()
-                    .take(MAX_RESEND_FRAMES)
-                    .filter(|(_, indices)| !indices.is_empty())
-                    .collect();
-                let mut buf =
-                    Vec::with_capacity(1 + 1 + frames.iter().map(|(_, i)| 3 + 2 * i.len().min(MAX_RESEND_FRAGS)).sum::<usize>());
-                buf.push(ClientDatagramVariants::RESEND_DELTAS.0);
-                buf.push(frames.len() as u8);
-                for (frame_id, indices) in frames {
-                    let indices: Vec<u16> = indices
-                        .iter()
-                        .copied()
-                        .take(MAX_RESEND_FRAGS)
-                        .collect();
-                    buf.extend_from_slice(&frame_id.to_be_bytes());
-                    buf.push(indices.len() as u8);
-                    for index in &indices {
-                        buf.extend_from_slice(&index.to_be_bytes());
-                    }
-                }
-                buf
-            }
         }
     }
 
@@ -470,11 +419,11 @@ impl ClientDatagram {
                     modifiers: Modifiers::from_bits_truncate(modifier),
                 }
             }
-            ClientDatagramVariants::RESIZE_DISPLAY => {
+            ClientDatagramVariants::DISPLAY_PARAMETERS => {
                 let [index, a, b, c, d] = data else {
-                    anyhow::bail!("ResizeDisplay datagram too short: {} bytes", bytes.len());
+                    anyhow::bail!("DisplayParameters datagram too short: {} bytes", bytes.len());
                 };
-                Self::ResizeDisplay {
+                Self::DisplayParameters {
                     index: *index,
                     width: u16::from_be_bytes([*a, *b]),
                     height: u16::from_be_bytes([*c, *d]),
@@ -492,7 +441,10 @@ impl ClientDatagram {
             }
             ClientDatagramVariants::TOUCHSCREEN_RELEASE => {
                 let [index] = data else {
-                    anyhow::bail!("TouchscreenRelease datagram too short: {} bytes", bytes.len());
+                    anyhow::bail!(
+                        "TouchscreenRelease datagram too short: {} bytes",
+                        bytes.len()
+                    );
                 };
                 Self::TouchscreenRelease { index: *index }
             }
@@ -541,7 +493,10 @@ impl ClientDatagram {
             }
             ClientDatagramVariants::GAMEPAD_DISCONNECT => {
                 let [id] = data else {
-                    anyhow::bail!("GamepadDisconnect datagram too short: {} bytes", bytes.len());
+                    anyhow::bail!(
+                        "GamepadDisconnect datagram too short: {} bytes",
+                        bytes.len()
+                    );
                 };
                 Self::GamepadDisconnect { id: *id }
             }
@@ -556,7 +511,10 @@ impl ClientDatagram {
             }
             ClientDatagramVariants::DECODER_CAPABILITIES => {
                 let Some((&len, codecs)) = data.split_first() else {
-                    anyhow::bail!("DecoderCapabilities datagram too short: {} bytes", bytes.len());
+                    anyhow::bail!(
+                        "DecoderCapabilities datagram too short: {} bytes",
+                        bytes.len()
+                    );
                 };
                 if codecs.len() < len as usize {
                     anyhow::bail!(
@@ -608,46 +566,19 @@ impl ClientDatagram {
                 }
             }
             ClientDatagramVariants::REQUEST_KEYFRAME => Self::RequestKeyframe,
-            ClientDatagramVariants::RESEND_DELTAS => {
-                // Walked with a cursor rather than destructured, because the
-                // length is not fixed: a truncated tail must fail here rather
-                // than index out of bounds, and the declared counts are read
-                // from the wire and so are not trusted to be small.
-                let mut rest = data;
-                // `..` in each pattern is what makes these "at least this long"
-                // rather than "exactly this long": the tail after the last frame
-                // is legitimately empty, and a slice pattern without it only
-                // matches a slice of precisely that length.
-                let [count, ..] = rest else {
-                    anyhow::bail!("ResendDeltas datagram too short: {} bytes", bytes.len());
-                };
-                rest = &rest[1..];
-                let mut frames = Vec::new();
-                for _ in 0..*count {
-                    let [a, b, n, ..] = rest else {
-                        anyhow::bail!(
-                            "ResendDeltas datagram truncated in frame {} of {count}",
-                            frames.len()
-                        );
-                    };
-                    rest = &rest[3..];
-                    let frame_id = u16::from_be_bytes([*a, *b]);
-                    let mut indices = Vec::new();
-                    for _ in 0..*n {
-                        let [c, d, ..] = rest else {
-                            anyhow::bail!(
-                                "ResendDeltas datagram truncated in fragment list of frame {frame_id}"
-                            );
-                        };
-                        rest = &rest[2..];
-                        indices.push(u16::from_be_bytes([*c, *d]));
-                    }
-                    frames.push((frame_id, indices));
-                }
-                Self::ResendDeltas { frames }
-            }
             n => anyhow::bail!("Invalid datagram discriminant: {}", n.0),
         })
+    }
+}
+
+impl Into<u8> for &ClientDatagramVariants {
+    fn into(self) -> u8 {
+        self.0
+    }
+}
+impl Into<u8> for ClientDatagramVariants {
+    fn into(self) -> u8 {
+        self.0
     }
 }
 
@@ -667,7 +598,7 @@ mod tests {
                 keycode: String::new(),
                 modifiers: Modifiers::empty(),
             },
-            ClientDatagram::ResizeDisplay {
+            ClientDatagram::DisplayParameters {
                 index: 1,
                 width: 1920,
                 height: 1080,
@@ -806,7 +737,10 @@ mod tests {
     /// Unknown discriminants are never flagged as input.
     #[test]
     fn is_input_byte_rejects_unknown_discriminants() {
-        for disc in [0x0E, 0x0F, 0x7F, 0xFF] {
+        // 0x4E is where `ResendDeltas` sat before the renumbering, and is now
+        // free; it is listed here because it is the byte most likely to be
+        // reintroduced by mistake.
+        for disc in [0x4E, 0x4F, 0x7F, 0xFF] {
             assert!(!is_input_byte(disc));
         }
     }
@@ -820,28 +754,28 @@ mod tests {
     #[test]
     fn wire_bytes_are_stable() {
         let cases: Vec<(ClientDatagram, Vec<u8>)> = vec![
-            (ClientDatagram::KeepAlive, vec![0x00]),
+            (ClientDatagram::KeepAlive, vec![0x40]),
             (
                 ClientDatagram::Keyboard {
                     keycode: "KeyA".into(),
                     modifiers: Modifiers::CTRL | Modifiers::SHIFT,
                 },
-                vec![0x01, 0x03, b'K', b'e', b'y', b'A'],
+                vec![0x41, 0x03, b'K', b'e', b'y', b'A'],
             ),
             (
                 ClientDatagram::Keyboard {
                     keycode: String::new(),
                     modifiers: Modifiers::empty(),
                 },
-                vec![0x01, 0x00],
+                vec![0x41, 0x00],
             ),
             (
-                ClientDatagram::ResizeDisplay {
+                ClientDatagram::DisplayParameters {
                     index: 1,
                     width: 1920,
                     height: 1080,
                 },
-                vec![0x02, 0x01, 0x07, 0x80, 0x04, 0x38],
+                vec![0x42, 0x01, 0x07, 0x80, 0x04, 0x38],
             ),
             (
                 ClientDatagram::Touchscreen {
@@ -849,11 +783,11 @@ mod tests {
                     x: 100,
                     y: 200,
                 },
-                vec![0x03, 0x00, 0x64, 0x00, 0xC8, 0x00],
+                vec![0x43, 0x00, 0x64, 0x00, 0xC8, 0x00],
             ),
             (
                 ClientDatagram::TouchscreenRelease { index: 2 },
-                vec![0x04, 0x02],
+                vec![0x44, 0x02],
             ),
             (
                 ClientDatagram::Gamepad {
@@ -868,7 +802,7 @@ mod tests {
                     motion: None,
                 },
                 vec![
-                    0x05, 0x03, 0x00, 0x00, 0xFF, 0xFF, 0x80, 0x00, 0x7F, 0xFF, 0x00, 0x00, 0xFF,
+                    0x45, 0x03, 0x00, 0x00, 0xFF, 0xFF, 0x80, 0x00, 0x7F, 0xFF, 0x00, 0x00, 0xFF,
                     0xFF, 0x00, 0x0A, 0x00, 0x14, 0x00,
                 ],
             ),
@@ -892,113 +826,81 @@ mod tests {
                     }),
                 },
                 vec![
-                    0x05, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x64,
+                    0x45, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x64,
                     0xFF, 0x38, 0x01, 0x2C, 0x00, 0x64, 0xFF, 0x38, 0x01, 0x2C,
                 ],
             ),
             (
                 ClientDatagram::GamepadDisconnect { id: 7 },
-                vec![0x06, 0x07],
+                vec![0x46, 0x07],
             ),
             (
                 ClientDatagram::Error {
                     level: log::Level::Warn,
                     message: "hello".into(),
                 },
-                vec![0x07, 0x02, b'h', b'e', b'l', b'l', b'o'],
+                vec![0x47, 0x02, b'h', b'e', b'l', b'l', b'o'],
             ),
             (
                 ClientDatagram::DecoderCapabilities {
                     decoders: vec![Codec::Av1, Codec::H264, Codec::Vp9],
                 },
-                vec![0x08, 0x03, 0x00, 0x02, 0x03],
+                vec![0x48, 0x03, 0x00, 0x02, 0x03],
             ),
             (
                 ClientDatagram::AudioReady {
                     channels: 2,
                     rate: 48000,
                 },
-                vec![0x09, 0x02, 0x00, 0x00, 0xBB, 0x80],
+                vec![0x49, 0x02, 0x00, 0x00, 0xBB, 0x80],
             ),
             (
                 ClientDatagram::MouseMove { dx: 12, dy: -34 },
-                vec![0x0A, 0x00, 0x0C, 0xFF, 0xDE],
+                vec![0x4A, 0x00, 0x0C, 0xFF, 0xDE],
             ),
             (
                 ClientDatagram::MouseButton {
                     button: 2,
                     pressed: true,
                 },
-                vec![0x0B, 0x02, 0x01],
+                vec![0x4B, 0x02, 0x01],
             ),
             (
                 ClientDatagram::Scroll { dx: 100, dy: -200 },
-                vec![0x0C, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xFF, 0xFF, 0x38],
+                vec![0x4C, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xFF, 0xFF, 0x38],
             ),
-            (ClientDatagram::RequestKeyframe, vec![0x0D]),
-            // Two frames, one missing a single fragment and one missing two. The
-            // shape of a real request: a run of lost frames, each short a fragment
-            // or two, which is what a burst of datagram loss looks like.
-            (
-                ClientDatagram::ResendDeltas {
-                    frames: vec![(814, vec![3]), (820, vec![0, 4])],
-                },
-                vec![
-                    0x0E, 0x02, // two frames
-                    0x03, 0x2E, 0x01, 0x00, 0x03, // frame 814, one index: 3
-                    0x03, 0x34, 0x02, 0x00, 0x00, 0x00, 0x04, // frame 820, two: 0, 4
-                ],
-            ),
+            (ClientDatagram::RequestKeyframe, vec![0x4D]),
         ];
         for (dgram, expected) in cases {
             assert_eq!(dgram.to_bytes(), expected, "bytes changed for {dgram:?}");
         }
     }
 
-    /// A repair request must survive the wire in both directions, and must
-    /// survive being truncated — this is fed with bytes from the network, so a
-    /// short read has to be an error rather than an out-of-bounds panic.
+    /// Every discriminant in this family has to land above MoQ's reserved
+    /// range, because the first byte is all a receiver has to route on. Walking
+    /// the family rather than checking the first variant means a variant
+    /// appended later cannot slip back down under the boundary.
     #[test]
-    fn a_resend_request_round_trips_and_rejects_a_truncated_tail() {
-        let request = ClientDatagram::ResendDeltas {
-            frames: vec![(0x0402, vec![1, 2, 3]), (0xFFFF, vec![0])],
-        };
-        let bytes = request.to_bytes();
-        assert_eq!(ClientDatagram::from_bytes(&bytes).expect("parses"), request);
-
-        // Every prefix of a real request must fail to parse rather than panic.
-        // The last byte is the one that makes the final index complete.
-        for cut in 0..bytes.len() {
+    fn every_discriminant_lands_in_the_app_range() {
+        for variant in ClientDatagramVariants::_values() {
             assert!(
-                ClientDatagram::from_bytes(&bytes[..cut]).is_err(),
-                "a {cut}-byte prefix parsed, so a truncated request is not rejected"
+                !crate::mux::is_moq_byte(variant.into()),
+                "{variant:?} would be routed to MoQ"
             );
         }
     }
 
-    /// The caps are a bound on what a malformed client can make the server
-    /// allocate, so they have to be enforced on the way out as well as on the
-    /// way in: a client that reports more than it can hold must not be able to
-    /// grow the message without limit.
+    /// The same collision as [`ServerDatagram`](crate::server_datagram)'s
+    /// equivalent test, from the receiving end: a message the mux routed to
+    /// MoQ must not then parse as a client message. Every one of these bytes
+    /// used to be a live discriminant, `KeepAlive` among them.
     #[test]
-    fn a_resend_request_is_capped_at_the_declared_limits() {
-        let many_frames: Vec<(u16, Vec<u16>)> = (0..MAX_RESEND_FRAMES as u16 * 4)
-            .map(|id| (id, vec![0u16; MAX_RESEND_FRAGS * 2]))
-            .collect();
-        let bytes = ClientDatagram::ResendDeltas {
-            frames: many_frames,
+    fn a_moq_first_byte_is_not_a_client_discriminant() {
+        for byte in 0..=crate::mux::MOQ_LAST_BYTE {
+            assert!(
+                ClientDatagram::from_bytes(&[byte]).is_err(),
+                "{byte:#04x} decoded as a client message, but it belongs to MoQ"
+            );
         }
-        .to_bytes();
-        let parsed = ClientDatagram::from_bytes(&bytes).expect("parses");
-        let ClientDatagram::ResendDeltas { frames } = parsed else {
-            panic!("wrong variant");
-        };
-        assert_eq!(frames.len(), MAX_RESEND_FRAMES, "the frame cap is enforced");
-        assert!(
-            frames.iter().all(|(_, indices)| indices.len() == MAX_RESEND_FRAGS),
-            "the per-frame index cap is enforced"
-        );
-        // And the result is still a message that fits a control datagram.
-        assert!(bytes.len() < 1200, "the capped request is {} bytes", bytes.len());
     }
 }

@@ -42,6 +42,22 @@ impl Codec {
         }
     }
 
+    /// The short, stable name this codec goes by in a MoQ track name.
+    ///
+    /// A track's name is its identity, and a subscriber builds its decoder from the
+    /// name it subscribed to, so this has to say which codec the frames are in and
+    /// nothing else. Both ends derive it from the same enum rather than each writing
+    /// the string out, because a mismatch here is not a parse error at any point —
+    /// it is a client that subscribes to a track that does not exist.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Av1 => "av1",
+            Self::H265 => "h265",
+            Self::H264 => "h264",
+            Self::Vp9 => "vp9",
+        }
+    }
+
     /// Priority-ordered list (best first). Server selects the first codec
     /// that the client also supports.
     pub const ALL: [Self; 4] = [Self::Av1, Self::H265, Self::H264, Self::Vp9];
