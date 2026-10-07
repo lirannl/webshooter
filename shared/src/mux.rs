@@ -35,60 +35,76 @@
 //!
 //! # The split
 //!
-//! [`MOQ_LAST_BYTE`] is the top of the reserved range. Everything at or below it
-//! is MoQ's; everything above it belongs to this crate's own protocol, whose
-//! discriminants therefore all start at [`APP_FIRST_BYTE`].
+//! The split is defined in one place: the first variant of
+//! [`ServerDatagram`](crate::server_datagram::ServerDatagram), which declares
+//! the first byte this crate's own protocol is allowed to use. Everything below
+//! that byte is MoQ's; everything from it up belongs to us, so both
+//! [`ServerDatagram`](crate::server_datagram::ServerDatagram) and
+//! [`ClientDatagram`](crate::client_datagram::ClientDatagram) start there.
 //!
-//! The reservation is asserted rather than assumed. [`tests::reserved_range_is_disjoint`]
-//! checks the two ends of the boundary, `server_datagram::tests` and
-//! `client_datagram::tests` each check that every discriminant their family owns
-//! lands above it, and both parsers are tested to reject the whole reserved
-//! range. So a webshooter variant that wanders back down into MoQ's range, or a
-//! moq-net release that grows a stream type past `0x3F`, fails a test in this
-//! crate rather than the first client that tries to use it.
+//! There is deliberately no free constant holding that boundary. A constant
+//! would be a second, independent statement of the same fact, and the two would
+//! drift: the enum is the wire format, so it is the thing that owns the number.
+//!
+//! The reservation is asserted rather than assumed.
+//! [`tests::reserved_range_is_disjoint`] checks the two ends of the boundary,
+//! `server_datagram::tests` and `client_datagram::tests` each check that every
+//! discriminant their family owns lands above it, and both parsers are tested to
+//! reject the whole reserved range. So a webshooter variant that wanders back
+//! down into MoQ's range, or a moq-net release that grows a stream type past the
+//! boundary, fails a test in this crate rather than the first client that tries
+//! to use it.
 
-/// The largest first byte that can begin a MoQ message, and so the top of the
-/// range reserved for MoQ on this WebTransport session.
-///
-/// `0x3F` rather than `0x01` because a MoQ datagram's first byte is a subscribe
-/// id, not a type tag. See the module docs.
-pub const MOQ_LAST_BYTE: u8 = 0x3F;
-
-/// The first byte available to this crate's own message discriminants.
-///
-/// The first byte past [`MOQ_LAST_BYTE`], so a webshooter message and a MoQ
-/// message can never be confused for one another.
-pub const APP_FIRST_BYTE: u8 = 0x40;
+use crate::server_datagram::ServerDatagramVariants;
 
 /// Whether the message whose first byte is `byte` belongs to MoQ.
 ///
 /// Used by both ends to route an incoming stream or datagram. The caller must
 /// have at least one byte to look at: an empty message has no first byte and so
 /// cannot be classified.
+///
+/// The boundary is the first byte of this crate's own protocol, read from
+/// [`ServerDatagramVariants::RELEASE_MOUSE`] rather than restated here — see the
+/// module docs.
 pub const fn is_moq_byte(byte: u8) -> bool {
-    byte <= MOQ_LAST_BYTE
+    byte < ServerDatagramVariants::MOQ_BOUNDARY.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The whole point of the mux: the two ranges must not touch, in either
-    /// direction. If they ever did, a message would be routed to the protocol
-    /// that did not write it — which for a MoQ stream means a webshooter
-    /// unidirectional stream is decoded as a frame group, and for a datagram
-    /// means an input event is parsed as a subscribe id.
+    /// The boundary itself, which is the case that breaks: the byte below it is
+    /// MoQ's last, the byte at it is ours, with no gap and no overlap between
+    /// them.
+    ///
+    /// `0x3F` and `0x40` are spelled out as literals rather than derived, because
+    /// this test is the one place whose job is to notice if the declared
+    /// boundary is ever moved: it reads the enum and compares.
     #[test]
     fn reserved_range_is_disjoint() {
-        assert_eq!(
-            APP_FIRST_BYTE,
-            MOQ_LAST_BYTE + 1,
-            "the app range must start exactly past the MoQ range"
+        let boundary = ServerDatagramVariants::MOQ_BOUNDARY.0;
+        assert_eq!(boundary, 0x40, "the declared boundary has moved");
+        assert!(
+            is_moq_byte(boundary - 1),
+            "the byte below the boundary must be MoQ's"
         );
-        // The boundary is the case that breaks: 0x3F is MoQ's last byte and
-        // 0x40 the app's first, with no gap and no overlap between them.
-        assert!(is_moq_byte(MOQ_LAST_BYTE));
-        assert!(!is_moq_byte(APP_FIRST_BYTE));
+        assert!(
+            !is_moq_byte(boundary),
+            "the boundary byte itself must be ours, or the ranges overlap"
+        );
+    }
+
+    /// Both families must begin at the same byte, since they share one session.
+    /// `ClientDatagram` names `ServerDatagram`'s boundary variant for exactly this
+    /// reason, so this asserts the two actually agree rather than assuming it.
+    #[test]
+    fn both_families_start_at_the_same_byte() {
+        assert_eq!(
+            crate::client_datagram::ClientDatagramVariants::KEEP_ALIVE.0,
+            ServerDatagramVariants::MOQ_BOUNDARY.0,
+            "client and server discriminants must start together"
+        );
     }
 
     /// The reserved range has to cover everything moq-lite can open a stream

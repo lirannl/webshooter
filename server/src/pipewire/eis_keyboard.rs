@@ -5,7 +5,6 @@ use reis::event as reis_event;
 
 use shared::client_datagram::Modifiers;
 
-
 use super::eis::with_emulation;
 
 // ---------------------------------------------------------------------------
@@ -317,21 +316,29 @@ pub fn js_keycode_to_eis_key(code: &str) -> Option<u32> {
 // EIS keyboard sender
 // ---------------------------------------------------------------------------
 
-pub fn send_keyboard_key(
+/// Send a run of key events as one emulated frame, for the same reason
+/// [`send_touch_events`](super::touch::send_touch_events) batches touches: the
+/// per-event `start_emulating`/`frame`/`stop_emulating`/`flush` costs more than
+/// the key itself.
+pub fn send_keyboard_keys(
     connection: &reis_event::Connection,
     device: &reis_event::Device,
     keyboard: &ei::Keyboard,
     sequence: &mut u32,
-    key: u32,
-    press: bool,
+    events: &[EisKeyboardEvent],
 ) {
+    if events.is_empty() {
+        return;
+    }
     with_emulation(connection, device, sequence, "keyboard", || {
-        let state = if press {
-            ei::keyboard::KeyState::Press
-        } else {
-            ei::keyboard::KeyState::Released
-        };
-        keyboard.key(key, state);
+        for event in events {
+            let state = if event.press {
+                ei::keyboard::KeyState::Press
+            } else {
+                ei::keyboard::KeyState::Released
+            };
+            keyboard.key(event.key, state);
+        }
     });
 }
 
@@ -344,10 +351,14 @@ pub fn send_keyboard_key(
 fn is_modifier_code(code: &str) -> bool {
     matches!(
         code,
-        "ShiftLeft" | "ShiftRight"
-            | "ControlLeft" | "ControlRight"
-            | "AltLeft" | "AltRight"
-            | "MetaLeft" | "MetaRight"
+        "ShiftLeft"
+            | "ShiftRight"
+            | "ControlLeft"
+            | "ControlRight"
+            | "AltLeft"
+            | "AltRight"
+            | "MetaLeft"
+            | "MetaRight"
     )
 }
 
@@ -359,7 +370,9 @@ pub struct KeyboardState {
 impl KeyboardState {
     pub fn new() -> Self {
         let mut mod_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(1)));
-        mod_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+        mod_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(1));
         Self {
             mod_state: ModifierState::new(),
             mod_timeout,

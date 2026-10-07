@@ -263,6 +263,83 @@ pub fn audio_start_button(
     }
 }
 
+/// Resume `ctx` on the page's user gestures, for as long as it takes.
+///
+/// A browser starts an `AudioContext` suspended unless the page is already
+/// allowed to play (`AudioPlayer::new` reports that case itself), and until it
+/// runs there is no audio to stream, so `AudioReady` cannot be sent — see
+/// [`handle_audio_state`]. A context that never leaves `suspended` also never
+/// fires `statechange`, which means the resume inside `handle_audio_state` is
+/// unreachable: it is a response to the state *changing*, so it cannot bring
+/// about the first change. Something outside the context has to ask.
+///
+/// On the /audio page that is the "Start Audio" button, which is the whole point
+/// of the page. A video session has no such button — the whole page is the remote
+/// desktop's canvas — so a pointer or key event on the page is the gesture, and
+/// this is what takes it.
+///
+/// **These listeners are deliberately not one-shot.** They were, and that was the
+/// bug. `resume()` returns a promise that stays *pending* — rather than
+/// rejecting — when the browser is not yet prepared to unlock the context, so a
+/// one-shot listener unsubscribes on an attempt that achieves nothing and never
+/// tries again: the context stays suspended for the rest of the session and
+/// `AudioReady` is never sent. Observed exactly that — the gesture arrived,
+/// `resume()` was called, and no further log line ever appeared.
+///
+/// Several event types, because engines disagree about what counts as media
+/// activation: `pointerdown` is enough in some, while others want `touchend` or
+/// `click`. Listening for all of them costs nothing, because the handler returns
+/// immediately once the context is running.
+///
+/// Once it is running, [`handle_audio_state`] takes over for any later
+/// suspension, so this only has to win the first one.
+pub fn resume_on_first_gesture(ctx: &web_sys::AudioContext) {
+    let Some(window) = web_sys::window() else {
+        log::warn!("audio: no window; cannot listen for the resume gesture");
+        return;
+    };
+    log::info!(
+        "audio: listening for gestures to resume the context (currently {:?})",
+        ctx.state()
+    );
+    for event in ["pointerdown", "pointerup", "touchend", "click", "keydown"] {
+        let ctx = ctx.clone();
+        let name = event;
+        let cb = Closure::wrap(Box::new(move || {
+            // Already running: nothing to unlock, and no promise worth watching.
+            if ctx.state() == web_sys::AudioContextState::Running {
+                return;
+            }
+            log::info!("audio: {name} — resuming the AudioContext");
+            match ctx.resume() {
+                Ok(promise) => {
+                    // Logged apart from the outcome on purpose: a promise left
+                    // *pending* produces neither, and that silence is the whole
+                    // failure mode — it is indistinguishable from a listener that
+                    // never fired.
+                    log::debug!("audio: resume() returned a promise");
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match wasm_bindgen_futures::JsFuture::from(promise).await {
+                            Ok(state) => log::info!("audio: resume() resolved to {state:?}"),
+                            Err(err) => log::error!(
+                                "audio: resume() was refused: {:?}",
+                                js_sys::Error::from(err)
+                            ),
+                        }
+                    });
+                }
+                Err(err) => log::error!("audio: resume() threw: {err:?}"),
+            }
+        }) as Box<dyn FnMut()>);
+        if let Err(err) =
+            window.add_event_listener_with_callback(event, cb.as_ref().unchecked_ref())
+        {
+            log::warn!("audio: could not listen for {event}: {err:?}");
+        }
+        cb.forget();
+    }
+}
+
 /// Monotonic milliseconds since navigation start, used for the client-side
 /// "is audio being played right now" window.
 fn now_ms() -> f64 {
@@ -557,7 +634,9 @@ fn play_audio_data(state: &Rc<RefCell<PlaybackState>>, data: AudioData) {
             static PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = PEAK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 3 {
-                log::debug!("audio: first pcm buffer peak={peak:.4} frames={frames} rate={sample_rate}");
+                log::debug!(
+                    "audio: first pcm buffer peak={peak:.4} frames={frames} rate={sample_rate}"
+                );
             }
         }
         let _ = buffer.copy_to_channel(&vec, ch as i32);

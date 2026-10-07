@@ -3,9 +3,10 @@ use shared::codec::Codec;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, EncodedVideoChunk, HtmlCanvasElement, HtmlDivElement, KeyboardEvent,
-    VideoFrame,
+    MediaQueryList, VideoFrame,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,93 +41,393 @@ pub fn setup_canvas() -> HtmlCanvasElement {
     canvas
 }
 
-pub fn send_initial_resize(canvas: &HtmlCanvasElement) -> Result<(), JsError> {
+/// The canvas's size in device pixels — what the server builds its virtual
+/// monitor to match — or `None` while it has none.
+///
+/// The `f64 as u16` casts saturate rather than wrap, which a multiplication
+/// done in `u16` would not: a wide display at a high device pixel ratio clamps
+/// to `u16::MAX` instead of asking the server for a 0×0 monitor.
+///
+/// A canvas that is not laid out — detached, or not yet painted — measures
+/// 0×0, and that is not a display the server could honour: it would build a
+/// 0×0 monitor and then find no stream at that size. So zero is reported as
+/// no size at all, and the next real observation reports the truth. That also
+/// covers a stale canvas: the previous session's handlers stay attached to a
+/// canvas that has since been detached, and a fullscreen exit delivers its
+/// event to that canvas, where it must not put a 0×0 monitor on the wire of
+/// whichever session is current now.
+fn display_size(canvas: &HtmlCanvasElement) -> Result<Option<(u16, u16)>, JsError> {
     let window = web_sys::window().ok_or(JsError::new("Window not found"))?;
-    let w = canvas.offset_width() as f64;
-    let h = canvas.offset_height() as f64;
-    crate::send_datagram(ClientDatagram::DisplayParameters {
+    let dpr = window.device_pixel_ratio();
+    let width = (f64::from(canvas.offset_width()) * dpr) as u16;
+    let height = (f64::from(canvas.offset_height()) * dpr) as u16;
+    Ok((width > 0 && height > 0).then_some((width, height)))
+}
+
+/// Report the canvas's current size to the server, and return what was sent —
+/// or `None` if the canvas has no size to report yet.
+///
+/// Sent once, when the display is built and before anything is observing the
+/// canvas: this is the datagram the server waits for before it creates a
+/// virtual monitor at all, so a session that never sends it has no display and
+/// no input path. When there is no size to send, the caller's next observation
+/// reports it instead — which is how a display recovers from a first measurement
+/// taken before the page was laid out.
+///
+/// Reliably, on a unidirectional stream: a lost size leaves the server capturing
+/// at the old one, and nothing retries it, because a client whose canvas has
+/// not changed since has no further observation to make. A failure is reported
+/// as an error so the caller can leave the display unsent rather than believing
+/// the server has a size it never received.
+///
+/// The returned size seeds [`DisplayResize`], which is what lets the observer's
+/// initial callback — reporting the size just sent — be recognised as nothing
+/// new rather than as a resize.
+pub async fn send_initial_resize(
+    canvas: &HtmlCanvasElement,
+) -> Result<Option<(u16, u16)>, JsError> {
+    let Some((width, height)) = display_size(canvas)? else {
+        return Ok(None);
+    };
+    let sent = crate::send_reliable(ClientDatagram::DisplayParameters {
         index: 0,
-        width: (w * window.device_pixel_ratio()) as u16,
-        height: (h * window.device_pixel_ratio()) as u16,
-    });
-    Ok(())
+        width,
+        height,
+    })
+    .await;
+    if !sent {
+        return Err(JsError::new("DisplayParameters could not be sent"));
+    }
+    log::info!("canvas sized {width}x{height}");
+    Ok(Some((width, height)))
 }
 
 // ---------------------------------------------------------------------------
-// Resize prompt
+// Resize reporting
 // ---------------------------------------------------------------------------
 
-pub fn setup_resize_prompt(canvas: &HtmlCanvasElement) -> Rc<Cell<bool>> {
-    let window = web_sys::window().unwrap();
-    let performance = window.performance().unwrap();
+/// How long the canvas has to hold one size before it is reported, in ms.
+///
+/// `DisplayParameters` is the most expensive message the client can send:
+/// receiving one makes the server close its portal session and rebuild the
+/// whole capture pipeline, encoder included, and a new encoder's first frame
+/// owes the client a keyframe it then has to ask for. A window drag, an
+/// address-bar collapse or a rotation therefore has to arrive as one message
+/// carrying the size the user actually ended up with — not one per
+/// intermediate size.
+const RESIZE_SETTLE_MS: f64 = 200.0;
 
-    // Debounced resize sender: 2s cooldown after initial send.
-    // Not started as None because send_initial_resize already fired before
-    // the ResizeObserver was attached — its first callback would duplicate.
-    let last_sent = RefCell::new(Some(performance.now()));
+thread_local! {
+    /// The display being watched. One canvas exists per session, so the settle
+    /// timer can reach the sender without every callback having to carry it.
+    static RESIZE: RefCell<Option<Rc<DisplayResize>>> = const { RefCell::new(None) };
+    /// The settle timer's callback, held here rather than forgotten on each arm
+    /// so the one `Closure` is reused for the session.
+    static SETTLE_CB: Closure<dyn FnMut()> =
+        Closure::wrap(Box::new(settle_expired) as Box<dyn FnMut()>);
+}
 
-    let send_resize = move || -> Result<(), JsError> {
-        let now = performance.now();
-        let should_send = {
-            let mut last = last_sent.borrow_mut();
-            if let Some(last_time) = *last {
-                if now - last_time >= 2000.0 {
-                    *last = Some(now);
-                    true
-                } else {
-                    false
-                }
+type Size = (u16, u16);
+
+/// What the debouncer wants its caller to do about a size.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeEffect {
+    /// Nothing: the size is already sent, or already waiting to be.
+    Idle,
+    /// (Re)arm the settle timer — a new size is waiting for it to expire.
+    Arm,
+    /// Forget the outstanding size and cancel the timer.
+    Cancel,
+    /// Put `size` on the wire. Should the send fail, `restore` becomes the
+    /// last-known size again, so a later observation of `size` can retry it.
+    Send { size: Size, restore: Option<Size> },
+}
+
+/// The decision half of the debounced resize sender: what size, if any, should
+/// go on the wire, and when.
+///
+/// Deliberately free of `web_sys`, timers and transport, because every rule
+/// here is one that can be wrong in a way nothing else would notice: a
+/// dropped size leaves the server capturing at the old one with no way to hear
+/// about the current one, and it fails *silently*. The tests in this module
+/// drive it directly, and [`DisplayResize`] is the thin shell that carries the
+/// decisions out — measuring the canvas, arming a timer, and opening a stream.
+#[derive(Debug, Default)]
+struct ResizeDebounce {
+    /// Size last put on the wire, or believed to be on it.
+    sent: Option<Size>,
+    /// Size seen but not yet sent; `None` when nothing is outstanding.
+    pending: Option<Size>,
+    /// A send is on the wire. At most one at a time, which is what makes the
+    /// order the server sees them in the order they were decided: every send
+    /// is its own unidirectional stream, and the server accepts those in the
+    /// order they were opened, but only if two are never opened at once.
+    in_flight: bool,
+    /// The size to send once the in-flight one lands.
+    queued: Option<Size>,
+}
+
+impl ResizeDebounce {
+    /// `initial` is what [`send_initial_resize`] already reported, or `None` if
+    /// it reported nothing — so the observer's first callback is not mistaken
+    /// for a resize the server has not heard about.
+    fn new(initial: Option<Size>) -> Self {
+        Self {
+            sent: initial,
+            ..Default::default()
+        }
+    }
+
+    /// Note a new size, to be sent once it has held still for
+    /// [`RESIZE_SETTLE_MS`] — or dropped if the server already has it.
+    ///
+    /// Every observation re-arms the timer, so a burst of them collapses into
+    /// one send of the *last* size in the burst. That trailing send is the
+    /// point: a cooldown that merely dropped in-window observations, with
+    /// nothing scheduled behind them, silently lost the end of every window
+    /// drag and every rotation a second after page load. `ResizeObserver` only
+    /// fires on change, so a dropped observation was never retried — the
+    /// server simply kept the stale size until the next unrelated change.
+    fn observe(&mut self, size: Size) -> ResizeEffect {
+        if self.pending == Some(size) {
+            // Already waiting to be sent. A repeated observation of the same
+            // size must not restart the settle window, or a box that jitters
+            // would never be reported at all.
+            return ResizeEffect::Idle;
+        }
+        if self.sent == Some(size) {
+            // Back to a size the server already has: nothing to send, and
+            // whatever was waiting is now obsolete. `Cancel` only when there
+            // was something to cancel, so a caller can tell "dropped what you
+            // had" from "there was never anything here".
+            return if self.pending.take().is_some() {
+                ResizeEffect::Cancel
             } else {
-                *last = Some(now);
-                true
+                ResizeEffect::Idle
+            };
+        }
+        self.pending = Some(size);
+        ResizeEffect::Arm
+    }
+
+    /// The settle window expired.
+    fn flush(&mut self) -> ResizeEffect {
+        match self.pending.take() {
+            Some(size) if self.sent != Some(size) => self.begin_send(size),
+            _ => ResizeEffect::Idle,
+        }
+    }
+
+    /// A send finished, successfully if `ok`. Reports what, if anything, should
+    /// go out next, draining a size that was waiting for this one to land.
+    fn completed(&mut self, restore: Option<Size>, ok: bool) -> ResizeEffect {
+        self.in_flight = false;
+        if !ok {
+            // The server does not have this size after all, so put back what it
+            // last did: a later observation of the failed size must be free to
+            // send it again.
+            self.sent = restore;
+        }
+        match self.queued.take() {
+            // Coalesced: the queued size is the one just sent, or is already
+            // on the wire, so a burst that spans a send costs one stream.
+            Some(queued) if self.sent != Some(queued) => self.begin_send(queued),
+            _ => ResizeEffect::Idle,
+        }
+    }
+
+    /// Claim the wire for `size`, or queue it behind the send in flight.
+    fn begin_send(&mut self, size: Size) -> ResizeEffect {
+        if self.in_flight {
+            self.queued = Some(size);
+            return ResizeEffect::Idle;
+        }
+        self.in_flight = true;
+        let restore = self.sent.replace(size);
+        ResizeEffect::Send { size, restore }
+    }
+}
+
+/// The debounced `DisplayParameters` sender for one display: the
+/// [`ResizeDebounce`] decisions plus everything needed to carry them out.
+///
+/// Size changes reach it from three places — the canvas box changing, the
+/// orientation flipping, the fullscreen box changing — and all three land in
+/// [`DisplayResize::observe`], so a rotation that also resizes the canvas
+/// costs one datagram rather than two.
+struct DisplayResize {
+    debounce: RefCell<ResizeDebounce>,
+    /// The outstanding settle timer, so a fresh observation cancels it instead
+    /// of racing it.
+    timer: Cell<Option<i32>>,
+    /// The orientation media query, held for the session so the listener
+    /// attached to it stays attached.
+    orientation: Option<MediaQueryList>,
+}
+
+impl DisplayResize {
+    fn new(initial: Option<Size>, orientation: Option<MediaQueryList>) -> Self {
+        Self {
+            debounce: RefCell::new(ResizeDebounce::new(initial)),
+            timer: Cell::new(None),
+            orientation,
+        }
+    }
+
+    /// Measure the canvas and feed the result to the debouncer, carrying out
+    /// whatever it decides.
+    fn observe(self: &Rc<Self>, canvas: &HtmlCanvasElement) {
+        let size = match display_size(canvas) {
+            Ok(Some(size)) => size,
+            // No size to report, so nothing to schedule. A canvas that only now
+            // has a size will be observed as changed.
+            Ok(None) => return,
+            Err(err) => {
+                log::error!("cannot measure canvas: {err:?}");
+                return;
             }
         };
-        if should_send {
-            send_initial_resize(canvas)?;
+        self.act(self.debounce.borrow_mut().observe(size));
+    }
+
+    /// The settle window expired.
+    fn flush(self: &Rc<Self>) {
+        self.timer.set(None);
+        self.act(self.debounce.borrow_mut().flush());
+    }
+
+    /// Perform a decision. The borrow is always released first, because
+    /// [`ResizeEffect::Send`] re-enters this type when the send completes.
+    fn act(self: &Rc<Self>, effect: ResizeEffect) {
+        match effect {
+            ResizeEffect::Idle => {}
+            ResizeEffect::Arm => self.arm(),
+            ResizeEffect::Cancel => self.clear_timer(),
+            ResizeEffect::Send { size, restore } => self.send(size, restore),
         }
-        Ok(())
-    };
+    }
 
-    let resize_cb = Closure::wrap(Box::new(move || {
-        send_resize().unwrap_or_else(|err| log::error!("{err:#?}"));
-    }) as Box<dyn FnMut()>);
-
-    let ro = web_sys::ResizeObserver::new(resize_cb.as_ref().unchecked_ref::<js_sys::Function>())
-        .unwrap();
-    ro.observe(canvas);
-    resize_cb.forget();
-
-    let fullscreen_cb = Closure::wrap(Box::new(move || {
-        let window = web_sys::window().unwrap();
-        let document = window.document().unwrap();
-        let w = std::cmp::max(
-            document
-                .document_element()
-                .map(|e| e.client_width())
-                .unwrap_or(0) as u16,
-            window
-                .inner_width()
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as u16,
-        );
-        let h = std::cmp::max(
-            document
-                .document_element()
-                .map(|e| e.client_height())
-                .unwrap_or(0) as u16,
-            window
-                .inner_height()
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as u16,
-        );
-        let msg = ClientDatagram::DisplayParameters {
-            index: 0,
-            width: w * window.device_pixel_ratio() as u16,
-            height: h * window.device_pixel_ratio() as u16,
+    /// Arm the settle timer, replacing any already armed.
+    fn arm(&self) {
+        self.clear_timer();
+        let cb = SETTLE_CB.with(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        let Some(window) = web_sys::window() else {
+            log::error!("no window: resize settle timer not armed");
+            return;
         };
-        crate::send_datagram(msg);
+        match window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&cb, RESIZE_SETTLE_MS as i32)
+        {
+            Ok(id) => self.timer.set(Some(id)),
+            Err(err) => log::error!("resize settle timer not armed: {err:?}"),
+        }
+    }
+
+    fn clear_timer(&self) {
+        if let Some(id) = self.timer.take()
+            && let Some(window) = web_sys::window()
+        {
+            window.clear_timeout_with_handle(id);
+        }
+    }
+
+    /// Put `size` on a fresh unidirectional stream, reporting back to the
+    /// debouncer when it lands.
+    fn send(self: &Rc<Self>, size: Size, restore: Option<Size>) {
+        let resize = self.clone();
+        spawn_local(async move {
+            let (width, height) = size;
+            let ok = crate::send_reliable(ClientDatagram::DisplayParameters {
+                index: 0,
+                width,
+                height,
+            })
+            .await;
+            if ok {
+                log::info!("canvas resized: reported {width}x{height}");
+            } else {
+                log::error!("resize {width}x{height} could not be sent");
+            }
+            let next = resize.debounce.borrow_mut().completed(restore, ok);
+            resize.act(next);
+        });
+    }
+}
+
+fn settle_expired() {
+    // The sender is cloned out of the thread-local first so its borrow is
+    // released before `flush` runs.
+    let resize = RESIZE.with(|cell| cell.borrow().clone());
+    if let Some(resize) = resize {
+        resize.flush();
+    }
+}
+
+/// Watch `canvas` for size changes and report them, and return the flag
+/// carrying a fullscreen intent from the render loop to the next user gesture,
+/// which is the earliest point it can actually be applied at.
+///
+/// `initial` is what has already been reported for this display, so an
+/// observation of it is not a resize.
+pub fn setup_display_events(
+    canvas: &HtmlCanvasElement,
+    initial: Option<(u16, u16)>,
+) -> Rc<Cell<bool>> {
+    let window = web_sys::window().unwrap();
+
+    // A rotation is reported through a media query as well as through the
+    // canvas box. Usually the box does move with the orientation and the
+    // `ResizeObserver` below has it covered; the media query is the
+    // authoritative signal for the change, and it also fires when the box
+    // stays put — a foldable unfolding, or a browser that resizes only the
+    // visual viewport. Both paths feed one debounce, so a rotation that does
+    // resize the canvas still costs a single datagram.
+    let orientation = window.match_media("(orientation: portrait)").ok().flatten();
+    let resize = Rc::new(DisplayResize::new(initial, orientation));
+    RESIZE.with(|cell| *cell.borrow_mut() = Some(resize.clone()));
+
+    let ro_cb = Closure::wrap(Box::new({
+        let resize = resize.clone();
+        let canvas = canvas.clone();
+        move || resize.observe(&canvas)
+    }) as Box<dyn FnMut()>);
+    let ro = web_sys::ResizeObserver::new(ro_cb.as_ref().unchecked_ref::<js_sys::Function>())
+        .expect("ResizeObserver exists wherever WebTransport does");
+    ro.observe(canvas);
+    ro_cb.forget();
+    // Leaked deliberately. An observation is only kept for as long as its
+    // observer is, and the renderer keeps an observer alive on account of the
+    // element it observes rather than on account of the script that created
+    // it — an implementation detail, not the contract. Holding the handle
+    // makes the lifetime ours to reason about instead.
+    //
+    // `std::mem::forget` and not a `forget()` method: `ResizeObserver` extends
+    // `js_sys::Object`, so wasm-bindgen models it as a borrowed handle, which
+    // it does not generate `forget()` for.
+    std::mem::forget(ro);
+
+    if let Some(orientation) = resize.orientation.as_ref() {
+        let orientation_cb = Closure::wrap(Box::new({
+            let resize = resize.clone();
+            let canvas = canvas.clone();
+            move || resize.observe(&canvas)
+        }) as Box<dyn FnMut()>);
+        let _ = orientation.add_event_listener_with_callback(
+            "change",
+            orientation_cb.as_ref().unchecked_ref::<js_sys::Function>(),
+        );
+        orientation_cb.forget();
+    }
+
+    // Entering and leaving fullscreen both resize the canvas, and
+    // `fullscreenchange` is delivered to the canvas because the canvas is the
+    // fullscreen element. The size is read from the canvas rather than from
+    // `innerWidth`: the two agree in fullscreen, and one number the browser
+    // recomputes is one fewer thing to keep correct.
+    let fullscreen_cb = Closure::wrap(Box::new({
+        let resize = resize.clone();
+        let canvas = canvas.clone();
+        move || resize.observe(&canvas)
     }) as Box<dyn FnMut()>);
     let _ = canvas.add_event_listener_with_callback(
         "fullscreenchange",
@@ -462,3 +763,150 @@ pub(crate) async fn run_video_track(
 
 // `FramePath` needs a non-async `Drop` handle: kept as such because its
 // contents need the JS blobs to outlive the decoder binding carefully.
+
+#[cfg(test)]
+mod tests {
+    use super::{ResizeDebounce, ResizeEffect, Size};
+
+    const A: Size = (1920, 1080);
+    const B: Size = (1280, 720);
+    const C: Size = (800, 600);
+
+    /// The size an effect asks to be sent, or `None` for anything else.
+    fn sending(effect: &ResizeEffect) -> Option<Size> {
+        match effect {
+            ResizeEffect::Send { size, .. } => Some(*size),
+            _ => None,
+        }
+    }
+
+    /// The regression this whole sender exists for: a resize inside the settle
+    /// window of the previous one must still reach the server, and a burst must
+    /// arrive as its *last* size.
+    ///
+    /// The bug it replaces dropped in-window observations with nothing
+    /// scheduled behind them, so a rotation a second after page load was never
+    /// sent at all.
+    #[test]
+    fn a_burst_collapses_to_its_last_size_and_that_size_is_sent() {
+        let mut d = ResizeDebounce::new(Some(A));
+        // A drag, observed faster than the settle window.
+        for size in [B, C, (1024, 768), (1152, 648)] {
+            assert_eq!(d.observe(size), ResizeEffect::Arm, "{size:?} must re-arm");
+        }
+        // Only one size ever reaches the wire, and it is the one the user ended
+        // up with — not the first of the burst.
+        assert_eq!(sending(&d.flush()), Some((1152, 648)));
+    }
+
+    /// A size that is already on the wire is not news. This is also what makes
+    /// the `ResizeObserver`'s initial callback free: it reports the size
+    /// `send_initial_resize` just sent.
+    #[test]
+    fn an_unchanged_size_is_not_resent() {
+        let mut d = ResizeDebounce::new(Some(A));
+        assert_eq!(d.observe(A), ResizeEffect::Idle);
+        assert_eq!(d.flush(), ResizeEffect::Idle);
+    }
+
+    /// The same size observed again while it waits must not restart the settle
+    /// window — otherwise a box that jitters would never be reported.
+    #[test]
+    fn a_repeated_pending_size_does_not_re_arm() {
+        let mut d = ResizeDebounce::new(Some(A));
+        assert_eq!(d.observe(B), ResizeEffect::Arm);
+        assert_eq!(d.observe(B), ResizeEffect::Idle);
+        assert_eq!(d.observe(B), ResizeEffect::Idle);
+        assert_eq!(sending(&d.flush()), Some(B));
+    }
+
+    /// Returning to a size the server already has cancels the size that was
+    /// waiting: the user is back where they started, so there is nothing to
+    /// report.
+    #[test]
+    fn returning_to_the_sent_size_cancels_the_pending_one() {
+        let mut d = ResizeDebounce::new(Some(A));
+        assert_eq!(d.observe(B), ResizeEffect::Arm);
+        assert_eq!(d.observe(A), ResizeEffect::Cancel);
+        assert_eq!(d.flush(), ResizeEffect::Idle);
+    }
+
+    /// Two sends must never be open at once. The server accepts unidirectional
+    /// streams in the order they were opened, so a second concurrent stream
+    /// could put a stale size on the wire *after* the one that replaced it.
+    #[test]
+    fn a_second_send_waits_for_the_first_instead_of_racing_it() {
+        let mut d = ResizeDebounce::new(None);
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        let ResizeEffect::Send { size, restore } = d.flush() else {
+            panic!("the first send must go out, not wait");
+        };
+        assert_eq!(size, A);
+        // With A in flight, observing and flushing B must not open a stream.
+        assert_eq!(d.observe(B), ResizeEffect::Arm);
+        assert_eq!(d.flush(), ResizeEffect::Idle);
+        // B goes out only once A has landed, and in that order.
+        assert_eq!(sending(&d.completed(restore, true)), Some(B));
+    }
+
+    /// Ordering is not enough — the server must not be told to rebuild twice for
+    /// one burst, and must not be rebuilt for a size it already has.
+    #[test]
+    fn a_burst_spanning_a_send_costs_one_stream() {
+        let mut d = ResizeDebounce::new(None);
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        let ResizeEffect::Send { restore, .. } = d.flush() else {
+            panic!("the first send must go out");
+        };
+        // The canvas is back to A, the size just sent, while that send is still
+        // in flight: coalesced, not a second stream.
+        assert_eq!(d.observe(A), ResizeEffect::Idle);
+        assert_eq!(d.flush(), ResizeEffect::Idle);
+        assert_eq!(d.completed(restore, true), ResizeEffect::Idle);
+    }
+
+    /// A failed send must leave the debouncer willing to report that size again.
+    /// Otherwise one dropped stream is permanent, which is the whole failure
+    /// mode the reliable transport is there to prevent — and if it happens
+    /// anyway, the next observation has to be able to fix it.
+    #[test]
+    fn a_failed_send_is_retried_rather_than_believed() {
+        let mut d = ResizeDebounce::new(None);
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        let ResizeEffect::Send { restore, .. } = d.flush() else {
+            panic!("the first send must go out");
+        };
+        // A was never delivered, so the last size the server has is the one
+        // before it — nothing, here.
+        assert_eq!(d.completed(restore, false), ResizeEffect::Idle);
+        // Observing the same size must now be news again.
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        assert_eq!(sending(&d.flush()), Some(A));
+    }
+
+    /// A send that fails while another size is queued must not lose the queued
+    /// one, and the two must not reorder.
+    #[test]
+    fn a_queued_size_survives_a_failed_send() {
+        let mut d = ResizeDebounce::new(None);
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        let ResizeEffect::Send { restore, .. } = d.flush() else {
+            panic!("the first send must go out");
+        };
+        assert_eq!(d.observe(B), ResizeEffect::Arm);
+        assert_eq!(d.flush(), ResizeEffect::Idle);
+        // A failed, B still goes — and B is now the size to believe.
+        assert_eq!(sending(&d.completed(restore, false)), Some(B));
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+    }
+
+    /// A display that never sent its initial size has told the server nothing,
+    /// so every observation is news until one lands.
+    #[test]
+    fn with_nothing_sent_the_first_observation_is_a_resize() {
+        let mut d = ResizeDebounce::new(None);
+        assert_eq!(d.observe(A), ResizeEffect::Arm);
+        assert_eq!(sending(&d.flush()), Some(A));
+        assert_eq!(d.observe(A), ResizeEffect::Idle);
+    }
+}

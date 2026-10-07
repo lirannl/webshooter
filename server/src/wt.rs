@@ -9,6 +9,7 @@ use crate::{
         transport::WtSession,
     },
     pipewire::audio::{AudioPacket, AudioSink, start_audio_sink},
+    pipewire::bitrate::LinkPressure,
     pipewire::video,
 };
 use anyhow::Result;
@@ -21,6 +22,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 use tokio::{
     spawn,
     sync::{broadcast, mpsc},
@@ -380,10 +382,16 @@ pub async fn run_session(
     // encoder output, and a frame that has been waiting that long is a frame the
     // client could not use anyway.
     let (frame_tx, frame_rx) = mpsc::channel::<video::EncodedFrame>(8);
+    // One verdict on the link, shared: the media pump samples the path and
+    // publishes what it finds, and the encoder subscribes. `Clear` until the
+    // first sample lands, which is also the right starting bitrate — the
+    // configured ceiling.
+    let (pressure_tx, pressure_rx) = watch::channel(LinkPressure::Clear);
     let mut media = media_pump(
         moq,
         server_msg_tx.clone(),
         connection.clone(),
+        pressure_tx,
         frame_rx,
         audio_rx,
         cancel.clone(),
@@ -399,6 +407,8 @@ pub async fn run_session(
         client_rx,
         decoder_caps.clone(),
         virtual_display,
+        client_id,
+        pressure_rx,
         cancel.clone(),
         server_msg_tx,
         frame_tx,
@@ -677,6 +687,7 @@ fn media_pump(
     moq: WtSession,
     control_tx: mpsc::Sender<ServerDatagram>,
     connection: Arc<Connection>,
+    pressure: watch::Sender<LinkPressure>,
     mut frame_rx: mpsc::Receiver<video::EncodedFrame>,
     mut audio_rx: mpsc::Receiver<AudioPacket>,
     cancel: CancellationToken,
@@ -712,7 +723,7 @@ fn media_pump(
                 // Ahead of the media arms deliberately: with `biased` the first ready
                 // arm wins, and while frames are always available this one would
                 // never be polled at all — exactly when the report matters most.
-                _ = report.tick() => report_link(&connection, &mut link),
+                _ = report.tick() => report_link(&connection, &mut link, &pressure),
                 frame = frame_rx.recv() => {
                     // `None` is the capture pipeline ending, which ends the session:
                     // there is no video left to publish.
@@ -779,7 +790,7 @@ struct LinkReport {
 /// tunnelled path — if it has been discovered below the peer's advertised
 /// maximum, packets that size are being lost somewhere and quinn had to back
 /// off.
-fn report_link(wt: &Connection, last: &mut LinkReport) {
+fn report_link(wt: &Connection, last: &mut LinkReport, pressure: &watch::Sender<LinkPressure>) {
     // wtransport keeps the underlying quinn connection private but exposes it, and
     // the path counters live only on quinn's side.
     let stats = wt.quic_connection().stats();
@@ -794,6 +805,14 @@ fn report_link(wt: &Connection, last: &mut LinkReport) {
     last.last_congestion = path.congestion_events;
 
     let degraded = lost > 0 || black_holes > 0 || congestion > 0;
+    // The same verdict that decides whether to log also drives the encoder's
+    // bitrate. One reader of the path counters, one verdict: two samplers would
+    // be free to disagree about whether the link is congested.
+    let _ = pressure.send(if degraded {
+        LinkPressure::Congested
+    } else {
+        LinkPressure::Clear
+    });
     if !degraded && last.primed {
         return;
     }

@@ -6,26 +6,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use futures_util::future::Either;
 use futures_util::StreamExt;
+use futures_util::future::Either;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use reis::tokio::EiConvertEventStream;
-use tokio::sync::{broadcast, mpsc};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use shared::client_datagram::{ClientDatagram, coalesce_input};
 use shared::server_datagram::ServerDatagram;
+use shared::throttle::spacing_ms_after_events;
 
-use super::eis_keyboard::{EisKeyboardEvent, KeyboardState, send_keyboard_key};
+use super::eis_keyboard::{EisKeyboardEvent, KeyboardState, send_keyboard_keys};
 use super::gamepad::GamepadManager;
 use super::pointer::{
     EisButtonEvent, EisPointerEvent, EisScrollEvent, MouseState, send_button_event,
     send_pointer_motion, send_scroll_event, web_button_to_linux,
 };
-use super::touch::{EisTouchEvent, TouchState, offset_touch_event, send_touch_event};
+use super::touch::{
+    CoordMap, EisTouchEvent, InputRegion, SLOTS_PER_SESSION, TouchState, input_space,
+    map_touch_event, offset_touch_event, send_touch_events, shift_slots,
+};
 
 pub(crate) fn timestamp_us() -> u64 {
     std::time::SystemTime::now()
@@ -60,17 +64,18 @@ pub(crate) fn with_emulation(
 /// within ~100 ms, slow enough not to spam the client with control datagrams.
 const THROTTLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Floor on the spacing the input gate enforces *independently* of the
-/// fill-driven throttle. Without it, the moment the pipeline has headroom
-/// (`interval_ms == 0`) a flood is forwarded straight to the EIS thread and
-/// compositor at full network rate, which can stall rendering and visibly
-/// freeze the session for as long as the flood lasts — the monitor only reacts
-/// after the pipeline *fills*, which never happens when the consumer keeps up
-/// at a rate that still overwhelms the compositor. Human input never arrives
-/// more often than a few hundred events per second, so a 1 ms floor (~1000
-/// events/s cap, further coalesced by the batch path) is invisible in practice
-/// while bounding what a non-cooperative client can inject.
-const INPUT_GATE_MIN_INTERVAL: Duration = Duration::from_millis(1);
+// The floor on input spacing lives in `shared::throttle`, because the client
+// applies the same one and the two must not disagree about the rate they are
+// each enforcing on the same stream. `input_throttle_monitor` can still ask for
+// something coarser; nothing can ask for something finer.
+
+/// How many queued input events one emulated frame may carry.
+///
+/// Bounded rather than unbounded because the batch is also the delay: the
+/// compositor is usually the slow part, and an unbounded batch would hold back
+/// its own first event until the queue drained. Well above the number of
+/// simultaneous fingers, so a real gesture never hits it.
+const MAX_INPUT_BATCH: usize = 64;
 
 /// Map the fraction of the input pipeline that is in use (0..=1) onto the
 /// minimum spacing (in milliseconds) the client must keep between consecutive
@@ -81,12 +86,12 @@ const INPUT_GATE_MIN_INTERVAL: Duration = Duration::from_millis(1);
 fn throttle_interval_from_fill(fill: f64) -> u16 {
     let pct = (fill.clamp(0.0, 1.0) * 100.0) as u8;
     match pct {
-        0..=49 => 0,    // plenty of headroom: no throttling
-        50..=64 => 8,   // could get busy: cap ~125 events/s
-        65..=79 => 16,  // getting heavy: cap ~62 events/s
-        80..=89 => 32,  // heavy: cap ~31 events/s
-        90..=94 => 64,  // severe: cap ~15 events/s
-        _ => 128,       // nearly full: cap ~8 events/s
+        0..=49 => 0,   // plenty of headroom: no throttling
+        50..=64 => 8,  // could get busy: cap ~125 events/s
+        65..=79 => 16, // getting heavy: cap ~62 events/s
+        80..=89 => 32, // heavy: cap ~31 events/s
+        90..=94 => 64, // severe: cap ~15 events/s
+        _ => 128,      // nearly full: cap ~8 events/s
     }
 }
 
@@ -162,7 +167,7 @@ fn is_input_datagram(msg: &ClientDatagram) -> bool {
 /// into a pending batch (mouse/scroll deltas summed, touch/gamepad reduced to
 /// the newest snapshot) and discarded if a still-newer one replaces it, and
 /// the batch is forwarded as soon as the rate allows. The cooling window is
-/// never shorter than [`INPUT_GATE_MIN_INTERVAL`], so even when the fill
+/// never shorter than [`shared::throttle::INPUT_MIN_INTERVAL_MS`], so even when the fill
 /// monitor has not (yet) asked for throttling a non-cooperative client cannot
 /// push the EIS pipeline at flood rate. Control datagrams bypass the gate
 /// entirely.
@@ -177,17 +182,14 @@ async fn input_gate_task(
     let mut flush_at: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
     loop {
-        let interval = Duration::from_millis(interval_ms.load(Ordering::Relaxed) as u64)
-            .max(INPUT_GATE_MIN_INTERVAL);
+        let requested_ms = interval_ms.load(Ordering::Relaxed);
         // Wake once the cooling window elapses if throttled input is waiting;
         // otherwise park this select arm so only client events run.
-        let flush_fut: Either<
-            Pin<&mut tokio::time::Sleep>,
-            futures_util::future::Pending<()>,
-        > = match flush_at.as_mut() {
-            Some(sleep) => Either::Left(sleep.as_mut()),
-            None => Either::Right(futures_util::future::pending()),
-        };
+        let flush_fut: Either<Pin<&mut tokio::time::Sleep>, futures_util::future::Pending<()>> =
+            match flush_at.as_mut() {
+                Some(sleep) => Either::Left(sleep.as_mut()),
+                None => Either::Right(futures_util::future::pending()),
+            };
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -197,8 +199,9 @@ async fn input_gate_task(
                     continue;
                 }
                 if tokio::time::Instant::now() >= next_allowed {
-                    forward_batch(&gated_tx, &mut pending).await;
-                    next_allowed = tokio::time::Instant::now() + interval;
+                    let forwarded = forward_batch(&gated_tx, &mut pending).await;
+                    next_allowed = tokio::time::Instant::now()
+                        + Duration::from_millis(spacing_ms_after_events(forwarded, requested_ms));
                 }
             }
             msg = client_rx.recv() => {
@@ -221,7 +224,8 @@ async fn input_gate_task(
                             if gated_tx.send(msg).is_err() {
                                 break;
                             }
-                            next_allowed = now + interval;
+                            next_allowed = now
+                                + Duration::from_millis(spacing_ms_after_events(1, requested_ms));
                             continue;
                         }
                         // Inside the cooling window: keep the newest input and
@@ -237,20 +241,26 @@ async fn input_gate_task(
     }
 }
 
-/// Send a coalesced batch of pending input datagrams. `broadcast::Sender` is
-/// best-effort: it errors only when every receiver has hung up.
+/// Send a coalesced batch of pending input datagrams, and report how many went.
+///
+/// `broadcast::Sender` is best-effort: it errors only when every receiver has
+/// hung up, which ends the session.
 async fn forward_batch(
     gated_tx: &broadcast::Sender<ClientDatagram>,
     pending: &mut VecDeque<ClientDatagram>,
-) {
+) -> usize {
     let msgs = std::mem::take(pending);
+    let count = msgs.len();
     for msg in msgs {
         if gated_tx.send(msg).is_err() {
-            return;
+            return count;
         }
     }
+    count
 }
 
+// The per-event spacing arithmetic is `shared::throttle::spacing_ms_after_events`,
+// for the same reason as the floor above.
 enum EisInputEvent {
     Touch(EisTouchEvent),
     Keyboard(EisKeyboardEvent),
@@ -262,6 +272,9 @@ enum EisInputEvent {
 pub fn eis_task(
     eis_fd: OwnedFd,
     stream_pos: (i32, i32),
+    frame: (u16, u16),
+    client_id: u64,
+    pipeline_restart: Arc<watch::Sender<Option<&'static str>>>,
     client_rx: &mut broadcast::Receiver<ClientDatagram>,
     server_tx: &mpsc::Sender<ServerDatagram>,
     mut cursor_rx: mpsc::Receiver<(i32, i32)>,
@@ -296,7 +309,15 @@ pub fn eis_task(
                 .enable_all()
                 .build()
                 .expect("eis tokio runtime");
-            rt.block_on(eis_main(eis_fd, stream_pos, input_rx, cancel_eis));
+            rt.block_on(eis_main(
+                eis_fd,
+                stream_pos,
+                frame,
+                client_id,
+                pipeline_restart,
+                input_rx,
+                cancel_eis,
+            ));
         })
         .expect("eis thread");
 
@@ -325,7 +346,18 @@ pub fn eis_task(
             loop {
                 let msg = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => {
+                        // A client that goes away mid-gesture leaves fingers
+                        // down, and nothing else will lift them: the compositor
+                        // keeps them until an explicit release or the emulating
+                        // connection drops. `try_send` rather than `send`,
+                        // because this is teardown and must not block on a
+                        // channel whose reader may already be gone.
+                        for ev in touch_state.release_all() {
+                            let _ = input_tx.try_send(EisInputEvent::Touch(ev));
+                        }
+                        break;
+                    }
                     msg = event_rx.recv() => msg,
                     cursor = cursor_rx.recv() => {
                         match cursor {
@@ -338,16 +370,11 @@ pub fn eis_task(
                         }
                         continue;
                     }
-                    // Release all touch points if no event arrives within 1 s,
-                    // so stuck touches don't persist after disconnect.
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        for ev in touch_state.release_all() {
-                            let _ = input_tx.send(EisInputEvent::Touch(ev)).await;
-                        }
-                        continue;
-                    }
                     // Release all held modifiers if no keyboard event arrives
-                    // within 1 s, so stuck modifiers don't persist.
+                    // within 1 s, so stuck modifiers don't persist. Unlike
+                    // touches, this one earns its timeout: a modifier stuck down
+                    // corrupts every later keystroke, and each key event
+                    // re-asserts the ones that are genuinely held.
                     _ = keyboard_state.timeout_fired() => {
                         for ev in keyboard_state.release_all_modifiers() {
                             let _ = input_tx.send(EisInputEvent::Keyboard(ev)).await;
@@ -378,14 +405,17 @@ pub fn eis_task(
                     }
                     Ok(ClientDatagram::MouseButton { button, pressed }) => {
                         let linux_btn = web_button_to_linux(button);
-                        let _ = input_tx.send(EisInputEvent::Button(
-                            EisButtonEvent::Button { button: linux_btn, pressed },
-                        )).await;
+                        let _ = input_tx
+                            .send(EisInputEvent::Button(EisButtonEvent::Button {
+                                button: linux_btn,
+                                pressed,
+                            }))
+                            .await;
                     }
                     Ok(ClientDatagram::Scroll { dx, dy }) => {
-                        let _ = input_tx.send(EisInputEvent::Scroll(
-                            EisScrollEvent::Scroll { dx, dy },
-                        )).await;
+                        let _ = input_tx
+                            .send(EisInputEvent::Scroll(EisScrollEvent::Scroll { dx, dy }))
+                            .await;
                     }
                     Ok(ClientDatagram::Gamepad {
                         id,
@@ -414,9 +444,17 @@ pub fn eis_task(
 async fn eis_main(
     eis_fd: OwnedFd,
     stream_pos: (i32, i32),
+    frame: (u16, u16),
+    client_id: u64,
+    pipeline_restart: Arc<watch::Sender<Option<&'static str>>>,
     mut input_rx: mpsc::Receiver<EisInputEvent>,
     cancel: CancellationToken,
 ) {
+    // Keyed by client name and session id, which is what `client_id` already is:
+    // the lowest id not in use, so no two live sessions share one. Saturating
+    // because a base past `u32` would wrap onto another session's slots, and no
+    // real session count gets near it.
+    let slot_base = (client_id.saturating_mul(u64::from(SLOTS_PER_SESSION))) as u32;
     let stream = UnixStream::from(eis_fd);
     let context = match ei::Context::new(stream) {
         Ok(c) => c,
@@ -441,13 +479,65 @@ async fn eis_main(
         return;
     }
 
-    let (touch_device, keyboard_device, pointer_device, touchscreen, keyboard, pointer, button, scroll) =
-        match wait_for_devices(&mut eis_stream, &connection, &cancel).await {
-            Some(result) => result,
-            None => return,
-        };
+    let (
+        touch_device,
+        keyboard_device,
+        pointer_device,
+        touchscreen,
+        keyboard,
+        pointer,
+        button,
+        scroll,
+        regions,
+    ) = match wait_for_devices(&mut eis_stream, &connection, &cancel).await {
+        Some(result) => result,
+        None => return,
+    };
+
+    // The client reports coordinates in frame pixels; libei accepts them within
+    // the device's region. The region is the only authority on that space, so
+    // the two are bridged here rather than guessed at from the portal's
+    // reported stream size, which describes the captured region and not where
+    // input lands.
+    //
+    // Which region is ours is decided per session, because the device is not:
+    // it lists one region per monitor, so a second concurrent session's
+    // virtual monitor is in that list too.
+    let input_space = input_space(&regions, frame, stream_pos);
+    let coord_map = match &input_space {
+        Some(region) => CoordMap::new(frame, (region.w, region.h)),
+        // No region could be attributed to this stream, so coordinates go
+        // through untouched. Unscaled is a visible fault — touches land off by
+        // the desktop's scale factor — whereas scaling by another monitor's
+        // region is invisible and lands them nowhere near where they were aimed.
+        None => {
+            log::warn!(
+                "no touch region matches this session's stream at {stream_pos:?} \
+                 (frames {frame:?}, {} region(s) advertised); coordinates sent \
+                 unscaled",
+                regions.len()
+            );
+            CoordMap::new(frame, frame)
+        }
+    };
+    log::info!(
+        "touch space: frames {frame:?}, stream at {stream_pos:?}, -> {:?}",
+        input_space.as_ref().map(|r| (r.w, r.h, r.x, r.y, &r.id))
+    );
 
     let mut touch_sequence = 0u32;
+    let mut touches_seen = 0u64;
+    let mut last_touch = None;
+    // The rate over the last window, which is the number that matters when a
+    // session freezes: a cumulative count says how much arrived in total, not
+    // how fast it was arriving while it was unresponsive.
+    let mut window_events = 0u64;
+    // A running count per session, because "is this client's touch still being
+    // received" and "is it being received and then ignored" look identical from
+    // the outside: both produce no complaints. An interval rather than a sleep,
+    // so it keeps ticking while input flows instead of only while it does not.
+    let mut liveness = tokio::time::interval(Duration::from_secs(5));
+    liveness.tick().await;
     let mut keyboard_sequence = 0u32;
     let mut pointer_sequence = 0u32;
     let mut button_sequence = 0u32;
@@ -465,7 +555,33 @@ async fn eis_main(
                         log::warn!("EIS: disconnected: {:?}", d.reason);
                         break;
                     }
-                    Some(Ok(_)) => {}
+                    // The compositor replaces its `eis_device` objects whenever
+                    // the set of outputs changes — `EisContext::updateScreens`
+                    // calls `EisDevice::changeDevice` on *every* connected client,
+                    // which removes the old `eis_device`. libei promises a
+                    // `DeviceRemoved` first, so this is where a session learns
+                    // that the handle it has been sending to all along is dead,
+                    // and from then on every touch is dropped in silence.
+                    Some(Ok(EiEvent::DeviceRemoved(ev))) => {
+                        // The handle is gone and cannot be revived: the
+                        // compositor removed the object, so every event sent to
+                        // it from here on is discarded without complaint. The
+                        // only way back is a new device, which means a new EIS
+                        // connection — so ask for the same full rebuild that a
+                        // lost GPU context asks for.
+                        log::warn!(
+                            "EIS: session {client_id} lost device {:?}; input on it is \
+                             discarded until the pipeline is rebuilt",
+                            ev.device.name()
+                        );
+                        let _ = pipeline_restart.send(Some("input device removed by the compositor"));
+                        break;
+                    }
+                    Some(Ok(EiEvent::DeviceResumed(_))) => {}
+                    Some(Ok(EiEvent::Frame(_))) => {}
+                    Some(Ok(other)) => {
+                        log::debug!("EIS: {other:?}");
+                    }
                     Some(Err(e)) => {
                         log::warn!("EIS: event error: {e}");
                         break;
@@ -473,28 +589,147 @@ async fn eis_main(
                     None => break,
                 }
             }
+            _ = liveness.tick() => {
+                log::info!(
+                    "session {client_id}: {window_events} input events in 5s \
+                     ({touches_seen} total), last touch {last_touch:?} \
+                     (frames {frame:?}, slots from {slot_base})"
+                );
+                window_events = 0;
+                continue;
+            }
             cmd = input_rx.recv() => {
-                match cmd {
-                    Some(EisInputEvent::Touch(event)) => {
-                        let event = offset_touch_event(event, stream_pos);
-                        send_touch_event(&connection, &touch_device, &touchscreen, &mut touch_sequence, event);
+                let Some(first) = cmd else { break };
+                // Drain everything already queued, up to a bound.
+                //
+                // This is the other half of the input gate's coalescing: the gate
+                // hands over a *batch*, and spending four protocol messages and a
+                // flush on each event inside it is what lets a multitouch flood
+                // saturate the compositor — which is why the display stalls, not
+                // just the input. The bound keeps latency bounded when the
+                // compositor is the slow part: a huge batch would delay its own
+                // first event.
+                let mut batch = Vec::with_capacity(MAX_INPUT_BATCH);
+                batch.push(first);
+                while batch.len() < MAX_INPUT_BATCH {
+                    match input_rx.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(_) => break,
                     }
-                    Some(EisInputEvent::Keyboard(ev)) => {
-                        send_keyboard_key(&connection, &keyboard_device, &keyboard, &mut keyboard_sequence, ev.key, ev.press);
+                }
+                let batched = batch.len();
+
+                let mut touches: Vec<EisTouchEvent> = Vec::new();
+                let mut keys: Vec<EisKeyboardEvent> = Vec::new();
+                let mut pointers: Vec<EisPointerEvent> = Vec::new();
+                let mut buttons: Vec<EisButtonEvent> = Vec::new();
+                let mut scrolls: Vec<EisScrollEvent> = Vec::new();
+                for event in batch {
+                    match event {
+                        EisInputEvent::Touch(event) => {
+                            // Frame pixels into the portal's own units first, then
+                            // into screen coordinates for a multi-monitor layout.
+                            let from = touch_point(&event);
+                            let event =
+                                offset_touch_event(map_touch_event(event, coord_map), stream_pos);
+                            let Some(event) = shift_slots(event, slot_base) else {
+                                log::warn!(
+                                    "touch slot outside this session's range of \
+                                     {SLOTS_PER_SESSION}, dropped"
+                                );
+                                continue;
+                            };
+                            // The first few touches of a session, so a session whose
+                            // input goes nowhere can be told apart from one that never
+                            // sent any. A count alone cannot: it is zero in both the
+                            // "client is not sending" and "we are dropping them" cases,
+                            // and those need opposite fixes.
+                            touches_seen += 1;
+                            last_touch = touch_point(&event);
+                            if touches_seen <= 3 {
+                                log::info!(
+                                    "touch #{touches_seen} {from:?} -> {:?} slot {:?} \
+                                     (frames {frame:?} at {stream_pos:?}, space {:?})",
+                                    touch_point(&event),
+                                    touch_slot(&event),
+                                    input_space.as_ref().map(|r| (r.w, r.h))
+                                );
+                            }
+                            touches.push(event);
+                        }
+                        EisInputEvent::Keyboard(ev) => {
+                            window_events += 1;
+                            keys.push(ev);
+                        }
+                        EisInputEvent::Pointer(ev) => {
+                            window_events += 1;
+                            pointers.push(ev);
+                        }
+                        EisInputEvent::Button(ev) => {
+                            window_events += 1;
+                            buttons.push(ev);
+                        }
+                        EisInputEvent::Scroll(ev) => {
+                            window_events += 1;
+                            scrolls.push(ev);
+                        }
                     }
-                    Some(EisInputEvent::Pointer(event)) => {
-                        send_pointer_motion(&connection, &pointer_device, &pointer, &mut pointer_sequence, event);
-                    }
-                    Some(EisInputEvent::Button(event)) => {
-                        send_button_event(&connection, &pointer_device, &button, &mut button_sequence, event);
-                    }
-                    Some(EisInputEvent::Scroll(event)) => {
-                        send_scroll_event(&connection, &pointer_device, &scroll, &mut scroll_sequence, event);
-                    }
-                    None => break,
+                }
+                if batched > 1 {
+                    log::debug!(
+                        "session {client_id}: {} events in one frame \
+                         ({} touch, {} key, {} pointer, {} button, {} scroll)",
+                        batched,
+                        touches.len(),
+                        keys.len(),
+                        pointers.len(),
+                        buttons.len(),
+                        scrolls.len()
+                    );
+                }
+                send_touch_events(
+                    &connection,
+                    &touch_device,
+                    &touchscreen,
+                    &mut touch_sequence,
+                    &touches,
+                );
+                send_keyboard_keys(
+                    &connection,
+                    &keyboard_device,
+                    &keyboard,
+                    &mut keyboard_sequence,
+                    &keys,
+                );
+                for event in pointers {
+                    send_pointer_motion(&connection, &pointer_device, &pointer, &mut pointer_sequence, event);
+                }
+                for event in buttons {
+                    send_button_event(&connection, &pointer_device, &button, &mut button_sequence, event);
+                }
+                for event in scrolls {
+                    send_scroll_event(&connection, &pointer_device, &scroll, &mut scroll_sequence, event);
                 }
             }
         }
+    }
+}
+
+/// Which slot a touch event occupies, for logging.
+fn touch_slot(event: &EisTouchEvent) -> Option<u32> {
+    match event {
+        EisTouchEvent::Down { index, .. }
+        | EisTouchEvent::Motion { index, .. }
+        | EisTouchEvent::Up { index } => Some(*index),
+    }
+}
+
+/// Where a touch event points, for logging. `Up` carries no position: it names
+/// the slot it releases and nothing else.
+fn touch_point(event: &EisTouchEvent) -> Option<(u16, u16)> {
+    match event {
+        EisTouchEvent::Down { x, y, .. } | EisTouchEvent::Motion { x, y, .. } => Some((*x, *y)),
+        EisTouchEvent::Up { .. } => None,
     }
 }
 
@@ -511,6 +746,7 @@ async fn wait_for_devices(
     ei::Pointer,
     ei::Button,
     ei::Scroll,
+    Vec<InputRegion>,
 )> {
     let mut touch_device = None;
     let mut keyboard_device = None;
@@ -566,7 +802,61 @@ async fn wait_for_devices(
                                 let scroll = pd.interface::<ei::Scroll>()?;
                                 let same_device = td == kd && kd == pd;
                                 log::info!("EIS: devices ready (all same device: {same_device})");
-                                return Some((td.clone(), kd.clone(), pd.clone(), touchscreen, keyboard, pointer, button, scroll));
+
+                                // The touch device states its own coordinate space, and
+                                // it is the only authority on it. A region is
+                                // *logical* pixels plus the physical scale that
+                                // produced them, so the frames — which are physical
+                                // — and the coordinates libei accepts are related by
+                                // exactly that scale and by nothing else.
+                                //
+                                // Deriving the map from the portal's reported
+                                // stream size instead gets this wrong whenever the
+                                // two disagree: on a 150%-scaled desktop the frames
+                                // were 1080x2255 while the portal reported 720x1503,
+                                // and mapping down by that factor capped every
+                                // touch at y=1502 — leaving the bottom third of the
+                                // screen unreachable rather than misplaced.
+                                for region in td.regions() {
+                                    log::info!(
+                                        "touch region: {}x{} logical at ({},{}) \
+                                         scale {} (physical {}x{}) id {:?}",
+                                        region.width,
+                                        region.height,
+                                        region.x,
+                                        region.y,
+                                        region.scale,
+                                        region.width as f32 * region.scale,
+                                        region.height as f32 * region.scale,
+                                        region.mapping_id,
+                                    );
+                                }
+                                // Every region is handed back, not just one: a
+                                // device advertises a region per monitor, and
+                                // which of them belongs to this session is only
+                                // knowable against the frame and stream
+                                // position, which live in `eis_main`. Choosing
+                                // here would mean guessing from order alone.
+                                //
+                                // A region's `scale` is deliberately not used to
+                                // derive the frame side: the protocol defines it
+                                // as the factor for *relative* movement between
+                                // regions, and says outright that coordinates
+                                // need not match the desktop's real size — the
+                                // compositor maps them itself.
+                                let regions = td
+                                    .regions()
+                                    .iter()
+                                    .map(|r| InputRegion {
+                                        w: r.width as u16,
+                                        h: r.height as u16,
+                                        x: r.x as i32,
+                                        y: r.y as i32,
+                                        id: r.mapping_id.clone(),
+                                    })
+                                    .collect();
+
+                                return Some((td.clone(), kd.clone(), pd.clone(), touchscreen, keyboard, pointer, button, scroll, regions));
                             }
                         }
                     }
@@ -666,7 +956,9 @@ mod tests {
             channels: 2,
             rate: 48000
         }));
-        assert!(!is_input_datagram(&ClientDatagram::DecoderCapabilities { decoders: Vec::new() }));
+        assert!(!is_input_datagram(&ClientDatagram::DecoderCapabilities {
+            decoders: Vec::new()
+        }));
     }
 
     #[test]
@@ -675,7 +967,10 @@ mod tests {
             keycode: "KeyA".into(),
             modifiers: Modifiers::empty()
         }));
-        assert!(is_input_datagram(&ClientDatagram::MouseMove { dx: 1, dy: -1 }));
+        assert!(is_input_datagram(&ClientDatagram::MouseMove {
+            dx: 1,
+            dy: -1
+        }));
         assert!(is_input_datagram(&ClientDatagram::MouseButton {
             button: 0,
             pressed: true
@@ -686,7 +981,9 @@ mod tests {
             x: 10,
             y: 10
         }));
-        assert!(is_input_datagram(&ClientDatagram::TouchscreenRelease { index: 0 }));
+        assert!(is_input_datagram(&ClientDatagram::TouchscreenRelease {
+            index: 0
+        }));
         assert!(is_input_datagram(&ClientDatagram::Gamepad {
             id: 0,
             buttons: 0,
@@ -698,7 +995,9 @@ mod tests {
             rt: 0,
             motion: None
         }));
-        assert!(is_input_datagram(&ClientDatagram::GamepadDisconnect { id: 0 }));
+        assert!(is_input_datagram(&ClientDatagram::GamepadDisconnect {
+            id: 0
+        }));
     }
 
     #[test]
@@ -718,52 +1017,105 @@ mod tests {
     #[test]
     fn coalesce_keeps_newest_touch_and_gamepad_snapshot() {
         let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(&mut q, ClientDatagram::Touchscreen { index: 0, x: 10, y: 20 });
-        coalesce_input(&mut q, ClientDatagram::Touchscreen { index: 0, x: 30, y: 40 });
-        coalesce_input(&mut q, ClientDatagram::Touchscreen { index: 1, x: 1, y: 2 });
+        coalesce_input(
+            &mut q,
+            ClientDatagram::Touchscreen {
+                index: 0,
+                x: 10,
+                y: 20,
+            },
+        );
+        coalesce_input(
+            &mut q,
+            ClientDatagram::Touchscreen {
+                index: 0,
+                x: 30,
+                y: 40,
+            },
+        );
+        coalesce_input(
+            &mut q,
+            ClientDatagram::Touchscreen {
+                index: 1,
+                x: 1,
+                y: 2,
+            },
+        );
         assert_eq!(q.len(), 2);
-        assert_eq!(q[0], ClientDatagram::Touchscreen { index: 0, x: 30, y: 40 });
-        assert_eq!(q[1], ClientDatagram::Touchscreen { index: 1, x: 1, y: 2 });
+        assert_eq!(
+            q[0],
+            ClientDatagram::Touchscreen {
+                index: 0,
+                x: 30,
+                y: 40
+            }
+        );
+        assert_eq!(
+            q[1],
+            ClientDatagram::Touchscreen {
+                index: 1,
+                x: 1,
+                y: 2
+            }
+        );
 
         let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(&mut q, ClientDatagram::Gamepad {
-            id: 1,
-            buttons: 0b01,
-            lx: 1,
-            ly: 2,
-            rx: 3,
-            ry: 4,
-            lt: 5,
-            rt: 6,
-            motion: None,
-        });
-        coalesce_input(&mut q, ClientDatagram::Gamepad {
-            id: 1,
-            buttons: 0b10,
-            lx: 9,
-            ly: 9,
-            rx: 9,
-            ry: 9,
-            lt: 9,
-            rt: 9,
-            motion: None,
-        });
+        coalesce_input(
+            &mut q,
+            ClientDatagram::Gamepad {
+                id: 1,
+                buttons: 0b01,
+                lx: 1,
+                ly: 2,
+                rx: 3,
+                ry: 4,
+                lt: 5,
+                rt: 6,
+                motion: None,
+            },
+        );
+        coalesce_input(
+            &mut q,
+            ClientDatagram::Gamepad {
+                id: 1,
+                buttons: 0b10,
+                lx: 9,
+                ly: 9,
+                rx: 9,
+                ry: 9,
+                lt: 9,
+                rt: 9,
+                motion: None,
+            },
+        );
         assert_eq!(q.len(), 1);
-        assert_eq!(q[0], ClientDatagram::Gamepad {
-            id: 1,
-            buttons: 0b10,
-            lx: 9,
-            ly: 9,
-            rx: 9,
-            ry: 9,
-            lt: 9,
-            rt: 9,
-            motion: None,
-        });
+        assert_eq!(
+            q[0],
+            ClientDatagram::Gamepad {
+                id: 1,
+                buttons: 0b10,
+                lx: 9,
+                ly: 9,
+                rx: 9,
+                ry: 9,
+                lt: 9,
+                rt: 9,
+                motion: None,
+            }
+        );
     }
 
+    /// The original rule was "only the tail is inspected", so a Keyboard event
+    /// between two mouse moves split one delta into two. That is now merged, and
+    /// this test used to assert the opposite — it is here because the change is
+    /// deliberate: the queue is the input gate's only bound on how many events
+    /// reach the compositor, so a rule that only ever looks at the tail leaves
+    /// the queue growing with the event count.
+    ///
+    /// What is preserved is order and the total delta: the movement still lands
+    /// before the key press, it just arrives as one event instead of two.
     #[test]
-    fn coalesce_only_merges_consecutive_same_kind_events() {
+    fn coalesce_merges_across_an_intervening_event_without_reordering() {
         let mut q: VecDeque<ClientDatagram> = VecDeque::new();
         coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 1, dy: 1 });
         coalesce_input(
@@ -775,10 +1127,12 @@ mod tests {
         );
         coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 2, dy: 2 });
         coalesce_input(&mut q, ClientDatagram::TouchscreenRelease { index: 0 });
-        // Only the tail is inspected, so the second MouseMove cannot merge with
-        // the first across the Keyboard event; both are kept, in order.
-        assert_eq!(q.len(), 4);
-        assert_eq!(q[0], ClientDatagram::MouseMove { dx: 1, dy: 1 });
+        assert_eq!(q.len(), 3, "the two moves must collapse into one");
+        assert_eq!(
+            q[0],
+            ClientDatagram::MouseMove { dx: 3, dy: 3 },
+            "deltas must sum, and must stay ahead of the key press"
+        );
         assert_eq!(
             q[1],
             ClientDatagram::Keyboard {
@@ -786,7 +1140,6 @@ mod tests {
                 modifiers: Modifiers::CTRL
             }
         );
-        assert_eq!(q[2], ClientDatagram::MouseMove { dx: 2, dy: 2 });
-        assert_eq!(q[3], ClientDatagram::TouchscreenRelease { index: 0 });
+        assert_eq!(q[2], ClientDatagram::TouchscreenRelease { index: 0 });
     }
 }

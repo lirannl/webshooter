@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub(crate) mod audio;
+pub(crate) mod bitrate;
 mod eis;
 mod eis_keyboard;
 pub(crate) mod gamepad;
@@ -24,14 +25,21 @@ pub mod video;
 pub async fn setup_pipewire() {
     pipewire::init();
 
+    // The startup token is an optimisation: it lets the first capture skip its
+    // `select_devices` dialog. A failure here is therefore never fatal — the
+    // server must keep running, because a server that has exited cannot tell a
+    // client *why* its capture is not starting, and cannot answer the next one
+    // once the session unlocks.
     match create_auth_token().await {
         Ok(string) => persist_portal_token(string).await,
         Err(err) => {
-            eprintln!("Failed to create portal auth token: {err:#}");
-            eprintln!("Cannot run without portal auto-approval. Exiting.");
-            std::process::exit(1);
+            log::warn!("no portal restore token at startup: {err:#}");
+            log::warn!(
+                "captures will ask for input permission again on each start; \
+                 this is normal while the session is locked"
+            );
         }
-    };
+    }
 }
 
 async fn create_auth_token() -> Result<String, anyhow::Error> {

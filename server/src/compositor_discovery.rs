@@ -12,11 +12,12 @@ fn set_env(name: &str, value: &str, why: &str) {
     log::info!("Set {name}={value} ({why})");
 }
 
-
 /// Return the id of the first logind session belonging to `uid` that has a
 /// seat assigned (i.e. a graphical session). Used to discover session-derived
 /// environment like `XDG_RUNTIME_DIR` and `XDG_CURRENT_DESKTOP` when they are
-/// missing from the process environment (e.g. when launched over SSH).
+/// missing from the process environment (e.g. when launched over SSH), and to
+/// find the session whose lock state decides whether a portal dialog can be
+/// approved at all (see [`crate::session_lock`]).
 pub(super) fn seat_session_for_uid(uid: u32) -> Result<Option<String>> {
     let output = std::process::Command::new("loginctl")
         .args(["list-sessions", "--no-legend", "--no-pager"])
@@ -30,8 +31,25 @@ pub(super) fn seat_session_for_uid(uid: u32) -> Result<Option<String>> {
         let Some(session_id) = line.split_whitespace().next() else {
             continue;
         };
+        // Both spellings are asked for because logind renamed the property:
+        // `UID` on older systemd, `User` from v230ish onward. Asking for a name
+        // logind does not know is not an error — it is simply omitted from the
+        // output — so a request for only one of them yields a session with no
+        // uid at all, and every comparison below then fails. That is silent: it
+        // looks exactly like "this machine has no graphical session", which is
+        // how asking for `UID` alone made this return `None` on any current
+        // systemd and quietly pushed every caller onto its fallback path.
         let props = match std::process::Command::new("loginctl")
-            .args(["show-session", session_id, "-p", "UID", "-p", "Seat"])
+            .args([
+                "show-session",
+                session_id,
+                "-p",
+                "UID",
+                "-p",
+                "User",
+                "-p",
+                "Seat",
+            ])
             .output()
         {
             Ok(p) if p.status.success() => p,
@@ -41,10 +59,13 @@ pub(super) fn seat_session_for_uid(uid: u32) -> Result<Option<String>> {
         let mut session_uid = None;
         let mut seat = String::new();
         for prop in String::from_utf8_lossy(&props.stdout).lines() {
-            if let Some(v) = prop.strip_prefix("UID=") {
-                session_uid = v.parse::<u32>().ok();
-            } else if let Some(v) = prop.strip_prefix("Seat=") {
-                seat = v.to_string();
+            if let Some((key, value)) = prop.split_once('=') {
+                match key {
+                    // Either name, whichever this logind knows.
+                    "UID" | "User" => session_uid = value.parse::<u32>().ok(),
+                    "Seat" => seat = value.to_string(),
+                    _ => {}
+                }
             }
         }
 
@@ -71,7 +92,11 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
 
     match seat_session_for_uid(uid) {
         Ok(Some(session_id)) => {
-            set_env("XDG_RUNTIME_DIR", &dir, &format!("from session {session_id}"));
+            set_env(
+                "XDG_RUNTIME_DIR",
+                &dir,
+                &format!("from session {session_id}"),
+            );
             Ok(())
         }
         Ok(None) => anyhow::bail!(
@@ -81,7 +106,11 @@ pub(super) fn ensure_xdg_runtime_dir() -> Result<()> {
         Err(_) => {
             // logind unavailable: fall back to the convention if the dir exists.
             if Path::new(&dir).is_dir() {
-                set_env("XDG_RUNTIME_DIR", &dir, "by convention (no logind available)");
+                set_env(
+                    "XDG_RUNTIME_DIR",
+                    &dir,
+                    "by convention (no logind available)",
+                );
                 Ok(())
             } else {
                 anyhow::bail!(
@@ -177,7 +206,10 @@ fn desktop_from_compositor() -> Option<String> {
 /// Whether a process with the given comm name is running. Tries `pgrep` first,
 /// then falls back to scanning `/proc` (so it works without procps installed).
 fn compositor_running(name: &str) -> bool {
-    if let Ok(out) = std::process::Command::new("pgrep").args(["-x", name]).output() {
+    if let Ok(out) = std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+    {
         if out.status.success() && !out.stdout.is_empty() {
             return true;
         }

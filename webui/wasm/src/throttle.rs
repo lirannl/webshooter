@@ -1,25 +1,37 @@
 //! Client-side input throttle.
 //!
-//! The server asks us to slow down when its input-processing pipeline
-//! approaches saturation by sending `ServerDatagram::Throttle { interval_ms }`.
-//! Every input datagram flows through [`send_input`]: while throttled, events
-//! are coalesced into a small queue and flushed at the requested minimum
-//! spacing instead of being written to the WebTransport stream once per
-//! browser event. Coalescing keeps the newest state — mouse deltas are summed
-//! (so no movement is lost), touch/scroll accumulate, gamepad snapshots are
-//! reduced to the latest one — which preserves the total input at a fraction
-//! of the event rate.
+//! Every input datagram flows through [`send_input`], which applies a minimum
+//! spacing between sends and coalesces whatever arrives inside that spacing into
+//! one flush. Coalescing keeps the newest state — mouse deltas are summed (so no
+//! movement is lost), touch/scroll accumulate, gamepad snapshots are reduced to
+//! the latest one — which preserves the total input at a fraction of the event
+//! rate.
+//!
+//! Two reasons for the spacing, and they are not the same reason:
+//!
+//! - **The floor** ([`shared::throttle::INPUT_MIN_INTERVAL_MS`]) is applied
+//!   whether or not the server has asked for anything, and is shared with the
+//!   server so both ends enforce the same rate. Without it the browser's event
+//!   rate *is* the wire rate, which is how a multitouch flood arrives at the
+//!   compositor at thousands of events per second before any throttle message
+//!   has been sent, let alone acted on.
+//! - **The server's request** can make the spacing coarser, never finer.
+//!
+//! Ordinary input is unaffected by the floor: a finger dragging produces events
+//! 16 ms apart, so the 4 ms floor is never reached and nothing waits.
 
 use shared::client_datagram::{ClientDatagram, coalesce_input};
+use shared::throttle::{INPUT_MIN_INTERVAL_MS, effective_interval_ms};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 
 struct Throttle {
-    /// Server-requested minimum spacing between input datagrams (ms).
-    /// 0 = no throttling.
+    /// Minimum spacing between input datagrams (ms), already resolved through
+    /// the shared floor. Never zero: an unthrottled stream is the case that
+    /// wastes bandwidth, so it must not mean "as fast as the browser fires".
     interval_ms: f64,
-    /// `performance.now()` when the last input batch was actually sent.
+    /// `performance.now()` when the last input datagram was actually sent.
     last_send: f64,
     /// Input datagrams waiting for the next flush. Consecutive coalescable
     /// events are merged (mouse/scroll deltas summed, touch/gamepad reduced to
@@ -32,7 +44,7 @@ struct Throttle {
 
 thread_local! {
     static THROTTLE: RefCell<Throttle> = const { RefCell::new(Throttle {
-        interval_ms: 0.0,
+        interval_ms: INPUT_MIN_INTERVAL_MS as f64,
         last_send: 0.0,
         pending: VecDeque::new(),
         flush_id: None,
@@ -41,41 +53,27 @@ thread_local! {
         Closure::wrap(Box::new(flush_pending) as Box<dyn FnMut()>);
 }
 
-/// Apply the spacing the server requested. `0` lifts throttling and drains any
-/// queued input immediately so there is no artificial lag left behind.
+/// Apply the spacing the server requested, resolved through the shared floor.
+///
+/// `last_send` is deliberately not touched: if the request arrives long after the
+/// last send, the elapsed time already satisfies the new spacing and the next
+/// event goes straight out, rather than being made to wait a whole interval from
+/// a moment the client did not choose. [`flush_pending`] re-arms its timer if the
+/// interval grew while one was outstanding.
 pub fn set_throttle(interval_ms: u16) {
-    let drain = THROTTLE.with(|t| {
-        let mut t = t.borrow_mut();
-        let was_on = t.interval_ms > 0.0;
-        t.interval_ms = interval_ms as f64;
-        if t.interval_ms <= 0.0 {
-            // Throttling lifted: cancel the pending flush and send whatever is
-            // queued now.
-            t.flush_id = None;
-            Some(Vec::from(std::mem::take(&mut t.pending)))
-        } else if !was_on {
-            // Just switched on: base the first spacing on this moment so we
-            // don't immediately release a burst.
-            t.last_send = now_ms();
-            None
-        } else {
-            None
-        }
+    THROTTLE.with(|t| {
+        t.borrow_mut().interval_ms = f64::from(effective_interval_ms(interval_ms));
     });
-    if let Some(msgs) = drain {
-        for msg in msgs {
-            send_raw(&msg);
-        }
-    }
 }
 
-/// Send an input datagram, honouring the server's throttle.
+/// Send an input datagram, honouring the minimum spacing.
 pub fn send_input(msg: ClientDatagram) {
+    let now = now_ms();
     THROTTLE.with(|t| {
         let mut t = t.borrow_mut();
-        if t.interval_ms <= 0.0 {
-            // Not throttled: write straight through, zero added latency.
-            t.last_send = now_ms();
+        if now - t.last_send >= t.interval_ms {
+            // Spacing satisfied: write straight through.
+            t.last_send = now;
             drop(t);
             send_raw(&msg);
             return;
@@ -107,10 +105,7 @@ fn arm_flush(t: &mut Throttle, delay: f64) {
     let flush_fn = FLUSH_CB.with(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
     let handle = web_sys::window()
         .unwrap()
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            &flush_fn,
-            delay.max(0.0) as i32,
-        )
+        .set_timeout_with_callback_and_timeout_and_arguments_0(&flush_fn, delay.max(0.0) as i32)
         .unwrap();
     t.flush_id = Some(handle);
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::LevelFilter;
+use log::{Level, LevelFilter};
 use named_constants::named_constants;
 
 use crate::codec::Codec;
@@ -8,12 +8,30 @@ use crate::codec::Codec;
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Eq, Reflection)]
 pub enum ServerDatagram {
-    /// The first discriminant is not zero on purpose. Every message on the wire
-    /// leads with a byte, and that byte is also how a peer tells a MoQ message
-    /// from one of ours on the shared WebTransport session — see
-    /// [`crate::mux`]. MoQ owns everything at or below
-    /// [`crate::mux::MOQ_LAST_BYTE`], so this protocol starts above it.
-    ReleaseMouse = crate::mux::APP_FIRST_BYTE,
+    /// The boundary between MoQ and this protocol, and the only place that
+    /// number is written down.
+    ///
+    /// **Never constructed and never sent.** It exists so the boundary has a
+    /// name in [`ServerDatagramVariants`], which is what the rest of the crate
+    /// then refers to — the router in [`crate::mux`], and the first discriminant
+    /// of [`ClientDatagram`](crate::client_datagram::ClientDatagram), which
+    /// shares this session and therefore must start at the same byte.
+    ///
+    /// It is a variant rather than a free constant because it is a fact about
+    /// the wire format, and the enum *is* the wire format. A constant beside it
+    /// would be a second statement of the same fact, free to drift.
+    ///
+    /// Carried here and not on a real message, so that reordering, removing or
+    /// repurposing any message can never move the boundary by accident.
+    ///
+    /// The literal is `0x40` because MoQ owns the one-byte range at or below
+    /// `0x3F`: every message on the wire leads with a byte, and that byte is also
+    /// how a peer tells a MoQ message from one of ours. `0x3F` and not `0x01`
+    /// because a MoQ *datagram* leads with a subscribe id rather than a type tag,
+    /// and those ids grow; [`crate::mux`] works through why the whole byte is
+    /// reserved.
+    MoqBoundary = 0x40,
+    ReleaseMouse,
     ToggleFullscreen,
     /// Announces the server's configured maximum log level so the client
     /// stops generating (and forwarding) records below that severity.
@@ -48,11 +66,35 @@ pub enum ServerDatagram {
     VideoTrack {
         codec: Codec,
     },
+    /// Tells the client something the server cannot do for it right now, in a
+    /// form a person can be shown.
+    ///
+    /// The mirror of [`crate::client_datagram::ClientDatagram::Error`]: the
+    /// client already reports its own failures this way, and a server-side
+    /// refusal — a locked session, no capture permission — is just as useless to
+    /// the client unless it arrives as a message rather than as a session that
+    /// silently never starts. A report, not a directive: nothing here is acted
+    /// on by the client on the server's behalf.
+    ///
+    /// Appended last so the discriminants above keep their wire values; see
+    /// `tests::wire_bytes_are_stable`.
+    Error {
+        level: Level,
+        message: String,
+    },
 }
 
 impl ServerDatagram {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
+            // Never sent. The variant exists only to give the boundary byte a
+            // name, so there is nothing to encode. The match has to be
+            // exhaustive, which means this arm is the only thing standing
+            // between "names a boundary" and "is a message" — it fails loudly
+            // rather than quietly putting a meaningless byte on the wire.
+            Self::MoqBoundary => {
+                panic!("MoqBoundary names the wire boundary, it is not a message")
+            }
             Self::ReleaseMouse => vec![ServerDatagramVariants::RELEASE_MOUSE.0],
             Self::ToggleFullscreen => vec![ServerDatagramVariants::TOGGLE_FULLSCREEN.0],
             Self::LogLevel { level } => vec![
@@ -70,6 +112,13 @@ impl ServerDatagram {
             }
             Self::VideoTrack { codec } => {
                 vec![ServerDatagramVariants::VIDEO_TRACK.0, codec.to_byte()]
+            }
+            Self::Error { level, message } => {
+                let mut buf = Vec::with_capacity(2 + message.len());
+                buf.push(ServerDatagramVariants::ERROR.0);
+                buf.push(crate::log_level::level_to_byte(*level));
+                buf.extend_from_slice(message.as_bytes());
+                buf
             }
         }
     }
@@ -110,6 +159,15 @@ impl ServerDatagram {
                     codec: Codec::from_byte(bytes[1])?,
                 })
             }
+            ServerDatagramVariants::ERROR => {
+                let Some((&level, message)) = bytes[1..].split_first() else {
+                    anyhow::bail!("Error datagram too short: {} bytes", bytes.len());
+                };
+                Ok(Self::Error {
+                    level: crate::log_level::level_from_byte(level)?,
+                    message: String::from_utf8_lossy(message).into_owned(),
+                })
+            }
             n => anyhow::bail!("Invalid server datagram discriminant: {}", n.0),
         }
     }
@@ -123,6 +181,7 @@ mod tests {
     /// gone — video and audio go out as MoQ frames now — so what remains is the
     /// control protocol, and this is the only thing that keeps its discriminants
     /// from being renumbered by an innocent reordering.
+
     #[test]
     fn wire_bytes_are_stable() {
         let cases: Vec<(ServerDatagram, Vec<u8>)> = vec![
@@ -155,10 +214,52 @@ mod tests {
                 ServerDatagram::VideoTrack { codec: Codec::H264 },
                 vec![ServerDatagramVariants::VIDEO_TRACK.0, 0x02],
             ),
+            (
+                ServerDatagram::Error {
+                    level: log::Level::Warn,
+                    message: "session is locked".into(),
+                },
+                vec![
+                    ServerDatagramVariants::ERROR.0,
+                    crate::log_level::level_to_byte(log::Level::Warn),
+                    b's',
+                    b'e',
+                    b's',
+                    b's',
+                    b'i',
+                    b'o',
+                    b'n',
+                    b' ',
+                    b'i',
+                    b's',
+                    b' ',
+                    b'l',
+                    b'o',
+                    b'c',
+                    b'k',
+                    b'e',
+                    b'd',
+                ],
+            ),
         ];
         for (dgram, expected) in cases {
             assert_eq!(dgram.to_bytes(), expected, "bytes changed for {dgram:?}");
         }
+    }
+
+    /// The boundary variant names a byte; it is not a message. Nothing may send it
+    /// and nothing may parse it back, or the boundary would become a wire value
+    /// that peers could use for two meanings at once.
+    #[test]
+    fn the_boundary_is_not_a_message() {
+        assert!(
+            ServerDatagram::from_bytes(&[ServerDatagramVariants::MOQ_BOUNDARY.0]).is_err(),
+            "the boundary byte must not decode as a message"
+        );
+        assert!(
+            !crate::mux::is_moq_byte(ServerDatagramVariants::MOQ_BOUNDARY.0),
+            "the boundary byte must not fall inside MoQ's range"
+        );
     }
 
     /// Every variant has to survive the round trip, not just the bytes: a
@@ -176,6 +277,16 @@ mod tests {
             ServerDatagram::AudioLevel { level: 255 },
             ServerDatagram::VideoTrack { codec: Codec::Av1 },
             ServerDatagram::VideoTrack { codec: Codec::Vp9 },
+            ServerDatagram::Error {
+                level: log::Level::Warn,
+                message: "the session is locked".into(),
+            },
+            // An empty message is legal: it must not be mistaken for a truncated
+            // datagram, and it must not be the thing that decides that.
+            ServerDatagram::Error {
+                level: log::Level::Error,
+                message: String::new(),
+            },
         ];
         for dgram in cases {
             let bytes = dgram.to_bytes();
@@ -207,11 +318,62 @@ mod tests {
     /// `0x00`, which is exactly what a MoQ group stream starts with.
     #[test]
     fn a_moq_first_byte_is_not_a_control_discriminant() {
-        for byte in 0..=crate::mux::MOQ_LAST_BYTE {
+        for byte in 0..ServerDatagramVariants::RELEASE_MOUSE.0 {
             assert!(
                 ServerDatagram::from_bytes(&[byte]).is_err(),
                 "{byte:#04x} decoded as a control message, but it belongs to MoQ"
             );
         }
+    }
+
+    /// `Error` is the first variable-length server datagram — every other one is
+    /// one or two fixed bytes — so it is the first whose truncation could read
+    /// past the end of a buffer. It sits on the network receive path, where a
+    /// panic takes the session down with it, so every cut short of a complete
+    /// message must be an `Err` rather than a read out of bounds.
+    #[test]
+    fn a_truncated_error_never_panics() {
+        let full = ServerDatagram::Error {
+            level: log::Level::Warn,
+            message: "the session is locked".into(),
+        }
+        .to_bytes();
+        // Discriminant and level are the fixed part; a cut below that cannot be
+        // told apart from noise and must be rejected.
+        for cut in 0..2 {
+            assert!(
+                ServerDatagram::from_bytes(&full[..cut]).is_err(),
+                "a {cut}-byte Error must not parse"
+            );
+        }
+        // A level with the message cut off is a *legal* Error with nothing to
+        // say, not a parse failure — an empty message round-trips above, so
+        // truncating into one must be consistent with that rather than an error.
+        assert_eq!(
+            ServerDatagram::from_bytes(&full[..2]).expect("level alone parses"),
+            ServerDatagram::Error {
+                level: log::Level::Warn,
+                message: String::new(),
+            }
+        );
+        // Every other cut is a partial message: parsed as an empty one, never a
+        // panic.
+        for cut in 3..full.len() {
+            let _ = ServerDatagram::from_bytes(&full[..cut]);
+        }
+    }
+
+    /// The level is what makes an `Error` worth reading, so an unrecognised one
+    /// is rejected rather than defaulted — a message with a wrong severity is
+    /// worse than a dropped one.
+    #[test]
+    fn an_error_with_an_unknown_level_is_rejected() {
+        let bytes = [
+            ServerDatagramVariants::ERROR.0,
+            0xFE, // not a level
+            b'h',
+            b'i',
+        ];
+        assert!(ServerDatagram::from_bytes(&bytes).is_err());
     }
 }

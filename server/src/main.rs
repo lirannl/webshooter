@@ -15,6 +15,8 @@ mod logging;
 mod moq;
 #[cfg(target_os = "linux")]
 mod pipewire;
+#[cfg(target_os = "linux")]
+mod session_lock;
 mod tray;
 mod wt;
 use anyhow::Result;

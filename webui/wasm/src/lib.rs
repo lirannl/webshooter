@@ -15,8 +15,8 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    HtmlDivElement, WebTransport, WebTransportDatagramDuplexStream, WebTransportOptions,
-    WritableStream, WritableStreamDefaultWriter,
+    HtmlButtonElement, HtmlDivElement, WebTransport, WebTransportDatagramDuplexStream,
+    WebTransportOptions, WritableStream, WritableStreamDefaultWriter,
 };
 
 use crate::log::init as init_log;
@@ -180,6 +180,14 @@ async fn run_moq(
                 }
             }
             ServerDatagram::LogLevel { level } => crate::log::apply_server_level(level),
+            // Unreachable by construction: the parser has no arm for the
+            // boundary, so it cannot arrive. Listed only because the match is
+            // exhaustive, and worth a note rather than a silent `_` — if this
+            // ever fires, the server is speaking a layout this client does not
+            // know, which is the one mistake here worth making loud.
+            ServerDatagram::MoqBoundary => {
+                ::log::error!("server sent the MoQ boundary as a message");
+            }
             ServerDatagram::ReleaseMouse => release_flag.set(true),
             ServerDatagram::Throttle { interval_ms } => crate::throttle::set_throttle(interval_ms),
             ServerDatagram::ToggleFullscreen => {
@@ -192,9 +200,21 @@ async fn run_moq(
                 } else if is_installed_pwa(&web_sys::window().unwrap()) {
                     let _entered_fullscreen = display.canvas.request_fullscreen();
                 } else {
-                    // Not a gesture yet: the resize prompt's pointerdown applies it.
+                    // Not a gesture yet: the pointerdown the display's own
+                    // handlers install applies it.
                     display.pending_fullscreen.set(true);
                 }
+            }
+            ServerDatagram::Error { level, message } => {
+                // The session is still up and the server may still be able to do
+                // what it was asked — a locked session parks its capture until
+                // the unlock. So this is a banner with a dismiss button, not the
+                // connection-lost overlay: the difference between "not for now"
+                // and "over" is exactly what the user needs to know, and
+                // putting up a full-screen "refresh to reconnect" here would be
+                // a lie.
+                ::log::warn!("server reported: {message}");
+                show_server_error(level, &message);
             }
             ServerDatagram::VideoTrack { codec } => {
                 let Some(display) = display.as_ref() else {
@@ -287,10 +307,13 @@ pub(crate) fn send_datagram(d: shared::client_datagram::ClientDatagram) {
 /// Send a [`ClientDatagram`] *reliably*, over a freshly opened unidirectional
 /// stream rather than a datagram. Datagrams are best-effort and can be silently
 /// dropped in transit; streams are ordered and delivered. Use this for state
-/// transitions whose loss would leave the server with a stale virtual device —
-/// most importantly `GamepadDisconnect`, which must always tear down the host's
-/// virtual controller. Returns `false` when the transport is gone or the send
-/// failed (the datagram path is unaffected by a failure here).
+/// transitions the server cannot recover on its own — its two are
+/// `GamepadDisconnect`, which must always tear down the host's virtual
+/// controller, and `DisplayParameters`, the only report of the display's size:
+/// lost, it leaves the server capturing at the previous size with no way to
+/// hear about the current one, because a client whose canvas has not changed
+/// since has nothing further to observe. Returns `false` when the transport is
+/// gone or the send failed (the datagram path is unaffected by a failure here).
 pub(crate) async fn send_reliable(d: shared::client_datagram::ClientDatagram) -> bool {
     let bytes = d.to_bytes();
     let buf = Uint8Array::from(&bytes[..]);
@@ -360,6 +383,79 @@ fn flush_deferred_report() {
     if let Some(parked) = parked {
         ::log::error!("from the previous session: {parked}");
     }
+}
+
+/// Show what the server said it cannot do, without ending the session.
+///
+/// One banner at a time, replaced in place: a server that reports the same
+/// refusal on each retry of a parked capture must not stack copies of it up the
+/// screen.
+///
+/// The banner itself is `pointer-events: none` so it never steals clicks from
+/// the remote desktop underneath; only the dismiss button takes them, so the
+/// desktop stays usable while the message is up.
+fn show_server_error(level: ::log::Level, message: &str) -> Option<()> {
+    let document = web_sys::window()?.document()?;
+    let body = document.body()?;
+    // Replace rather than append.
+    if let Some(old) = document
+        .query_selector("#webshooter-server-error")
+        .ok()
+        .flatten()
+    {
+        let _ = old.remove();
+    }
+
+    let colour = if level <= ::log::Level::Error {
+        "#ff6b6b"
+    } else if level == ::log::Level::Warn {
+        "#ffd166"
+    } else {
+        "#8ecdf7"
+    };
+    let div = document
+        .create_element("div")
+        .ok()
+        .and_then(|d| d.dyn_into::<HtmlDivElement>().ok())?;
+    div.set_id("webshooter-server-error");
+    let _ = div.set_attribute(
+        "style",
+        "position:fixed;left:50%;transform:translateX(-50%);top:1rem;max-width:min(90vw,520px);\
+         box-sizing:border-box;padding:0.75rem 1rem;border-radius:8px;pointer-events:none;\
+         background:rgba(22,22,27,0.94);color:white;font-family:sans-serif;font-size:0.95rem;\
+         display:flex;gap:0.75rem;align-items:center;border:1px solid #33333f;z-index:9998;",
+    );
+    div.set_inner_html(&format!("<span style='flex:1;color:{colour};'></span>"));
+    // Text via `text_content` rather than the HTML above, so a server-supplied
+    // message can never be markup.
+    if let Some(span) = div
+        .query_selector("span")
+        .ok()
+        .flatten()
+        .and_then(|s| s.dyn_into::<web_sys::HtmlSpanElement>().ok())
+    {
+        span.set_text_content(Some(message));
+    }
+
+    let button = document
+        .create_element("button")
+        .ok()
+        .and_then(|b| b.dyn_into::<HtmlButtonElement>().ok())?;
+    button.set_text_content(Some("Dismiss"));
+    button.style().set_css_text(
+        "pointer-events:auto;cursor:pointer;background:#16161b;color:#8ecdf7;\
+         border:1px solid #33333f;border-radius:6px;padding:0.25rem 0.75rem;font:inherit;",
+    );
+    let div_clone = div.clone();
+    let cb = Closure::wrap(Box::new(move || {
+        let _ = div_clone.remove();
+    }) as Box<dyn FnMut()>);
+    let _ = button.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref());
+    cb.forget();
+    let _ = div.append_child(&button);
+
+    let _ = body.append_child(&div);
+    Some(())
 }
 
 fn show_connection_lost() -> Option<()> {
@@ -499,7 +595,7 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
 
         // 9. The display, which is the whole of the difference between the two
         // kinds of session. Building it is what sends the first
-        // `ResizeDisplay`, which is the server's signal to capture -- so
+        // `DisplayParameters`, which is the server's signal to capture -- so
         // leaving it out is what leaves a session with no virtual monitor and
         // no input path.
         let display = if audio_only {
@@ -507,9 +603,15 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
             None
         } else {
             let canvas = video::setup_canvas();
-            video::send_initial_resize(&canvas)
-                .unwrap_or_else(|err| ::log::warn!("initial resize not sent: {err:#?}"));
-            let pending_fullscreen = video::setup_resize_prompt(&canvas);
+            // Nothing reported means the server has no size from us yet, and
+            // the sender's first observation is what supplies one.
+            let initial = video::send_initial_resize(&canvas)
+                .await
+                .unwrap_or_else(|err| {
+                    ::log::warn!("initial resize not sent: {err:#?}");
+                    None
+                });
+            let pending_fullscreen = video::setup_display_events(&canvas, initial);
             Some(video::Display {
                 canvas,
                 pending_fullscreen,
@@ -547,6 +649,14 @@ pub async fn start(audio_only: bool) -> Result<(), JsValue> {
                     &player.analyser(),
                     &container,
                 ))
+            }
+            // A video session has no button to press, so the first pointer or
+            // key event is the gesture that lets the context run — and until it
+            // does, `AudioReady` never goes out and the server builds no audio
+            // sink. See `resume_on_first_gesture`.
+            (Some(player), Some(_)) => {
+                crate::audio::resume_on_first_gesture(&player.audio_context());
+                None
             }
             _ => None,
         };

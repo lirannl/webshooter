@@ -128,30 +128,59 @@ pub fn is_input_byte(byte: u8) -> bool {
 pub fn coalesce_input(queue: &mut VecDeque<ClientDatagram>, msg: ClientDatagram) {
     match &msg {
         ClientDatagram::MouseMove { dx, dy } => {
-            if let Some(ClientDatagram::MouseMove { dx: pdx, dy: pdy }) = queue.back_mut() {
+            // Accumulated into the *oldest* pending move, not just the newest
+            // entry. A key event landing between two moves used to split one
+            // delta into two, and the queue is the input gate's only bound on
+            // how many events reach the compositor, so every entry it fails to
+            // collapse is one more event forwarded per flush.
+            if let Some(ClientDatagram::MouseMove { dx: pdx, dy: pdy }) = queue
+                .iter_mut()
+                .find(|d| matches!(d, ClientDatagram::MouseMove { .. }))
+            {
                 *pdx = pdx.saturating_add(*dx);
                 *pdy = pdy.saturating_add(*dy);
                 return;
             }
         }
         ClientDatagram::Scroll { dx, dy } => {
-            if let Some(ClientDatagram::Scroll { dx: pdx, dy: pdy }) = queue.back_mut() {
+            if let Some(ClientDatagram::Scroll { dx: pdx, dy: pdy }) = queue
+                .iter_mut()
+                .find(|d| matches!(d, ClientDatagram::Scroll { .. }))
+            {
                 *pdx = pdx.saturating_add(*dx);
                 *pdy = pdy.saturating_add(*dy);
                 return;
             }
         }
         ClientDatagram::Touchscreen { index, x, y } => {
-            if let Some(ClientDatagram::Touchscreen {
-                index: pi,
-                x: px,
-                y: py,
-            }) = queue.back_mut()
-                && pi == index
-            {
-                *px = *x;
-                *py = *y;
-                return;
+            // Scanned back for the newest pending position *for this slot*, not
+            // merely for a match at the back of the queue.
+            //
+            // The back-only rule is correct for one finger and useless for many:
+            // multitouch interleaves, so consecutive events belong to different
+            // slots, nothing ever matches, and ten fingers tapping produce a
+            // queue that grows by one entry per event. The input gate
+            // rate-limits *batches*, not the events inside them, so an unbounded
+            // batch is handed to the compositor whole — which is what freezes it.
+            // Coalescing per slot bounds the batch by the number of fingers.
+            //
+            // The scan stops at a pending release of the same slot, so a position
+            // that arrived after a lift is never folded back in front of it.
+            for entry in queue.iter_mut().rev() {
+                match entry {
+                    ClientDatagram::Touchscreen {
+                        index: pi,
+                        x: px,
+                        y: py,
+                        ..
+                    } if *pi == *index => {
+                        *px = *x;
+                        *py = *y;
+                        return;
+                    }
+                    ClientDatagram::TouchscreenRelease { index: ri } if *ri == *index => break,
+                    _ => {}
+                }
             }
         }
         ClientDatagram::Gamepad { id, .. } => {
@@ -172,12 +201,16 @@ pub fn coalesce_input(queue: &mut VecDeque<ClientDatagram>, msg: ClientDatagram)
 #[repr(u8)]
 #[derive(Debug, Clone, PartialEq, Reflection)]
 pub enum ClientDatagram {
-    /// The first discriminant is not zero on purpose: the first byte of
+    /// The first discriminant. Not zero on purpose: the first byte of
     /// every message on this WebTransport session also decides which protocol
-    /// owns the message, and MoQ owns everything at or below
-    /// [`crate::mux::MOQ_LAST_BYTE`]. See `crate::mux` for why one byte is
-    /// enough to route it.
-    KeepAlive = crate::mux::APP_FIRST_BYTE,
+    /// owns the message, and MoQ owns everything below it. See `crate::mux` for
+    /// why one byte is enough to route it.
+    ///
+    /// Named from [`ServerDatagram`]'s `MoqBoundary` variant rather than given
+    /// its own literal, because the two families share one WebTransport session
+    /// and must therefore start at the same byte — a number stated twice is a
+    /// number that can be changed in one place only.
+    KeepAlive = crate::server_datagram::ServerDatagramVariants::MOQ_BOUNDARY.0,
     Keyboard {
         keycode: String,
         modifiers: Modifiers,
@@ -421,7 +454,10 @@ impl ClientDatagram {
             }
             ClientDatagramVariants::DISPLAY_PARAMETERS => {
                 let [index, a, b, c, d] = data else {
-                    anyhow::bail!("DisplayParameters datagram too short: {} bytes", bytes.len());
+                    anyhow::bail!(
+                        "DisplayParameters datagram too short: {} bytes",
+                        bytes.len()
+                    );
                 };
                 Self::DisplayParameters {
                     index: *index,
@@ -896,11 +932,131 @@ mod tests {
     /// used to be a live discriminant, `KeepAlive` among them.
     #[test]
     fn a_moq_first_byte_is_not_a_client_discriminant() {
-        for byte in 0..=crate::mux::MOQ_LAST_BYTE {
+        let boundary = crate::server_datagram::ServerDatagramVariants::MOQ_BOUNDARY.0;
+        for byte in 0..boundary {
             assert!(
                 ClientDatagram::from_bytes(&[byte]).is_err(),
                 "{byte:#04x} decoded as a client message, but it belongs to MoQ"
             );
         }
+    }
+}
+
+/// The queue is the throttle's *only* bound on how many events reach the
+/// compositor, so how well it collapses a burst is a throughput property, not a
+/// nicety. Multitouch is the case that breaks it: fingers interleave, so a
+/// same-slot merge that only looks at the newest entry never fires.
+#[cfg(test)]
+mod coalesce_flood_tests {
+    use std::collections::VecDeque;
+
+    use super::{ClientDatagram, coalesce_input};
+
+    fn touch(index: u8, x: u16, y: u16) -> ClientDatagram {
+        ClientDatagram::Touchscreen { index, x, y }
+    }
+
+    /// Ten fingers, 200 interleaved samples each: 2000 events in, and the queue
+    /// must hold about ten — one live position per finger — not 2000. Before the
+    /// per-slot scan this grew to 2000, because every event followed a
+    /// *different* finger and so matched nothing at the back of the queue.
+    #[test]
+    fn interleaved_fingers_collapse_to_one_entry_each() {
+        let mut queue = VecDeque::new();
+        for sample in 0..200u16 {
+            for finger in 0..10u8 {
+                coalesce_input(&mut queue, touch(finger, sample, sample));
+            }
+        }
+        assert_eq!(
+            queue.len(),
+            10,
+            "expected one live position per finger, got {}",
+            queue.len()
+        );
+        let newest = queue
+            .iter()
+            .find(|d| matches!(d, ClientDatagram::Touchscreen { index: 3, .. }))
+            .cloned();
+        assert_eq!(
+            newest,
+            Some(touch(3, 199, 199)),
+            "the surviving entry must hold the newest position, not the first"
+        );
+    }
+
+    /// A single finger dragging is the case the old code handled, so it must not
+    /// regress.
+    #[test]
+    fn one_dragging_finger_stays_a_single_entry() {
+        let mut queue = VecDeque::new();
+        for x in 0..500u16 {
+            coalesce_input(&mut queue, touch(0, x, x));
+        }
+        assert_eq!(queue, VecDeque::from([touch(0, 499, 499)]));
+    }
+
+    /// Merging must not reach across a pending release, or a lift would be
+    /// followed by a stale position for a finger that is already gone — the
+    /// compositor would put it back down.
+    #[test]
+    fn a_merge_never_reaches_past_a_release_of_the_same_finger() {
+        let mut queue = VecDeque::new();
+        coalesce_input(&mut queue, touch(0, 10, 10));
+        coalesce_input(&mut queue, ClientDatagram::TouchscreenRelease { index: 0 });
+        coalesce_input(&mut queue, touch(0, 20, 20));
+        assert_eq!(
+            queue,
+            VecDeque::from([
+                touch(0, 10, 10),
+                ClientDatagram::TouchscreenRelease { index: 0 },
+                touch(0, 20, 20),
+            ]),
+            "the post-release position must stand alone, not overwrite the pre-release one"
+        );
+    }
+
+    /// Different fingers still do not merge into each other.
+    #[test]
+    fn fingers_are_not_merged_into_one_another() {
+        let mut queue = VecDeque::new();
+        coalesce_input(&mut queue, touch(0, 1, 1));
+        coalesce_input(&mut queue, touch(1, 2, 2));
+        coalesce_input(&mut queue, touch(0, 3, 3));
+        assert_eq!(
+            queue,
+            VecDeque::from([touch(0, 3, 3), touch(1, 2, 2)]),
+            "slot 1 must keep its own position"
+        );
+    }
+
+    /// Keyboard events interleave with mouse movement too, and the same
+    /// back-only rule applies to accumulating deltas. Summing is order-sensitive,
+    /// so the safe collapse for those is to keep the oldest pending entry rather
+    /// than the newest.
+    #[test]
+    fn mouse_deltas_accumulate_across_an_intervening_key_event() {
+        let mut queue = VecDeque::new();
+        coalesce_input(&mut queue, ClientDatagram::MouseMove { dx: 3, dy: 1 });
+        coalesce_input(
+            &mut queue,
+            ClientDatagram::Keyboard {
+                keycode: String::from("a"),
+                modifiers: super::Modifiers::empty(),
+            },
+        );
+        coalesce_input(&mut queue, ClientDatagram::MouseMove { dx: 4, dy: 2 });
+        let deltas: Vec<(i16, i16)> = queue
+            .iter()
+            .filter_map(|d| match d {
+                ClientDatagram::MouseMove { dx, dy } => Some((*dx, *dy)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec![(7i16, 3i16)],
+            "a key event between two moves must not split the delta"
+        );
     }
 }
