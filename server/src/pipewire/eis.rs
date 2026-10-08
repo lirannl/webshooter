@@ -1,13 +1,9 @@
-use std::collections::VecDeque;
 use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::future::Either;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use reis::tokio::EiConvertEventStream;
@@ -16,12 +12,12 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use shared::client_datagram::{ClientDatagram, coalesce_input};
+use shared::client_datagram::ClientDatagram;
 use shared::server_datagram::ServerDatagram;
-use shared::throttle::spacing_ms_after_events;
 
 use super::eis_keyboard::{EisKeyboardEvent, KeyboardState, send_keyboard_keys};
 use super::gamepad::GamepadManager;
+use super::input_coalesce::{INPUT_DRAIN_INTERVAL, InputCoalesce};
 use super::pointer::{
     EisButtonEvent, EisPointerEvent, EisScrollEvent, MouseState, send_button_event,
     send_pointer_motion, send_scroll_event, web_button_to_linux,
@@ -59,91 +55,15 @@ pub(crate) fn with_emulation(
     }
 }
 
-/// How often the server samples its input-pipeline load to decide whether to
-/// ask the client to throttle. Fast enough to react to a sustained burst
-/// within ~100 ms, slow enough not to spam the client with control datagrams.
-const THROTTLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-
-// The floor on input spacing lives in `shared::throttle`, because the client
-// applies the same one and the two must not disagree about the rate they are
-// each enforcing on the same stream. `input_throttle_monitor` can still ask for
-// something coarser; nothing can ask for something finer.
-
-/// How many queued input events one emulated frame may carry.
+/// How many input events one emulated EIS frame may carry.
 ///
-/// Bounded rather than unbounded because the batch is also the delay: the
-/// compositor is usually the slow part, and an unbounded batch would hold back
-/// its own first event until the queue drained. Well above the number of
-/// simultaneous fingers, so a real gesture never hits it.
+/// The coalesce's drain already bounds the event *rate*; this bounds how many
+/// of those events a single frame batches, so a burst is spread across frames
+/// rather than spent in one. Well above the number of simultaneous fingers, so
+/// a real gesture never hits it.
 const MAX_INPUT_BATCH: usize = 64;
 
-/// Map the fraction of the input pipeline that is in use (0..=1) onto the
-/// minimum spacing (in milliseconds) the client must keep between consecutive
-/// input datagrams. 0 means "no throttling". The fill ratio is derived from
-/// the channel that queues input events for the EIS thread: as it climbs
-/// toward the point where a burst would block or overflow, the server is
-/// nearly overloaded, so it asks the client to slow down.
-fn throttle_interval_from_fill(fill: f64) -> u16 {
-    let pct = (fill.clamp(0.0, 1.0) * 100.0) as u8;
-    match pct {
-        0..=49 => 0,   // plenty of headroom: no throttling
-        50..=64 => 8,  // could get busy: cap ~125 events/s
-        65..=79 => 16, // getting heavy: cap ~62 events/s
-        80..=89 => 32, // heavy: cap ~31 events/s
-        90..=94 => 64, // severe: cap ~15 events/s
-        _ => 128,      // nearly full: cap ~8 events/s
-    }
-}
-
-/// Watches the input-event channel that feeds the EIS thread. When it starts
-/// approaching capacity (the server's input pipeline is nearly saturated), it
-/// sends [`ServerDatagram::Throttle`] asking the client to space its input
-/// datagrams further apart. The message is only sent when the requested
-/// interval changes, so an idle or comfortably fast session never sees one.
-/// The current interval is also stored in `interval_ms` on every sample: the
-/// server-side input gate enforces that same spacing even against a
-/// non-cooperative client. Best-effort: if the control channel is gone the
-/// monitor simply stops.
-async fn input_throttle_monitor(
-    input_tx: mpsc::Sender<EisInputEvent>,
-    server_tx: mpsc::Sender<ServerDatagram>,
-    interval_ms: Arc<AtomicU16>,
-    cancel: CancellationToken,
-) {
-    let max = input_tx.max_capacity();
-    let mut last_sent: Option<u16> = None;
-    let mut interval = tokio::time::interval(THROTTLE_SAMPLE_INTERVAL);
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            _ = interval.tick() => {
-                let fill = if max > 0 {
-                    (max - input_tx.capacity()) as f64 / max as f64
-                } else {
-                    0.0
-                };
-                let desired = throttle_interval_from_fill(fill);
-                // Keep the input gate on the current requested spacing, every
-                // sample — even when the client message is suppressed because
-                // the value did not change.
-                interval_ms.store(desired, Ordering::Relaxed);
-                if last_sent != Some(desired) {
-                    last_sent = Some(desired);
-                    if server_tx
-                        .send(ServerDatagram::Throttle { interval_ms: desired })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Whether a datagram is an input event (subject to the throttle) rather than
+/// Whether a datagram is an input event (subject to the coalesce) rather than
 /// control traffic (keepalive, resize, logs, decoder caps, audio, …).
 fn is_input_datagram(msg: &ClientDatagram) -> bool {
     matches!(
@@ -159,114 +79,33 @@ fn is_input_datagram(msg: &ClientDatagram) -> bool {
     )
 }
 
-/// Server-side enforcement of the throttle. Inputs travel as WebTransport
-/// datagrams (unreliable, best-effort), so the client-side throttle is only
-/// cooperative and may exceed the requested rate by a little. This gate sits
-/// between the broadcast socket and the EIS forwarding task as the hard
-/// backstop: an event arriving inside the current cooling window is coalesced
-/// into a pending batch (mouse/scroll deltas summed, touch/gamepad reduced to
-/// the newest snapshot) and discarded if a still-newer one replaces it, and
-/// the batch is forwarded as soon as the rate allows. The cooling window is
-/// never shorter than [`shared::throttle::INPUT_MIN_INTERVAL_MS`], so even when the fill
-/// monitor has not (yet) asked for throttling a non-cooperative client cannot
-/// push the EIS pipeline at flood rate. Control datagrams bypass the gate
-/// entirely.
-async fn input_gate_task(
-    mut client_rx: broadcast::Receiver<ClientDatagram>,
-    gated_tx: broadcast::Sender<ClientDatagram>,
-    interval_ms: Arc<AtomicU16>,
-    cancel: CancellationToken,
-) {
-    let mut pending: VecDeque<ClientDatagram> = VecDeque::new();
-    let mut next_allowed = tokio::time::Instant::now();
-    let mut flush_at: Option<Pin<Box<tokio::time::Sleep>>> = None;
-
-    loop {
-        let requested_ms = interval_ms.load(Ordering::Relaxed);
-        // Wake once the cooling window elapses if throttled input is waiting;
-        // otherwise park this select arm so only client events run.
-        let flush_fut: Either<Pin<&mut tokio::time::Sleep>, futures_util::future::Pending<()>> =
-            match flush_at.as_mut() {
-                Some(sleep) => Either::Left(sleep.as_mut()),
-                None => Either::Right(futures_util::future::pending()),
-            };
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            _ = flush_fut => {
-                flush_at = None;
-                if pending.is_empty() {
-                    continue;
-                }
-                if tokio::time::Instant::now() >= next_allowed {
-                    let forwarded = forward_batch(&gated_tx, &mut pending).await;
-                    next_allowed = tokio::time::Instant::now()
-                        + Duration::from_millis(spacing_ms_after_events(forwarded, requested_ms));
-                }
-            }
-            msg = client_rx.recv() => {
-                match msg {
-                    // Input is coalesced, not replayed, so a lagged record is
-                    // superseded by the state that follows it; only a closed
-                    // bus means the client is really gone.
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => break,
-                    Ok(msg) => {
-                        // Control datagrams are not input: bypass the gate.
-                        if !is_input_datagram(&msg) {
-                            if gated_tx.send(msg).is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        let now = tokio::time::Instant::now();
-                        if now >= next_allowed {
-                            if gated_tx.send(msg).is_err() {
-                                break;
-                            }
-                            next_allowed = now
-                                + Duration::from_millis(spacing_ms_after_events(1, requested_ms));
-                            continue;
-                        }
-                        // Inside the cooling window: keep the newest input and
-                        // flush it once the window elapses.
-                        coalesce_input(&mut pending, msg);
-                        if flush_at.is_none() {
-                            flush_at = Some(Box::pin(tokio::time::sleep_until(next_allowed)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Send a coalesced batch of pending input datagrams, and report how many went.
-///
-/// `broadcast::Sender` is best-effort: it errors only when every receiver has
-/// hung up, which ends the session.
-async fn forward_batch(
-    gated_tx: &broadcast::Sender<ClientDatagram>,
-    pending: &mut VecDeque<ClientDatagram>,
-) -> usize {
-    let msgs = std::mem::take(pending);
-    let count = msgs.len();
-    for msg in msgs {
-        if gated_tx.send(msg).is_err() {
-            return count;
-        }
-    }
-    count
-}
-
-// The per-event spacing arithmetic is `shared::throttle::spacing_ms_after_events`,
-// for the same reason as the floor above.
 enum EisInputEvent {
     Touch(EisTouchEvent),
     Keyboard(EisKeyboardEvent),
     Pointer(EisPointerEvent),
     Button(EisButtonEvent),
     Scroll(EisScrollEvent),
+}
+
+/// Owns the input workers for one capture iteration. Stop before closing the
+/// portal session so no worker can address devices belonging to the next one.
+pub struct EisTasks {
+    cancel: CancellationToken,
+    input: JoinHandle<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl EisTasks {
+    pub async fn stop(self) {
+        self.cancel.cancel();
+        self.input.abort();
+        let _ = self.input.await;
+        // The reis stream is !Send; only the OS thread can destroy it. Never
+        // join on an executor worker.
+        if let Err(e) = tokio::task::spawn_blocking(move || self.thread.join()).await {
+            log::warn!("EIS thread join failed: {e}");
+        }
+    }
 }
 
 pub fn eis_task(
@@ -277,32 +116,18 @@ pub fn eis_task(
     pipeline_restart: Arc<watch::Sender<Option<&'static str>>>,
     client_rx: &mut broadcast::Receiver<ClientDatagram>,
     server_tx: &mpsc::Sender<ServerDatagram>,
-    mut cursor_rx: mpsc::Receiver<(i32, i32)>,
+    cursor_rx: mpsc::Receiver<(i32, i32)>,
     cancel: &CancellationToken,
-) -> JoinHandle<()> {
+) -> std::io::Result<EisTasks> {
     let (input_tx, input_rx) = mpsc::channel::<EisInputEvent>(64);
-    let cancel_task = cancel.clone();
-    let cancel_eis = cancel.clone();
-    let cancel_gate = cancel.clone();
-
-    // Throttle spacing, shared between the monitor (which decides it from the
-    // input pipeline's fill) and the input gate (which enforces it on behalf
-    // of the pipeline even against a non-cooperative client).
-    let throttle_interval = Arc::new(AtomicU16::new(0));
-
-    // Watch the input pipeline for saturation and ask the client to throttle
-    // before events start blocking or overflowing (near-overload feedback).
-    tokio::spawn(input_throttle_monitor(
-        input_tx.clone(),
-        server_tx.clone(),
-        throttle_interval.clone(),
-        cancel.clone(),
-    ));
+    let worker_cancel = cancel.child_token();
+    let cancel_input = worker_cancel.clone();
+    let cancel_eis = worker_cancel.clone();
 
     // Dedicated thread for the EIS event loop. The reis event stream is !Send
     // because EiEventConverter stores dyn FnOnce callbacks internally, so it
     // must live on a single thread with a current-thread tokio runtime.
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("webshooter-eis".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -318,127 +143,173 @@ pub fn eis_task(
                 input_rx,
                 cancel_eis,
             ));
-        })
-        .expect("eis thread");
+        })?;
 
-    // Server-side enforcement of the throttle. The client's own throttle is
-    // cooperative and may exceed the requested rate by a little; the gate is
-    // the hard backstop: it discards excess input, keeps the newest state, and
-    // forwards at the permitted rate.
-    let (gated_tx, mut event_rx) = broadcast::channel::<ClientDatagram>(64);
-    tokio::spawn(input_gate_task(
+    let input = tokio::spawn(input_task(
         client_rx.resubscribe(),
-        gated_tx,
-        throttle_interval,
-        cancel_gate,
+        server_tx.clone(),
+        input_tx,
+        cursor_rx,
+        cancel_input,
     ));
 
-    // Async forwarding task on the main tokio runtime. Reads events
-    // from the gated channel and sends them to the EIS thread.
-    let server_tx = server_tx.clone();
-    tokio::spawn({
-        let cancel = cancel_task;
-        async move {
-            let mut touch_state = TouchState::new();
-            let mut keyboard_state = KeyboardState::new();
-            let mut mouse_state = MouseState::new();
-            let mut gamepad_state = GamepadManager::new();
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        // A client that goes away mid-gesture leaves fingers
-                        // down, and nothing else will lift them: the compositor
-                        // keeps them until an explicit release or the emulating
-                        // connection drops. `try_send` rather than `send`,
-                        // because this is teardown and must not block on a
-                        // channel whose reader may already be gone.
-                        for ev in touch_state.release_all() {
-                            let _ = input_tx.try_send(EisInputEvent::Touch(ev));
-                        }
-                        break;
-                    }
-                    msg = event_rx.recv() => msg,
-                    cursor = cursor_rx.recv() => {
-                        match cursor {
-                            Some((x, y)) => {
-                                if mouse_state.update_compositor_pos(x, y) {
-                                    let _ = server_tx.send(ServerDatagram::ReleaseMouse).await;
-                                }
-                            }
-                            None => {}
-                        }
-                        continue;
-                    }
-                    // Release all held modifiers if no keyboard event arrives
-                    // within 1 s, so stuck modifiers don't persist. Unlike
-                    // touches, this one earns its timeout: a modifier stuck down
-                    // corrupts every later keystroke, and each key event
-                    // re-asserts the ones that are genuinely held.
-                    _ = keyboard_state.timeout_fired() => {
-                        for ev in keyboard_state.release_all_modifiers() {
-                            let _ = input_tx.send(EisInputEvent::Keyboard(ev)).await;
-                        }
-                        continue;
-                    }
-                };
-                match msg {
-                    Ok(ClientDatagram::Touchscreen { index, x, y }) => {
-                        for ev in touch_state.handle_touch(index, x, y) {
-                            let _ = input_tx.send(EisInputEvent::Touch(ev)).await;
-                        }
-                    }
-                    Ok(ClientDatagram::TouchscreenRelease { index }) => {
-                        if let Some(ev) = touch_state.handle_release(index) {
-                            let _ = input_tx.send(EisInputEvent::Touch(ev)).await;
-                        }
-                    }
-                    Ok(ClientDatagram::Keyboard { keycode, modifiers }) => {
-                        for ev in keyboard_state.handle_event(&keycode, modifiers) {
-                            let _ = input_tx.send(EisInputEvent::Keyboard(ev)).await;
-                        }
-                        keyboard_state.reset_timeout();
-                    }
-                    Ok(ClientDatagram::MouseMove { dx, dy }) => {
-                        let event = mouse_state.handle_move(dx, dy);
-                        let _ = input_tx.send(EisInputEvent::Pointer(event)).await;
-                    }
-                    Ok(ClientDatagram::MouseButton { button, pressed }) => {
-                        let linux_btn = web_button_to_linux(button);
-                        let _ = input_tx
-                            .send(EisInputEvent::Button(EisButtonEvent::Button {
-                                button: linux_btn,
-                                pressed,
-                            }))
-                            .await;
-                    }
-                    Ok(ClientDatagram::Scroll { dx, dy }) => {
-                        let _ = input_tx
-                            .send(EisInputEvent::Scroll(EisScrollEvent::Scroll { dx, dy }))
-                            .await;
-                    }
-                    Ok(ClientDatagram::Gamepad {
-                        id,
-                        buttons,
-                        lx,
-                        ly,
-                        rx,
-                        ry,
-                        lt,
-                        rt,
-                        motion,
-                    }) => {
-                        gamepad_state.update(id, buttons, lx, ly, rx, ry, lt, rt, motion);
-                    }
-                    Ok(ClientDatagram::GamepadDisconnect { id }) => {
-                        gamepad_state.remove(id);
-                    }
-                    Ok(_) => continue,
-                    Err(_) => break,
+    Ok(EisTasks {
+        cancel: worker_cancel,
+        input,
+        thread,
+    })
+}
+
+/// Fold client input into the per-session coalesce and drain it under the
+/// server-wide budget.
+///
+/// This is the single place input is bound. It reads the raw client bus, folds
+/// each input datagram into the coalesce, and on every [`INPUT_DRAIN_INTERVAL`]
+/// turns whatever the budget affords from the front of that buffer into EIS
+/// events for the EIS thread. One buffer with one drain replaces the old
+/// monitor + gate + forward chain, whose three independent drop points could
+/// each discard the very event a floor had preserved.
+async fn input_task(
+    mut client_rx: broadcast::Receiver<ClientDatagram>,
+    server_tx: mpsc::Sender<ServerDatagram>,
+    input_tx: mpsc::Sender<EisInputEvent>,
+    mut cursor_rx: mpsc::Receiver<(i32, i32)>,
+    cancel: CancellationToken,
+) {
+    let mut coalesce = InputCoalesce::new();
+    let mut touch_state = TouchState::new();
+    let mut keyboard_state = KeyboardState::new();
+    let mut mouse_state = MouseState::new();
+    let mut gamepad_state = GamepadManager::new();
+
+    // The drain cadence: how long a datagram may wait to be folded before it is
+    // eligible to leave. Delay, not Burst, so a stall spreads the backlog over
+    // the following ticks instead of dumping it at once.
+    let mut tick = tokio::time::interval(INPUT_DRAIN_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // A client that goes away mid-gesture leaves fingers down, and
+                // nothing else will lift them: the compositor keeps them until
+                // an explicit release or the emulating connection drops.
+                // `try_send` rather than `send`, because this is teardown and
+                // must not block on a channel whose reader may already be gone.
+                for ev in touch_state.release_all() {
+                    let _ = input_tx.try_send(EisInputEvent::Touch(ev));
+                }
+                break;
+            }
+            _ = tick.tick() => {
+                for msg in coalesce.drain_budgeted() {
+                    dispatch_input(
+                        msg,
+                        &mut touch_state,
+                        &mut keyboard_state,
+                        &mut mouse_state,
+                        &mut gamepad_state,
+                        &input_tx,
+                    )
+                    .await;
+                }
+            }
+            msg = client_rx.recv() => match msg {
+                Ok(msg) if is_input_datagram(&msg) => coalesce.push(msg),
+                // Control datagrams belong to the other bus subscribers.
+                Ok(_) => {}
+                // Input is coalesced, not replayed, so a lagged record is
+                // superseded by the state that follows it; only a closed bus
+                // means the client is really gone.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            },
+            cursor = cursor_rx.recv() => {
+                if let Some((x, y)) = cursor
+                    && mouse_state.update_compositor_pos(x, y)
+                {
+                    let _ = server_tx.send(ServerDatagram::ReleaseMouse).await;
+                }
+            }
+            // Release all held modifiers if no keyboard event arrives within
+            // 1 s, so stuck modifiers don't persist. Unlike touches, this one
+            // earns its timeout: a modifier stuck down corrupts every later
+            // keystroke, and each key event re-asserts the ones that are
+            // genuinely held.
+            _ = keyboard_state.timeout_fired() => {
+                for ev in keyboard_state.release_all_modifiers() {
+                    let _ = input_tx.send(EisInputEvent::Keyboard(ev)).await;
                 }
             }
         }
-    })
+    }
+}
+
+/// Turn one drained datagram into EIS events, updating the per-device state
+/// that spans datagrams. Every arm is the conversion the old forward task did,
+/// just run at drain time so it sees the coalesced batch rather than one event.
+async fn dispatch_input(
+    msg: ClientDatagram,
+    touch_state: &mut TouchState,
+    keyboard_state: &mut KeyboardState,
+    mouse_state: &mut MouseState,
+    gamepad_state: &mut GamepadManager,
+    input_tx: &mpsc::Sender<EisInputEvent>,
+) {
+    match msg {
+        ClientDatagram::Touchscreen { index, x, y } => {
+            for ev in touch_state.handle_touch(index, x, y) {
+                let _ = input_tx.send(EisInputEvent::Touch(ev)).await;
+            }
+        }
+        ClientDatagram::TouchscreenRelease { index } => {
+            if let Some(ev) = touch_state.handle_release(index) {
+                let _ = input_tx.send(EisInputEvent::Touch(ev)).await;
+            }
+        }
+        ClientDatagram::Keyboard { keycode, modifiers } => {
+            for ev in keyboard_state.handle_event(&keycode, modifiers) {
+                let _ = input_tx.send(EisInputEvent::Keyboard(ev)).await;
+            }
+            keyboard_state.reset_timeout();
+        }
+        ClientDatagram::MouseMove { dx, dy } => {
+            let event = mouse_state.handle_move(dx, dy);
+            let _ = input_tx.send(EisInputEvent::Pointer(event)).await;
+        }
+        ClientDatagram::MouseButton { button, pressed } => {
+            let linux_btn = web_button_to_linux(button);
+            let _ = input_tx
+                .send(EisInputEvent::Button(EisButtonEvent::Button {
+                    button: linux_btn,
+                    pressed,
+                }))
+                .await;
+        }
+        ClientDatagram::Scroll { dx, dy } => {
+            let _ = input_tx
+                .send(EisInputEvent::Scroll(EisScrollEvent::Scroll { dx, dy }))
+                .await;
+        }
+        ClientDatagram::Gamepad {
+            id,
+            buttons,
+            lx,
+            ly,
+            rx,
+            ry,
+            lt,
+            rt,
+            motion,
+        } => {
+            gamepad_state.update(id, buttons, lx, ly, rx, ry, lt, rt, motion);
+        }
+        ClientDatagram::GamepadDisconnect { id } => {
+            gamepad_state.remove(id);
+        }
+        _ => {}
+    }
 }
 
 async fn eis_main(
@@ -464,10 +335,11 @@ async fn eis_main(
         }
     };
 
-    let (connection, mut eis_stream) = match context
-        .handshake_tokio("webshooter", ei::handshake::ContextType::Sender)
-        .await
-    {
+    let (connection, mut eis_stream) = match tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        result = context.handshake_tokio("webshooter", ei::handshake::ContextType::Sender) => result,
+    } {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("EIS: handshake failed: {e}");
@@ -602,13 +474,15 @@ async fn eis_main(
                 let Some(first) = cmd else { break };
                 // Drain everything already queued, up to a bound.
                 //
-                // This is the other half of the input gate's coalescing: the gate
-                // hands over a *batch*, and spending four protocol messages and a
-                // flush on each event inside it is what lets a multitouch flood
-                // saturate the compositor — which is why the display stalls, not
-                // just the input. The bound keeps latency bounded when the
-                // compositor is the slow part: a huge batch would delay its own
-                // first event.
+                // This is the other half of the coalesce: the input task hands
+                // over a *batch* per drain tick, and spending four protocol
+                // messages and a flush on each event inside it is what lets a
+                // multitouch flood saturate the compositor — which is why the
+                // display stalls, not just the input. The bound keeps latency
+                // bounded when the compositor is the slow part: a huge batch
+                // would delay its own first event. (The event *rate* is already
+                // bounded by the coalesce's budget; this only shapes how many of
+                // the granted events share one frame.)
                 let mut batch = Vec::with_capacity(MAX_INPUT_BATCH);
                 batch.push(first);
                 while batch.len() < MAX_INPUT_BATCH {
@@ -900,30 +774,6 @@ mod tests {
     use shared::server_datagram::ServerDatagramVariants;
 
     #[test]
-    fn throttle_interval_is_none_when_pipeline_is_idle() {
-        assert_eq!(throttle_interval_from_fill(0.0), 0);
-        assert_eq!(throttle_interval_from_fill(0.3), 0);
-        assert_eq!(throttle_interval_from_fill(0.49), 0);
-    }
-
-    #[test]
-    fn throttle_interval_ramps_up_with_pipeline_fill() {
-        assert_eq!(throttle_interval_from_fill(0.5), 8);
-        assert_eq!(throttle_interval_from_fill(0.7), 16);
-        assert_eq!(throttle_interval_from_fill(0.85), 32);
-        assert_eq!(throttle_interval_from_fill(0.92), 64);
-        assert_eq!(throttle_interval_from_fill(1.0), 128);
-    }
-
-    #[test]
-    fn throttle_interval_clamps_out_of_range_fill() {
-        assert_eq!(throttle_interval_from_fill(-1.0), 0);
-        assert_eq!(throttle_interval_from_fill(f64::NEG_INFINITY), 0);
-        assert_eq!(throttle_interval_from_fill(2.0), 128);
-        assert_eq!(throttle_interval_from_fill(f64::NAN), 0); // NaN clamps to 0.0
-    }
-
-    #[test]
     fn throttle_datagram_round_trips() {
         for &interval_ms in &[0u16, 1, 16, 128, u16::MAX] {
             let dgram = ServerDatagram::Throttle { interval_ms };
@@ -940,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_treats_control_datagrams_as_unthrottled() {
+    fn control_datagrams_are_not_input() {
         assert!(!is_input_datagram(&ClientDatagram::KeepAlive));
         assert!(!is_input_datagram(&ClientDatagram::DisplayParameters {
             index: 0,
@@ -962,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_subjects_all_input_kinds_to_the_throttle() {
+    fn all_input_kinds_are_classified_as_input() {
         assert!(is_input_datagram(&ClientDatagram::Keyboard {
             keycode: "KeyA".into(),
             modifiers: Modifiers::empty()
@@ -1002,81 +852,86 @@ mod tests {
 
     #[test]
     fn coalesce_sums_mouse_and_scroll_deltas() {
-        let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 3, dy: -4 });
-        coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 2, dy: 1 });
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0], ClientDatagram::MouseMove { dx: 5, dy: -3 });
+        let mut c = InputCoalesce::new();
+        c.push(ClientDatagram::MouseMove { dx: 3, dy: -4 });
+        c.push(ClientDatagram::MouseMove { dx: 2, dy: 1 });
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c.drain_front(1),
+            vec![ClientDatagram::MouseMove { dx: 5, dy: -3 }]
+        );
 
-        coalesce_input(&mut q, ClientDatagram::Scroll { dx: 10, dy: 0 });
-        coalesce_input(&mut q, ClientDatagram::Scroll { dx: -4, dy: 7 });
-        assert_eq!(q.len(), 2);
-        assert_eq!(q[1], ClientDatagram::Scroll { dx: 6, dy: 7 });
+        c.push(ClientDatagram::Scroll { dx: 10, dy: 0 });
+        c.push(ClientDatagram::Scroll { dx: -4, dy: 7 });
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c.drain_front(1),
+            vec![ClientDatagram::Scroll { dx: 6, dy: 7 }]
+        );
     }
 
     #[test]
     fn coalesce_keeps_newest_touch_and_gamepad_snapshot() {
-        let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Touchscreen {
-                index: 0,
-                x: 10,
-                y: 20,
-            },
-        );
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Touchscreen {
-                index: 0,
-                x: 30,
-                y: 40,
-            },
-        );
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Touchscreen {
-                index: 1,
-                x: 1,
-                y: 2,
-            },
-        );
-        assert_eq!(q.len(), 2);
+        let mut c = InputCoalesce::new();
+        c.push(ClientDatagram::Touchscreen {
+            index: 0,
+            x: 10,
+            y: 20,
+        });
+        c.push(ClientDatagram::Touchscreen {
+            index: 1,
+            x: 1,
+            y: 2,
+        });
+        c.push(ClientDatagram::Touchscreen {
+            index: 0,
+            x: 30,
+            y: 40,
+        });
+        assert_eq!(c.len(), 2);
         assert_eq!(
-            q[0],
-            ClientDatagram::Touchscreen {
-                index: 0,
-                x: 30,
-                y: 40
-            }
-        );
-        assert_eq!(
-            q[1],
-            ClientDatagram::Touchscreen {
-                index: 1,
-                x: 1,
-                y: 2
-            }
+            c.drain_front(2),
+            vec![
+                ClientDatagram::Touchscreen {
+                    index: 0,
+                    x: 30,
+                    y: 40
+                },
+                ClientDatagram::Touchscreen {
+                    index: 1,
+                    x: 1,
+                    y: 2
+                },
+            ]
         );
 
-        let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Gamepad {
-                id: 1,
-                buttons: 0b01,
-                lx: 1,
-                ly: 2,
-                rx: 3,
-                ry: 4,
-                lt: 5,
-                rt: 6,
-                motion: None,
-            },
-        );
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Gamepad {
+        let mut c = InputCoalesce::new();
+        c.push(ClientDatagram::Gamepad {
+            id: 1,
+            buttons: 0b01,
+            lx: 1,
+            ly: 2,
+            rx: 3,
+            ry: 4,
+            lt: 5,
+            rt: 6,
+            motion: None,
+        });
+        c.push(ClientDatagram::Gamepad {
+            id: 1,
+            buttons: 0b10,
+            lx: 9,
+            ly: 9,
+            rx: 9,
+            ry: 9,
+            lt: 9,
+            rt: 9,
+            motion: None,
+        });
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c.drain_front(1),
+            vec![ClientDatagram::Gamepad {
                 id: 1,
                 buttons: 0b10,
                 lx: 9,
@@ -1086,60 +941,7 @@ mod tests {
                 lt: 9,
                 rt: 9,
                 motion: None,
-            },
+            }]
         );
-        assert_eq!(q.len(), 1);
-        assert_eq!(
-            q[0],
-            ClientDatagram::Gamepad {
-                id: 1,
-                buttons: 0b10,
-                lx: 9,
-                ly: 9,
-                rx: 9,
-                ry: 9,
-                lt: 9,
-                rt: 9,
-                motion: None,
-            }
-        );
-    }
-
-    /// The original rule was "only the tail is inspected", so a Keyboard event
-    /// between two mouse moves split one delta into two. That is now merged, and
-    /// this test used to assert the opposite — it is here because the change is
-    /// deliberate: the queue is the input gate's only bound on how many events
-    /// reach the compositor, so a rule that only ever looks at the tail leaves
-    /// the queue growing with the event count.
-    ///
-    /// What is preserved is order and the total delta: the movement still lands
-    /// before the key press, it just arrives as one event instead of two.
-    #[test]
-    fn coalesce_merges_across_an_intervening_event_without_reordering() {
-        let mut q: VecDeque<ClientDatagram> = VecDeque::new();
-        coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 1, dy: 1 });
-        coalesce_input(
-            &mut q,
-            ClientDatagram::Keyboard {
-                keycode: "KeyA".into(),
-                modifiers: Modifiers::CTRL,
-            },
-        );
-        coalesce_input(&mut q, ClientDatagram::MouseMove { dx: 2, dy: 2 });
-        coalesce_input(&mut q, ClientDatagram::TouchscreenRelease { index: 0 });
-        assert_eq!(q.len(), 3, "the two moves must collapse into one");
-        assert_eq!(
-            q[0],
-            ClientDatagram::MouseMove { dx: 3, dy: 3 },
-            "deltas must sum, and must stay ahead of the key press"
-        );
-        assert_eq!(
-            q[1],
-            ClientDatagram::Keyboard {
-                keycode: "KeyA".into(),
-                modifiers: Modifiers::CTRL
-            }
-        );
-        assert_eq!(q[2], ClientDatagram::TouchscreenRelease { index: 0 });
     }
 }

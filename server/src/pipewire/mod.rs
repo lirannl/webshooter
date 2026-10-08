@@ -17,6 +17,7 @@ pub(crate) mod bitrate;
 mod eis;
 mod eis_keyboard;
 pub(crate) mod gamepad;
+mod input_coalesce;
 pub(crate) mod pointer;
 mod portal_auth;
 pub mod touch;

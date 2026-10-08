@@ -400,6 +400,16 @@ impl KeyboardState {
     /// (no keyboard event received for 1 s).
     pub async fn timeout_fired(&mut self) {
         (&mut self.mod_timeout).await;
+        // A fired `Sleep` answers `Ready` on every later poll — its timer
+        // entry stays deregistered — so a `select!` arm awaiting it without
+        // re-arming would run on each turn of the loop and busy-spin the task
+        // at full speed until the next keyboard event. Re-arm the moment it
+        // fires: the arm body still runs once per fire, and the next poll
+        // parks until either this new deadline passes or a keyboard event
+        // moves it via `reset_timeout`.
+        self.mod_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(1));
     }
 
     /// Reset the modifier timeout after a keyboard event arrives.

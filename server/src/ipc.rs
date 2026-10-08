@@ -3,14 +3,19 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use shared::server_datagram::ServerDatagram;
 use std::{
-    collections::HashMap,
+    borrow::Borrow,
+    collections::HashSet,
     env,
     fmt::Display,
+    hash::{Hash, Hasher},
     io::ErrorKind,
     path::PathBuf,
     process::exit,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock, RwLock,
+        atomic::Ordering,
+    },
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stdin};
 use tokio::sync::watch;
@@ -109,220 +114,344 @@ impl IPCConnection {
 // ---------------------------------------------------------------------------
 // Connected-client session registry
 //
-// Every live WebTransport client is represented by a `Session`.  The live set
-// is the current value of a `watch` channel: readers take a brief read lock
-// (`borrow`), writers mutate in place through `send_if_modified`, which runs
-// the mutation under the channel's write lock and pokes subscribers in the
-// same step.  Connecting and disconnecting are rare, so serialising the whole
-// registry for the duration of a mutation is the right trade: this code is
-// about concurrency, not parallelism.
-//
-// Subscribers (the desktop tray) are *poked*, not given data: the watch
-// carries the registry itself, and a notification means "the registry changed
-// — re-read it".  Pokes are emitted as part of the store, and each read takes
-// a fresh owned snapshot, so a wake can never observe a pre-change registry.
-// Rapid changes coalesce into a single wake, which is harmless: the next
-// render reflects the latest snapshot, not a per-event delta.
-//
-// A `Session` owns everything needed to tear the connection down: the control
-// channel, a `CancellationToken` for a forced-disconnect, and the `JoinHandle`
-// of the supervisor that races every task driving the session (the driver
-// itself holds the transport).  Teardown is initiated by async cancellation —
-// a task finishing, a forced disconnect, or the transport dying — and the
-// driver closes the transport, drops the audio sink and deregisters as its
-// *last* act (the supervisor's deregistration is idempotent with it).
-// `Session::drop` therefore never remediates: it asserts that the token was
-// already cancelled, so removing a client from the registry can only ever be
-// the final step of a wind-down it was already told to do.
-//
-// Client ids are globally unique across all connected sessions: each new
-// session gets the lowest id not currently in use, so no two live sessions
-// ever share a map key (and thus never overwrite each other).
+// The set owns membership; its lock is never held while touching a session's
+// state or stopping its tasks. Lookups clone one Arc under a shared read lock.
+// A separate watch counter notifies the tray only when membership changes.
+// Removal matches on identity — the exact `Arc` — never the number alone, so
+// an id freed by a closed session can be handed out again without a late
+// teardown disconnecting whoever holds that id now.
 // ---------------------------------------------------------------------------
 
 pub type ClientId = u64;
 
-/// A connected client, plus the supervisor racing the tasks driving its
-/// session.
-///
-/// Session startup creates every long-lived task up-front — `datagrams` /
-/// `unistreams` feed the client's transport in, `client_events` and `audio`
-/// react to messages on the broadcast bus, `driver` owns capture negotiation,
-/// the frame forwarder and the run loop — and hands them to a supervisor that
-/// races them all.  The first task to end has ended the session: the
-/// supervisor cancels the session token and deregisters.  A registered session
-/// is therefore always complete, and `Session` holds exactly one task: the
-/// supervisor.
+/// The identity and all work belonging to one connected client. The transport
+/// task is the ancestor of platform-independent futures. Linux-only work lives
+/// in the conditionally compiled fields below, not in the transport handle.
 pub struct Session {
     pub id: ClientId,
     pub display_name: String,
     control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
     disconnect: CancellationToken,
-    // Held so the supervisor lives exactly as long as this session; teardown
-    // is driven by the disconnect token, so the supervisor is never joined or
-    // aborted from here.
-    #[expect(dead_code)]
-    supervisor: JoinHandle<()>,
+    connection: Arc<wtransport::Connection>,
+    transport: std::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(target_os = "linux")]
+    pub video: std::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(target_os = "linux")]
+    pub audio: std::sync::Mutex<Option<JoinHandle<()>>>,
+    #[cfg(target_os = "linux")]
+    pub audio_sink: Arc<std::sync::Mutex<Option<crate::pipewire::audio::AudioSink>>>,
+    #[cfg(target_os = "linux")]
+    cleanup: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The runtime this session's tasks run on, captured at creation so removal
+    /// can dispose those tasks from any thread (e.g. a tray callback) without
+    /// needing to be inside a runtime itself.
+    #[cfg(target_os = "linux")]
+    runtime: tokio::runtime::Handle,
 }
 
 impl Session {
-    /// A clone of the token that, when cancelled, tears this session down.
-    pub fn disconnect(&self) -> CancellationToken {
+    pub fn new(
+        id: ClientId,
+        display_name: String,
+        control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
+        connection: Arc<wtransport::Connection>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            display_name,
+            control_tx,
+            disconnect: CancellationToken::new(),
+            connection,
+            transport: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            video: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            audio: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            audio_sink: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(target_os = "linux")]
+            cleanup: std::sync::Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    pub fn token(&self) -> CancellationToken {
         self.disconnect.clone()
     }
 
-    /// Route a `ServerDatagram` into this session's control channel.
-    pub fn send(&self, msg: ServerDatagram) {
-        let _ = self.control_tx.try_send(msg);
+    pub fn set_transport(&self, handle: JoinHandle<()>) {
+        let mut task = self.transport.lock().unwrap();
+        if self.disconnect.is_cancelled() {
+            handle.abort();
+        } else {
+            assert!(task.is_none(), "transport task already running");
+            *task = Some(handle);
+        }
     }
-}
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        // A tripwire, not a net: teardown is driven by explicit async
-        // cancellation (the driver's run loop) and the token is cancelled
-        // before this ever runs.  An un-cancelled drop here is a bug — an
-        // authorisation path skipped its teardown — so make it loud instead of
-        // silently remediating by cancelling from the destructor.
+    #[cfg(target_os = "linux")]
+    pub fn set_video(&self, handle: JoinHandle<()>) {
+        let mut task = self.video.lock().unwrap();
+        if self.disconnect.is_cancelled() {
+            handle.abort();
+        } else {
+            assert!(task.is_none(), "video task already running");
+            *task = Some(handle);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_audio(&self, handle: JoinHandle<()>) {
+        let mut task = self.audio.lock().unwrap();
+        if self.disconnect.is_cancelled() {
+            handle.abort();
+        } else {
+            assert!(task.is_none(), "audio task already running");
+            *task = Some(handle);
+        }
+    }
+
+    /// Route a control message without holding the registry lock.
+    pub fn send(&self, msg: ServerDatagram) {
         if !self.disconnect.is_cancelled() {
-            log::error!(
-                "session {} dropped without the cancel token cancelled",
-                self.id
-            );
-            debug_assert!(
-                self.disconnect.is_cancelled(),
-                "session {} dropped without async cancellation",
-                self.id
-            );
+            let _ = self.control_tx.try_send(msg);
+        }
+    }
+
+    fn stop(self: Arc<Self>) {
+        self.disconnect.cancel();
+        self.connection
+            .close(wtransport::VarInt::from_u32(0), b"done");
+        if let Some(task) = self.transport.lock().unwrap().take() {
+            task.abort();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // A capture must close its portal grant and stop its GStreamer
+            // pipeline. Aborting it immediately would skip that async cleanup.
+            // Keep the cleanup task on this session, never in the registry lock.
+            let video = self.video.lock().unwrap().take();
+            let audio = self.audio.lock().unwrap().take();
+            let owner = Arc::clone(&self);
+            let reservation = PendingCleanup;
+            let cleanup = self.runtime.spawn(async move {
+                // Captured before spawning, so even an unpolled aborted task
+                // releases the resource-name reservation.
+                let _reservation = reservation;
+                async fn finish(task: Option<JoinHandle<()>>) {
+                    if let Some(mut task) = task
+                        && tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+                            .await
+                            .is_err()
+                    {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                }
+                tokio::join!(finish(video), finish(audio));
+                let sink = owner.audio_sink.lock().unwrap().take();
+                if let Some(sink) = sink {
+                    let _ = tokio::task::spawn_blocking(move || drop(sink)).await;
+                }
+            });
+            *self.cleanup.lock().unwrap() = Some(cleanup);
         }
     }
 }
 
-/// The connected-client registry.  The state is the watch channel's current
-/// value: writers mutate it in place via `send_if_modified` and readers take
-/// momentary `borrow()` read locks.  A single object therefore provides the
-/// snapshot, serialises mutations, and notifies subscribers in one place.
-type RegistrySnapshot = HashMap<ClientId, Arc<Session>>;
-static REGISTRY: LazyLock<watch::Sender<RegistrySnapshot>> =
-    LazyLock::new(|| watch::Sender::new(HashMap::new()));
+/// The hash key is the immutable ID, never a mutable field or a task handle.
+struct SessionEntry(Arc<Session>);
 
-/// Subscribe to connected-client change notifications.  The value carried is
-/// the registry itself; the current state is always re-read from it afterwards
-/// via [`list_clients`].
-pub fn subscribe_registry_changes() -> watch::Receiver<RegistrySnapshot> {
-    REGISTRY.subscribe()
+impl Borrow<ClientId> for SessionEntry {
+    fn borrow(&self) -> &ClientId {
+        &self.0.id
+    }
 }
 
-/// Mutate the registry: the mutation runs under the watch's write lock and the
-/// change notification is sent in the same step, so a wake can never observe a
-/// pre-change registry.
-fn mutate_registry(mutate: impl FnOnce(&mut RegistrySnapshot)) {
-    REGISTRY.send_if_modified(|registry| {
-        mutate(registry);
-        true
-    });
+impl PartialEq for SessionEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+impl Eq for SessionEntry {}
+impl Hash for SessionEntry {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.0.id.hash(hasher);
+    }
 }
 
-/// Reserve the lowest id not currently in use for a session still being
-/// constructed.  Only the accept loop allocates ids, so between reservation
-/// and [`register_session`] the id cannot be taken again — removals only ever
-/// *free* ids, and only registration occupies them.
+static REGISTRY: LazyLock<RwLock<HashSet<SessionEntry>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+static CHANGES: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::Sender::new(0));
+#[cfg(target_os = "linux")]
+static TEARING_DOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+struct PendingCleanup;
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingCleanup {
+    fn drop(&mut self) {
+        TEARING_DOWN.fetch_sub(1, Ordering::Release);
+    }
+}
+
+pub fn subscribe_registry_changes() -> watch::Receiver<u64> {
+    CHANGES.subscribe()
+}
+
+/// The lowest id no live session holds — `1` for a lone client, past the live
+/// set otherwise — so a client that reconnects finds its own id, and its own
+/// tray label, waiting for it instead of starting one higher every time.
+///
+/// Recycling is sound only because [`remove_session`] decides on identity: a
+/// stale teardown naming a recycled id finds no matching `Arc` in the
+/// registry and is a no-op. That is the guarantee the monotonic counter used
+/// to buy, bought without giving up id reuse.
+///
+/// Only the accept loop calls this, and it registers the session without
+/// accepting another connection in between, so two sessions cannot scan their
+/// way to the same id.
 pub fn next_client_id() -> ClientId {
-    let registry = REGISTRY.borrow();
-    let mut id = 1u64;
-    while registry.contains_key(&id) {
-        id += 1;
+    let registry = REGISTRY.read().unwrap();
+    lowest_free_id(|id| registry.contains(&id))
+}
+
+/// The least positive id `in_use` reports as taken. Split out so the
+/// allocation rule is testable without a live [`Session`] to put in the
+/// registry.
+fn lowest_free_id(in_use: impl Fn(ClientId) -> bool) -> ClientId {
+    let mut id = 1;
+    while in_use(id) {
+        id = id.checked_add(1).expect("client ID space exhausted");
     }
     id
 }
 
-/// Register a fully-constructed session.
-///
-/// The id must come from [`next_client_id`]: the lowest id not currently in
-/// use, and because only the accept loop registers, no other session can be
-/// allocated that id in between.  The session (including its supervisor,
-/// racing every task that must keep running) is created before registration
-/// and inserted atomically, so the moment the registry holds it, the client is
-/// live and addressable.
-pub fn register_session(
-    id: ClientId,
-    display_name: String,
-    control_tx: tokio::sync::mpsc::Sender<ServerDatagram>,
-    disconnect: CancellationToken,
-    supervisor: JoinHandle<()>,
-) {
-    let session = Arc::new(Session {
-        id,
-        display_name,
-        control_tx,
-        disconnect,
-        supervisor,
-    });
-    REGISTRY.send_if_modified(|registry| {
-        debug_assert!(!registry.contains_key(&id), "client id {id} already in use");
-        registry.insert(id, Arc::clone(&session));
-        true
-    });
+pub fn register_session(session: Arc<Session>) {
+    let mut registry = REGISTRY.write().unwrap();
+    if session.disconnect.is_cancelled() {
+        return;
+    }
+    assert!(
+        registry.insert(SessionEntry(session)),
+        "client id already in use"
+    );
+    CHANGES.send_modify(|revision| *revision = revision.wrapping_add(1));
 }
 
-/// Remove a session from the registry.  Callers must already have cancelled the
-/// session's token and torn the connection down; this is the *last* step of a
-/// wind-down.  `Session::drop` asserts that cancellation happened.
-pub fn remove_session(id: ClientId) {
-    mutate_registry(|registry| {
-        registry.remove(&id);
-    });
+/// Membership changes are exclusive. Cancellation, transport closure and task
+/// disposal happen only after the write lock is released.
+/// Remove a session by identity, never by its id alone.
+///
+/// By the time a finished task reaches this call its id may already have been
+/// recycled into a brand-new session: deleting by number would disconnect a
+/// client that had nothing to do with this teardown. The registry is keyed by
+/// id, but the decision here is `Arc::ptr_eq`, so a late or duplicate removal
+/// finds nothing and does nothing — which is exactly what makes id reuse in
+/// [`next_client_id`] safe.
+pub fn remove_session(session: &Arc<Session>) {
+    let doomed = {
+        let mut registry = REGISTRY.write().unwrap();
+        let doomed = registry
+            .iter()
+            .find(|entry| Arc::ptr_eq(&entry.0, session))
+            .map(|entry| SessionEntry(entry.0.clone()));
+        let Some(doomed) = doomed else {
+            return;
+        };
+        registry.remove(&doomed);
+        // Retain the old resource names while Linux capture winds down.
+        #[cfg(target_os = "linux")]
+        TEARING_DOWN.fetch_add(1, Ordering::Release);
+        CHANGES.send_modify(|revision| *revision = revision.wrapping_add(1));
+        doomed
+    };
+    doomed.0.stop();
 }
 
-/// The lowest client id currently in use, or `None` when no session is
-/// registered.
-///
-/// This is what distinguishes a session's *primary* session from a second one:
-/// the lowest id is held by exactly one session at a time (see
-/// [`next_client_id`]), so comparing against it is enough.
 pub fn lowest_client_id() -> Option<ClientId> {
-    REGISTRY.borrow().keys().copied().min()
+    let lowest = REGISTRY.read().unwrap().iter().map(|s| s.0.id).min();
+    #[cfg(target_os = "linux")]
+    if lowest.is_none() && TEARING_DOWN.load(Ordering::Acquire) != 0 {
+        // ID zero is never allocated. A new session must use a suffixed name
+        // until the old capture has released its PipeWire nodes and monitor.
+        return Some(0);
+    }
+    lowest
 }
 
-/// Snapshot of currently connected clients for UI (tray menu) rendering.
 pub fn list_clients() -> Vec<(ClientId, String)> {
     REGISTRY
-        .borrow()
-        .values()
-        .map(|s| (s.id, s.display_name.clone()))
+        .read()
+        .unwrap()
+        .iter()
+        .map(|s| (s.0.id, s.0.display_name.clone()))
         .collect()
 }
 
-/// Broadcast a control datagram to every connected client.
+fn get_session(id: ClientId) -> Option<Arc<Session>> {
+    REGISTRY
+        .read()
+        .unwrap()
+        .get(&id)
+        .map(|entry| entry.0.clone())
+}
+
 pub fn send_client_control(msg: ServerDatagram) {
-    let registry = REGISTRY.borrow();
-    for session in registry.values() {
+    let sessions: Vec<_> = REGISTRY
+        .read()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.0.clone())
+        .collect();
+    for session in sessions {
         session.send(msg.clone());
     }
 }
 
-/// Route a control datagram to a single client.
 pub fn send_client_control_to(id: ClientId, msg: ServerDatagram) {
-    let registry = REGISTRY.borrow();
-    if let Some(session) = registry.get(&id) {
+    if let Some(session) = get_session(id) {
         session.send(msg);
     }
 }
 
-/// Force a client to disconnect by cancelling its token and removing it from
-/// the registry.  The registry is the only `Arc<Session>` holder: removing the
-/// entry drops it, and `Session::drop` asserts the token is already cancelled.
-/// The driver task wakes on the cancellation and finishes the wind-down
-/// (transport close, audio-sink teardown); its own `remove_session()` call is
-/// then a no-op.  A disconnected session is therefore always removed from the
-/// collection — there is no way to disconnect while leaving a stale entry
-/// behind.
 pub fn disconnect_client(id: ClientId) {
-    let token = REGISTRY.borrow().get(&id).map(|s| s.disconnect());
-    if let Some(token) = token {
-        token.cancel();
+    if let Some(session) = get_session(id) {
+        remove_session(&session);
     }
-    remove_session(id);
+}
+
+/// Give Linux capture and audio a chance to release their resources before the
+/// runtime is shut down. The interactive removal path remains non-blocking.
+pub async fn shutdown_sessions() {
+    let sessions: Vec<_> = REGISTRY
+        .read()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.0.clone())
+        .collect();
+    for session in &sessions {
+        remove_session(session);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cleanup: Vec<_> = sessions
+            .iter()
+            .filter_map(|session| session.cleanup.lock().unwrap().take())
+            .collect();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for task in cleanup {
+                let _ = task.await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            log::warn!("timed out waiting for sessions to release Linux resources");
+        }
+    }
 }
 
 mod ipc_funcs {
@@ -513,8 +642,7 @@ pub async fn deauthorise(index: Option<usize>, mut conn: IPCConnection) -> Resul
         }
     };
     let short = crate::auth::format_id(&id);
-    let mut config_with_path =
-        crate::get_config_with_path().await;
+    let mut config_with_path = crate::get_config_with_path().await;
     let config = &mut config_with_path.config;
     if let Some(doomed) = config.users.extract_if(|user| id == *user).last() {
         crate::update_config(config_with_path).await?;
@@ -549,4 +677,41 @@ async fn ipc_handler(message: IPCMessage, mut conn: IPCConnection) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ids rewind to the lowest free slot, so a lone client that reconnects
+    /// reclaims its old id — and its old tray label — instead of climbing.
+    /// Recycling is sound only because `remove_session` compares identities:
+    /// a stale removal naming a recycled id finds no matching `Arc` and is a
+    /// no-op, which is the property the previous monotonic counter provided.
+    #[test]
+    fn client_ids_rewind_to_the_lowest_free() {
+        let used: HashSet<ClientId> = [1, 2, 4].into_iter().collect();
+        assert_eq!(lowest_free_id(|id| used.contains(&id)), 3);
+        let empty: HashSet<ClientId> = HashSet::new();
+        assert_eq!(
+            lowest_free_id(|id| empty.contains(&id)),
+            1,
+            "id 0 is reserved as a sentinel"
+        );
+        let full: HashSet<ClientId> = (1..1000).collect();
+        assert_eq!(lowest_free_id(|id| full.contains(&id)), 1000);
+    }
+
+    /// While a removed Linux capture is still releasing its resources, the
+    /// registry is empty but the unsuffixed (primary) name is still taken, so a
+    /// new session must be named as if a lower id were live.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pending_teardown_reserves_the_primary_name() {
+        assert_eq!(lowest_client_id(), None);
+        TEARING_DOWN.fetch_add(1, Ordering::Release);
+        assert_eq!(lowest_client_id(), Some(0));
+        TEARING_DOWN.fetch_sub(1, Ordering::Release);
+        assert_eq!(lowest_client_id(), None);
+    }
 }

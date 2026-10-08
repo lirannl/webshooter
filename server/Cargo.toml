@@ -28,6 +28,7 @@ ecdsa = { workspace = true, features = ["spki"] }
 futures-util.workspace = true
 data-encoding.workspace = true
 http.workspace = true
+indexmap.workspace = true
 mime_guess.workspace = true
 notify.workspace = true
 p384.workspace = true

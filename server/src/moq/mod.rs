@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use shared::mux::is_moq_byte;
+use tokio::task::JoinHandle;
 use wtransport::Connection;
 
 use shared::wake_queue::WakeQueue;
@@ -84,10 +85,10 @@ impl AppSide {
 /// Split a live WebTransport session into a MoQ transport and the webshooter
 /// control path, and start the pump that feeds both.
 ///
-/// Returns the MoQ session and the webshooter side of the mux. The caller owns the
-/// `AppSide` and must keep draining it: the pump cannot read past a message
-/// nobody takes.
-pub(crate) fn attach(connection: Arc<Connection>) -> (WtSession, AppSide) {
+/// Returns the MoQ session, the webshooter side of the mux, and the pump task.
+/// The caller must keep draining `AppSide`: the pump cannot read past a message
+/// nobody takes. The caller also owns the task handle for session supervision.
+pub(crate) fn attach(connection: Arc<Connection>) -> (WtSession, AppSide, JoinHandle<()>) {
     let inbox = Inbox::default();
     let app = AppSide::default();
     let session = WtSession::attach(connection.clone(), inbox.clone());
@@ -95,8 +96,8 @@ pub(crate) fn attach(connection: Arc<Connection>) -> (WtSession, AppSide) {
     // be one object: a second instance would leave the caller's queue permanently
     // empty while the client's datagrams piled up in a queue nobody drains, which
     // looks exactly like a client that has gone silent.
-    tokio::spawn(pump(connection, inbox, app.clone()));
-    (session, app)
+    let pump_task = tokio::spawn(pump(connection, inbox, app.clone()));
+    (session, app, pump_task)
 }
 
 /// Own every read on the connection and route each message by its first byte.

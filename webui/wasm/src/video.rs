@@ -619,10 +619,18 @@ pub(crate) fn frame_path(canvas: &HtmlCanvasElement) -> Result<FramePath, JsValu
         .expect("no 2d context");
 
     // VideoDecoder callbacks
+    // Decoder outputs so far, counted from the output callback: the far end of
+    // the pipeline, set beside `decode_queue_size()` in `run_video_track`'s
+    // periodic report. WebCodecs keeps every frame it is handed in its queue,
+    // so this pair is what separates "the server sent slowly" from "the
+    // decoder fell behind" — the difference grows nowhere else.
+    let outputs = Rc::new(Cell::new(0u32));
     let output_cb = {
         let ctx = ctx.clone();
         let canvas = canvas.clone();
+        let outputs = Rc::clone(&outputs);
         Closure::wrap(Box::new(move |frame: VideoFrame| {
+            outputs.set(outputs.get().wrapping_add(1));
             if canvas.width() != frame.display_width() || canvas.height() != frame.display_height()
             {
                 canvas.set_width(frame.display_width());
@@ -656,6 +664,7 @@ pub(crate) fn frame_path(canvas: &HtmlCanvasElement) -> Result<FramePath, JsValu
 
     Ok(FramePath {
         decoder,
+        outputs,
         _output: output_cb,
         _error: error_cb,
         current_codec: Rc::new(RefCell::new(None)),
@@ -665,6 +674,8 @@ pub(crate) fn frame_path(canvas: &HtmlCanvasElement) -> Result<FramePath, JsValu
 /// The decoder, its output callback and the last configuration.
 pub(crate) struct FramePath {
     decoder: web_sys::VideoDecoder,
+    /// Frames the decoder has produced, counted by the output callback.
+    outputs: Rc<Cell<u32>>,
     /// Lifetime anchor: the decoder holds JS refs to these Closure callbacks.
     _output: Closure<dyn FnMut(VideoFrame)>,
     _error: Closure<dyn FnMut(JsValue)>,
@@ -723,11 +734,34 @@ pub(crate) async fn run_video_track(
     // is where decoding can start.
     let mut awaiting_keyframe = true;
 
+    // How many frames the decoder may hold before this loop stops feeding it.
+    //
+    // Six is a little over one frame at the server's 60 fps cap — enough to
+    // absorb a scheduling hiccup without turning it into visible stutter, not
+    // enough to accumulate into perceptible delay. WebCodecs itself has no
+    // bound: it will queue whatever it is handed for as long as it takes to
+    // decode it, and the wait is paid entirely in latency.
+    const MAX_DECODE_QUEUE: u32 = 6;
+
+    // Receipt/decode accounting, reported every few seconds so it lands beside
+    // the server's own `frame rate:` lines in the same log. Three numbers with
+    // three distinct owners: `arrived` is what the transport delivered (if it
+    // lags the server's encoded count, the queue is between here and the wire),
+    // `fed` is what passed the keyframe gate into WebCodecs, and `decoded` is
+    // what came back out. WebCodecs holds every fed frame until it decodes it,
+    // so a `decode queue` that only climbs while a drag lasts *is* the growing
+    // latency — its slope is the rate the delay accumulates.
+    let mut arrived = 0u32;
+    let mut fed = 0u32;
+    let mut outputs_mark = path.outputs.get();
+    let mut last_report = js_sys::Date::now();
+
     loop {
         match subscribed.recv_group().await {
             Ok(Some(mut group)) => loop {
                 match group.read_frame().await {
                     Ok(Some(frame)) => {
+                        arrived += 1;
                         let Some(is_keyframe) = frame_tag(&frame.payload) else {
                             continue;
                         };
@@ -740,6 +774,37 @@ pub(crate) async fn run_video_track(
                         configure_decoder(&path.decoder, &path.current_codec, codec);
                         let timestamp_us = (frame.timestamp.as_millis() as f64) * 1000.0;
                         decode_frame(&path.decoder, &frame.payload[..], is_keyframe, timestamp_us);
+                        fed += 1;
+
+                        // The latency bound, enforced where it can be: once
+                        // the decoder holds more than MAX_DECODE_QUEUE frames,
+                        // everything queued inside it is already stale by the
+                        // time it would be shown, and waiting only makes that
+                        // worse. Raising the gate drops every frame up to the
+                        // next keyframe — a GOP of quality traded for a
+                        // picture that stays current — and the keyframe is
+                        // asked for here, so the wait is one round trip.
+                        if !awaiting_keyframe
+                            && path.decoder.decode_queue_size() > MAX_DECODE_QUEUE
+                        {
+                            awaiting_keyframe = true;
+                            crate::send_reliable(ClientDatagram::RequestKeyframe).await;
+                        }
+
+                        let now = js_sys::Date::now();
+                        if now - last_report >= 5_000.0 {
+                            let decoded = path.outputs.get().saturating_sub(outputs_mark);
+                            log::info!(
+                                "video stats: arrived {arrived} fed {fed} decoded {decoded} \
+                                 in {:.1}s, decode queue {}",
+                                (now - last_report) / 1_000.0,
+                                path.decoder.decode_queue_size(),
+                            );
+                            arrived = 0;
+                            fed = 0;
+                            outputs_mark = path.outputs.get();
+                            last_report = now;
+                        }
                     }
                     // A group ends at its own boundary and a failed one is
                     // dropped whole: the next group is a fresh stream, and it

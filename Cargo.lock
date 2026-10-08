@@ -4632,6 +4632,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "http 1.5.0",
+ "indexmap",
  "inputtino",
  "json5",
  "ksni",

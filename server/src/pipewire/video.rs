@@ -4,7 +4,10 @@ use crate::pipewire::portal_auth::{
     PortalToken, SESSION_LOCKED, accept_dialog, get_portal_token, load_persisted_portal_token,
     set_portal_token,
 };
-use crate::{extensions::CancellationTokenExt, pipewire::eis::eis_task};
+use crate::{
+    extensions::CancellationTokenExt,
+    pipewire::eis::{EisTasks, eis_task},
+};
 use anyhow::{Result, anyhow};
 use ashpd::desktop::{
     CreateSessionOptions, PersistMode,
@@ -33,9 +36,9 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    spawn,
     sync::{broadcast::Receiver, broadcast::error::RecvError, mpsc, watch},
-    time::sleep,
+    task::JoinHandle,
+    time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -153,13 +156,33 @@ pub struct EncodedFrame {
 /// [`bitrate`] for the policy.
 const BITRATE_CEILING_KBPS: u32 = 4000;
 
+/// The frame rate the capture pipeline conforms to: the display's refresh
+/// rate, a 60 Hz mode on this output.
+///
+/// A latency bound as much as a picture preference: a frame above refresh
+/// does not smooth anything, it lines up in the decoder's queue where each
+/// is shown later than the last. The virtual output is paced by no CRTC, so
+/// during a drag it re-renders on every damage at ~110 frames/s through the
+/// 60 Hz mode while a client decodes 60–90 — the queue grew for as long as
+/// the drag continued. Conforming the stream to refresh instead feeds the
+/// client exactly what the display would produce: a steady 60 frames/s
+/// whether the screen moves or not, and a decoder queue a frame deep. See
+/// [`build_pipeline`] for where this sits and why it costs nothing.
+const SOURCE_FPS_CAP: u16 = 60;
+
 /// The capture pipeline.
 ///
-/// `videoconvert` is not optional decoration. Every encoder here is VA-API and
+/// The converter is not optional decoration. Every encoder here is VA-API and
 /// accepts only NV12 or P010 — never RGB — while a compositor's screencast may
-/// hand over whatever it likes; on this one it is BGRA, which costs a software
-/// conversion of ~587 MB/s on the single streaming thread (there is no `queue`,
-/// so it costs throughput headroom, which is what becomes latency under load).
+/// hand over whatever it likes; on this one it is BGRA, which a software
+/// conversion of ~587 MB/s costs on the single streaming thread (there is no
+/// `queue`, so it costs throughput headroom, which is what becomes latency
+/// under load). Measured during input spam it was ~two thirds of total server
+/// CPU across two sessions — so when `vapostproc` is installed it is preferred:
+/// it imports the compositor's DMA-BUF as a VA surface and converts BGRA→NV12
+/// on the GPU, leaving the frame in VA-owned memory the encoder adopts without
+/// ever touching host RAM. `videoconvert` remains the portable fallback for
+/// machines without the VA plugin or a usable VPP.
 ///
 /// The converter's *input* is deliberately left unconstrained. Constraining it to
 /// NV12 in the hope of making the conversion a no-op looks tempting and is a trap:
@@ -168,13 +191,64 @@ const BITRATE_CEILING_KBPS: u32 = 4000;
 /// where caps are actually resolved, long after `gst::parse::launch` has
 /// cheerfully returned a pipeline. An unconstrained converter is the portable
 /// choice: it accepts whatever arrives and emits the one format the encoder needs.
-///
-/// GPU conversion (`vaconvert`) would move the work off the CPU where it exists,
-/// and would be worth using if installed.
 fn build_pipeline(raw_fd: i32, node_id: u32, codec: Codec) -> Option<gst::Pipeline> {
+    // Element-existence check only: whether vapostproc can actually VPP *this*
+    // stream's format resolves at PLAYING like any other caps question, and
+    // there is no cheaper way to ask ahead of the portal session. `name=convert`
+    // stays fixed either way so `log_negotiated_formats` reports the chosen
+    // element's pads unchanged.
+    //
+    // `WEBSHOOTER_CONVERT` overrides the choice in either direction, because a
+    // driver's VPP can misbehave for one particular stream in ways an existence
+    // check cannot see — and settling that question should not cost a rebuild.
+    let default = || {
+        if gst::ElementFactory::find("vapostproc").is_some() {
+            ("vapostproc", "GPU-side BGRA->NV12, DMA-BUF in")
+        } else {
+            ("videoconvert", "software fallback; vapostproc not installed")
+        }
+    };
+    let forced = std::env::var("WEBSHOOTER_CONVERT");
+    let (convert, why) = match forced.as_deref() {
+        Ok(v @ ("vapostproc" | "videoconvert")) => (v, "forced by $WEBSHOOTER_CONVERT"),
+        Ok(other) => {
+            log::warn!(
+                "WEBSHOOTER_CONVERT={other:?} is not vapostproc or videoconvert; \
+                 using the default"
+            );
+            default()
+        }
+        Err(_) => default(),
+    };
+    log::info!("convert={convert} ({why})");
+
+    // Conform the stream to [`SOURCE_FPS_CAP`] — the display's refresh rate —
+    // as a `videorate` with a fixed-framerate caps filter in front of the
+    // converter. The decisions are made from the timestamps `do-timestamp`
+    // puts on the source's buffers (see the launch string below): excess
+    // frames during motion are dropped *here*, before conversion, on the
+    // streaming thread, and a DMA-BUF passes through by reference — the
+    // zero-copy path is untouched. When the screen is static, videorate
+    // repeats the held frame instead, which is what matching the refresh
+    // rate means — the client sees the display's cadence either way, and
+    // repeating a buffered DMA-BUF costs a reference, not a conversion.
+    //
+    // Without the element the pipeline still runs; it is merely the
+    // growing-latency bug again, which is why this is a warning and not a
+    // hard dependency.
+    let rate = if gst::ElementFactory::find("videorate").is_some() {
+        log::info!("rate: conforming stream to display refresh {SOURCE_FPS_CAP} fps");
+        format!("videorate ! video/x-raw,framerate={SOURCE_FPS_CAP}/1 ! ")
+    } else {
+        log::warn!(
+            "videorate not installed; source rate uncapped — clients queue \
+             whatever their decoder cannot keep up with"
+        );
+        String::new()
+    };
     gst::parse::launch(&format!(
-        "pipewiresrc name=src fd={raw_fd} path={node_id} \
-     ! videoconvert name=convert \
+        "pipewiresrc name=src do-timestamp=true fd={raw_fd} path={node_id} \
+     ! {rate}{convert} name=convert \
      ! {encoder} name=enc rate-control=vbr bitrate={bitrate} target-percentage=75 \
      ! appsink name=sink sync=false",
         encoder = codec.gst_encoder_element(),
@@ -455,391 +529,493 @@ async fn single_capture(
             .r(remote_desktop.create_session(CreateSessionOptions::default()))
             .await?;
 
-        // The restore token from the previous start() lets select_devices
-        // restore the same device permissions without showing a dialog.
-        let select_dev_opts = SelectDevicesOptions::default()
-            .set_restore_token(get_portal_token(portal_token).as_deref())
-            .set_devices(Some(
-                DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
-            ))
-            .set_persist_mode(PersistMode::ExplicitlyRevoked);
-        accept_dialog(
-            &mut portal_kb,
-            cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
-        )
-        .await?;
-
-        accept_dialog(
-            &mut portal_kb,
-            cancel.r(screencast.select_sources(
-                &session,
-                SelectSourcesOptions::default()
-                    .set_multiple(true)
-                    .set_sources(Some(BitFlags::from(source_type)))
-                    .set_cursor_mode(CursorMode::Embedded),
-            )),
-        )
-        .await?;
-
-        let request = accept_dialog(
-            &mut portal_kb,
-            cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
-        )
-        .await?;
-        let started = request.response()?;
-
-        drop(portal_kb);
-
-        // The restore token lets the next capture skip the select_devices
-        // dialog.  Source selection and start() always show dialogs.
-        let token = started.restore_token();
-        if let Some(token) = token {
-            set_portal_token(portal_token, token.to_owned());
-        }
-
-        let streams = started.streams();
-        let stream = pick_stream(streams, width, height).ok_or_else(|| {
-            // Naming what *was* offered is the difference between a
-            // diagnosable failure and a guessing game: "no stream" alone cannot
-            // distinguish a portal that offered nothing from one that offered
-            // every size except the right shape.
-            let offered = streams
-                .iter()
-                .map(|s| match s.size() {
-                    Some((w, h)) => format!("{w}x{h}"),
-                    None => "unsized".to_owned(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow!(
-                "no stream of the right shape for {width}x{height} from portal start; \
-                 it offered [{}]",
-                if offered.is_empty() {
-                    "nothing"
-                } else {
-                    &offered
-                }
+        // All work below belongs to this portal session, including work created
+        // before PLAYING. Always run the common teardown, even when a portal or
+        // GStreamer setup step fails.
+        let iteration_cancel = cancel.child_token();
+        let mut pipeline_to_stop: Option<gst::Pipeline> = None;
+        let mut bus_task: Option<JoinHandle<()>> = None;
+        let mut keyframe_task: Option<JoinHandle<()>> = None;
+        let mut bitrate_task: Option<JoinHandle<()>> = None;
+        let mut rate_task: Option<JoinHandle<()>> = None;
+        let mut input_tasks: Option<EisTasks> = None;
+        let result: Result<Option<(u16, u16, u8)>> = async {
+            // The restore token from the previous start() lets select_devices
+            // restore the same device permissions without showing a dialog.
+            let select_dev_opts = SelectDevicesOptions::default()
+                .set_restore_token(get_portal_token(portal_token).as_deref())
+                .set_devices(Some(
+                    DeviceType::Touchscreen | DeviceType::Pointer | DeviceType::Keyboard,
+                ))
+                .set_persist_mode(PersistMode::ExplicitlyRevoked);
+            accept_dialog(
+                &mut portal_kb,
+                cancel.r(remote_desktop.select_devices(&session, select_dev_opts)),
             )
-        })?;
-        if let Some((w, h)) = stream.size() {
-            // The portal is allowed to answer with a different resolution than
-            // the one asked for (it does, and did: two thirds of it), so this
-            // is expected rather than alarming — but it changes what the client
-            // is paying for in bitrate, so it is worth being able to see.
-            if (w as u16) != width || (h as u16) != height {
-                log::info!(
-                    "portal streamed at {w}x{h} rather than the requested \
-                     {width}x{height}; same shape, different detail"
-                );
-            }
-        }
-        let node_id = stream.pipe_wire_node_id();
-        let stream_pos = stream.position().unwrap_or((0, 0));
-
-        let pw_fd = cancel
-            .r(screencast.open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
             .await?;
-        let raw_fd = pw_fd.into_raw_fd();
 
-        // --- GStreamer pipeline --------------------------------------------------
+            accept_dialog(
+                &mut portal_kb,
+                cancel.r(screencast.select_sources(
+                    &session,
+                    SelectSourcesOptions::default()
+                        .set_multiple(true)
+                        .set_sources(Some(BitFlags::from(source_type)))
+                        .set_cursor_mode(CursorMode::Embedded),
+                )),
+            )
+            .await?;
 
-        // Pick the best codec that the client supports.
-        let decoders = decoder_caps.lock().unwrap().clone().unwrap_or_default();
-        let codec = select_codec(&decoders);
-        println!("[video] selected codec: {codec:?} (client decoders: {decoders:?})");
+            let request = accept_dialog(
+                &mut portal_kb,
+                cancel.r(remote_desktop.start(&session, None, StartOptions::default())),
+            )
+            .await?;
+            let started = request.response()?;
 
-        gst::init()?;
-        // The ceiling, and the starting point. `bitrate::next_bitrate` may only
-        // move this down while the path is congested and back up to exactly
-        // this value — never past it.
-        //
-        // The link this runs on measures about 7 Mbit/s, and a keyframe is
-        // 25-30x a delta. At 7 Mbit/s of video there is no headroom for one:
-        // a 67 KB keyframe is a 77 ms freeze, and the deltas produced behind
-        // it push the total past what the link carries, so the keyframe itself
-        // is what loses the frames that ask for the next one. The ceiling is
-        // set below the link's capacity so a keyframe fits inside the space
-        // the deltas leave, which is the only thing that breaks the loop.
-        let pipeline = build_pipeline(raw_fd, node_id, codec)
-            .ok_or(anyhow!("could not build the capture pipeline"))?;
+            drop(portal_kb);
 
-        // Keyframes are produced only when the client asks for one. The client is
-        // the only party that knows whether its prediction chain is broken, and a
-        // keyframe is the most expensive thing on the link by a wide margin
-        // (measured ~72 KB against ~16 KB for a delta), so a schedule the server
-        // picks for itself spends the link on frames nobody needs — and a
-        // periodic one guarantees the client pays for a burst of them every
-        // period, right when the link is already struggling.
-        let encoder = pipeline
-            .by_name("enc")
-            .ok_or(anyhow!("no encoder element"))?;
-        {
-            let mut keyframe_rx = client_rx.resubscribe();
-            let encoder = encoder.clone();
-            let cancel = cancel.clone();
-            spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        msg = keyframe_rx.recv() => match msg {
-                            Ok(ClientDatagram::RequestKeyframe) => force_keyframe(&encoder),
-                            Ok(_) => continue,
-                            // The request may be in the messages this receiver just
-                            // missed, and the client cannot recover on its own: it
-                            // is holding frames waiting for a keyframe that nothing
-                            // is going to send, so the display stays frozen until
-                            // the session restarts. A keyframe nobody asked for is
-                            // cheap next to that, so err towards sending one.
-                            Err(RecvError::Lagged(_)) => force_keyframe(&encoder),
-                            Err(RecvError::Closed) => break,
+            // The restore token lets the next capture skip the select_devices
+            // dialog.  Source selection and start() always show dialogs.
+            let token = started.restore_token();
+            if let Some(token) = token {
+                set_portal_token(portal_token, token.to_owned());
+            }
+
+            let streams = started.streams();
+            let stream = pick_stream(streams, width, height).ok_or_else(|| {
+                // Naming what *was* offered is the difference between a
+                // diagnosable failure and a guessing game: "no stream" alone cannot
+                // distinguish a portal that offered nothing from one that offered
+                // every size except the right shape.
+                let offered = streams
+                    .iter()
+                    .map(|s| match s.size() {
+                        Some((w, h)) => format!("{w}x{h}"),
+                        None => "unsized".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow!(
+                    "no stream of the right shape for {width}x{height} from portal start; \
+                 it offered [{}]",
+                    if offered.is_empty() {
+                        "nothing"
+                    } else {
+                        &offered
+                    }
+                )
+            })?;
+            if let Some((w, h)) = stream.size() {
+                // The portal is allowed to answer with a different resolution than
+                // the one asked for (it does, and did: two thirds of it), so this
+                // is expected rather than alarming — but it changes what the client
+                // is paying for in bitrate, so it is worth being able to see.
+                if (w as u16) != width || (h as u16) != height {
+                    log::info!(
+                        "portal streamed at {w}x{h} rather than the requested \
+                     {width}x{height}; same shape, different detail"
+                    );
+                }
+            }
+            let node_id = stream.pipe_wire_node_id();
+            let stream_pos = stream.position().unwrap_or((0, 0));
+
+            let pw_fd =
+                cancel
+                    .r(screencast
+                        .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default()))
+                    .await?;
+            let raw_fd = pw_fd.into_raw_fd();
+
+            // --- GStreamer pipeline --------------------------------------------------
+
+            // Pick the best codec that the client supports.
+            let decoders = decoder_caps.lock().unwrap().clone().unwrap_or_default();
+            let codec = select_codec(&decoders);
+            println!("[video] selected codec: {codec:?} (client decoders: {decoders:?})");
+
+            gst::init()?;
+            // The ceiling, and the starting point. `bitrate::next_bitrate` may only
+            // move this down while the path is congested and back up to exactly
+            // this value — never past it.
+            //
+            // The link this runs on measures about 7 Mbit/s, and a keyframe is
+            // 25-30x a delta. At 7 Mbit/s of video there is no headroom for one:
+            // a 67 KB keyframe is a 77 ms freeze, and the deltas produced behind
+            // it push the total past what the link carries, so the keyframe itself
+            // is what loses the frames that ask for the next one. The ceiling is
+            // set below the link's capacity so a keyframe fits inside the space
+            // the deltas leave, which is the only thing that breaks the loop.
+            let pipeline = build_pipeline(raw_fd, node_id, codec)
+                .ok_or(anyhow!("could not build the capture pipeline"))?;
+            pipeline_to_stop = Some(pipeline.clone());
+
+            // Frame-rate accounting, so a frozen or lagging client sorts to its
+            // cause from one log line instead of inference: `src` counts frames
+            // the compositor hands the pipeline — a low number there is
+            // source-side (a static output, a compositor not repainting) and no
+            // change to this pipeline can raise it — while `enc` counts frames
+            // the encoder emitted and the third number is backpressure the
+            // publisher could not absorb. The 5s cadence lines these rates up
+            // with the EIS input summaries in the same log.
+            let src_frames = Arc::new(AtomicU64::new(0));
+            let enc_frames = Arc::new(AtomicU64::new(0));
+            let dropped_frames = Arc::new(AtomicU64::new(0));
+            // Both buffer and buffer-list probes: a BUFFER-only probe counts
+            // nothing when the source pushes a list, which showed up in the
+            // log as an impossible "compositor 0 -> encoded 850" rate line.
+            // And if there is no pad to attach to, say so — the silent `if
+            // let` made that indistinguishable from a source that stopped.
+            match pipeline
+                .by_name("src")
+                .and_then(|src| src.static_pad("src"))
+            {
+                Some(pad) => {
+                    let counter = Arc::clone(&src_frames);
+                    pad.add_probe(
+                        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                        move |_, _| {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            gst::PadProbeReturn::Ok
                         },
-                    }
-                }
-            });
-        }
-
-        {
-            let cancel = cancel.clone();
-            spawn(govern_bitrate(encoder.clone(), pressure_rx.clone(), cancel));
-        }
-
-        let appsink = pipeline
-            .by_name("sink")
-            .ok_or(anyhow!("no sink element"))?
-            .downcast::<gst_app::AppSink>()
-            .map_err(|_| anyhow!("not an appsink"))?;
-
-        let (cursor_tx, cursor_rx) = mpsc::channel::<(i32, i32)>(32);
-        let tx = frame_tx.clone();
-        appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-
-                    // Extract compositor cursor position from
-                    // GstVideoRegionOfInterestMeta("cursor") emitted by
-                    // pipewiresrc when CursorMode::Embedded is set.
-                    if let Some(meta) = buffer.meta::<gst_video::VideoRegionOfInterestMeta>()
-                        && meta.roi_type() == "cursor"
-                    {
-                        let (x, y, _w, _h) = meta.rect();
-                        let _ = cursor_tx.try_send((x as i32, y as i32));
-                    }
-
-                    let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-                    let frame = EncodedFrame {
-                        data: buffer.to_owned(),
-                        is_keyframe,
-                        codec,
-                    };
-                    // Backpressure: if the consumer can't keep up, drop this
-                    // frame rather than returning FlowError::Error, which would
-                    // tear down the whole GStreamer pipeline and trigger a
-                    // restart storm.
-                    if tx.try_send(frame).is_err() {
-                        return Ok(gst::FlowSuccess::Ok);
-                    }
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
-
-        // Log what resolution the pipeline *actually* negotiated, next to the
-        // size the portal reported.
-        //
-        // These are not the same number, and which is which decides where input
-        // coordinates belong. The portal reports a stream's size in logical
-        // units — divided by the output's scale — while the frames on the
-        // PipeWire node are physical pixels. On a 150%-scaled desktop that makes
-        // the two differ by exactly 1.5, so a client that reports coordinates in
-        // frame pixels and a portal that accepts them in the reported units are
-        // talking past each other by that factor, and nothing in the error
-        // messages says so.
-        if let Some(enc) = pipeline.by_name("enc")
-            && let Some(pad) = enc.static_pad("src")
-        {
-            let requested = (width, height);
-            let reported = stream.size().map(|(w, h)| (w as u16, h as u16));
-            pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
-                // The pad's negotiated caps are what the encoder is really
-                // being fed, which is the question being asked here.
-                let size = pad.current_caps().and_then(|caps| {
-                    let s = caps.structure(0)?;
-                    Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
-                });
-                if let Some((w, h)) = size {
-                    log::info!(
-                        "encoder is fed {w}x{h} (monitor {requested:?}, \
-                         portal reported {reported:?})"
-                    );
-                } else {
-                    log::info!(
-                        "encoder caps unreadable (monitor {requested:?}, \
-                         portal reported {reported:?})"
                     );
                 }
-                // One look is all that is needed; the negotiated caps do not
-                // change without the pipeline being rebuilt.
-                gst::PadProbeReturn::Remove
-            });
-        }
-
-        // Carries *why* a restart was asked for, because the two reasons need
-        // different things read back out of the log hours later: a GPU loss is
-        // about the encoder, a lost input device is about the compositor
-        // replacing its handles.
-        let (pipeline_restart, mut pipeline_restart_watcher) =
-            tokio::sync::watch::channel(None::<&'static str>);
-        let pipeline_restart = Arc::new(pipeline_restart);
-        {
-            let bus = pipeline.bus().ok_or(anyhow!("no pipeline bus"))?;
-            let pipeline_ref = pipeline.clone();
-            let pipeline_restart = pipeline_restart.clone();
-            let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || {
-                // Exit on cancellation as well as EOS/Error, otherwise this
-                // task would block forever (iter_timed with no timeout) and
-                // keep a strong ref to the pipeline — preventing it from ever
-                // being finalized and leaking the VA-API encoder context across
-                // sessions.
-                loop {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) else {
-                        continue;
-                    };
-                    match msg.view() {
-                        gst::MessageView::Eos(_) | gst::MessageView::Error(_) => {
-                            if let gst::MessageView::Error(err) = msg.view() {
-                                let err_str = format!(
-                                    "{} — {}",
-                                    err.error(),
-                                    err.debug().unwrap_or_default()
+                None => log::warn!("frame-rate probe: pipewiresrc has no src pad to attach to"),
+            }
+            rate_task = Some(tokio::spawn({
+                let src_frames = Arc::clone(&src_frames);
+                let enc_frames = Arc::clone(&enc_frames);
+                let dropped_frames = Arc::clone(&dropped_frames);
+                let cancel = iteration_cancel.clone();
+                async move {
+                    let mut tick = tokio::time::interval_at(
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        Duration::from_secs(5),
+                    );
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            _ = tick.tick() => {
+                                let src = src_frames.swap(0, Ordering::Relaxed);
+                                let enc = enc_frames.swap(0, Ordering::Relaxed);
+                                let dropped = dropped_frames.swap(0, Ordering::Relaxed);
+                                log::info!(
+                                    "frame rate: compositor {src} ({:.1}/s) -> \
+                                     encoded {enc} ({:.1}/s), dropped {dropped}",
+                                    src as f64 / 5.0,
+                                    enc as f64 / 5.0,
                                 );
-                                if err_str.contains("context") && err_str.contains("lost")
-                                    || err_str.contains("hard recovery")
-                                    || err_str.contains("context is lost")
-                                    || err_str.contains("GPU")
-                                    || err_str.contains("vaapi")
-                                    || err_str.contains("amf")
-                                {
-                                    log::error!("GPU context loss detected: {err_str}");
-                                    let _ = pipeline_restart.send(Some("GPU context lost"));
-                                }
                             }
-                            let _ = pipeline_ref.set_state(gst::State::Null);
+                        }
+                    }
+                }
+            }));
+
+            // Keyframes are produced only when the client asks for one. The client is
+            // the only party that knows whether its prediction chain is broken, and a
+            // keyframe is the most expensive thing on the link by a wide margin
+            // (measured ~72 KB against ~16 KB for a delta), so a schedule the server
+            // picks for itself spends the link on frames nobody needs — and a
+            // periodic one guarantees the client pays for a burst of them every
+            // period, right when the link is already struggling.
+            let encoder = pipeline
+                .by_name("enc")
+                .ok_or(anyhow!("no encoder element"))?;
+            {
+                let mut keyframe_rx = client_rx.resubscribe();
+                let encoder = encoder.clone();
+                let cancel = iteration_cancel.clone();
+                keyframe_task = Some(tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            msg = keyframe_rx.recv() => match msg {
+                                Ok(ClientDatagram::RequestKeyframe) => force_keyframe(&encoder),
+                                Ok(_) => continue,
+                                // The request may be in the messages this receiver just
+                                // missed, and the client cannot recover on its own: it
+                                // is holding frames waiting for a keyframe that nothing
+                                // is going to send, so the display stays frozen until
+                                // the session restarts. A keyframe nobody asked for is
+                                // cheap next to that, so err towards sending one.
+                                Err(RecvError::Lagged(_)) => force_keyframe(&encoder),
+                                Err(RecvError::Closed) => break,
+                            },
+                        }
+                    }
+                }));
+            }
+
+            bitrate_task = Some(tokio::spawn(govern_bitrate(
+                encoder.clone(),
+                pressure_rx.clone(),
+                iteration_cancel.clone(),
+            )));
+
+            let appsink = pipeline
+                .by_name("sink")
+                .ok_or(anyhow!("no sink element"))?
+                .downcast::<gst_app::AppSink>()
+                .map_err(|_| anyhow!("not an appsink"))?;
+
+            let (cursor_tx, cursor_rx) = mpsc::channel::<(i32, i32)>(32);
+            let tx = frame_tx.clone();
+            let enc_counter = Arc::clone(&enc_frames);
+            let drop_counter = Arc::clone(&dropped_frames);
+            appsink.set_callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |sink| {
+                        let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        enc_counter.fetch_add(1, Ordering::Relaxed);
+                        let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+
+                        // Extract compositor cursor position from
+                        // GstVideoRegionOfInterestMeta("cursor") emitted by
+                        // pipewiresrc when CursorMode::Embedded is set.
+                        if let Some(meta) = buffer.meta::<gst_video::VideoRegionOfInterestMeta>()
+                            && meta.roi_type() == "cursor"
+                        {
+                            let (x, y, _w, _h) = meta.rect();
+                            let _ = cursor_tx.try_send((x as i32, y as i32));
+                        }
+
+                        let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                        let frame = EncodedFrame {
+                            data: buffer.to_owned(),
+                            is_keyframe,
+                            codec,
+                        };
+                        // Backpressure: if the consumer can't keep up, drop this
+                        // frame rather than returning FlowError::Error, which would
+                        // tear down the whole GStreamer pipeline and trigger a
+                        // restart storm.
+                        if tx.try_send(frame).is_err() {
+                            drop_counter.fetch_add(1, Ordering::Relaxed);
+                            return Ok(gst::FlowSuccess::Ok);
+                        }
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+
+            // Log what resolution the pipeline *actually* negotiated, next to the
+            // size the portal reported.
+            //
+            // These are not the same number, and which is which decides where input
+            // coordinates belong. The portal reports a stream's size in logical
+            // units — divided by the output's scale — while the frames on the
+            // PipeWire node are physical pixels. On a 150%-scaled desktop that makes
+            // the two differ by exactly 1.5, so a client that reports coordinates in
+            // frame pixels and a portal that accepts them in the reported units are
+            // talking past each other by that factor, and nothing in the error
+            // messages says so.
+            if let Some(enc) = pipeline.by_name("enc")
+                && let Some(pad) = enc.static_pad("src")
+            {
+                let requested = (width, height);
+                let reported = stream.size().map(|(w, h)| (w as u16, h as u16));
+                pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
+                    // The pad's negotiated caps are what the encoder is really
+                    // being fed, which is the question being asked here.
+                    let size = pad.current_caps().and_then(|caps| {
+                        let s = caps.structure(0)?;
+                        Some((s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?))
+                    });
+                    if let Some((w, h)) = size {
+                        log::info!(
+                            "encoder is fed {w}x{h} (monitor {requested:?}, \
+                         portal reported {reported:?})"
+                        );
+                    } else {
+                        log::info!(
+                            "encoder caps unreadable (monitor {requested:?}, \
+                         portal reported {reported:?})"
+                        );
+                    }
+                    // One look is all that is needed; the negotiated caps do not
+                    // change without the pipeline being rebuilt.
+                    gst::PadProbeReturn::Remove
+                });
+            }
+
+            // Carries *why* a restart was asked for, because the two reasons need
+            // different things read back out of the log hours later: a GPU loss is
+            // about the encoder, a lost input device is about the compositor
+            // replacing its handles.
+            let (pipeline_restart, mut pipeline_restart_watcher) =
+                tokio::sync::watch::channel(None::<&'static str>);
+            let pipeline_restart = Arc::new(pipeline_restart);
+            {
+                let bus = pipeline.bus().ok_or(anyhow!("no pipeline bus"))?;
+                let pipeline_ref = pipeline.clone();
+                let pipeline_restart = pipeline_restart.clone();
+                let cancel = iteration_cancel.clone();
+                bus_task = Some(tokio::task::spawn_blocking(move || {
+                    // Exit on cancellation as well as EOS/Error, otherwise this
+                    // task would block forever (iter_timed with no timeout) and
+                    // keep a strong ref to the pipeline — preventing it from ever
+                    // being finalized and leaking the VA-API encoder context across
+                    // sessions.
+                    loop {
+                        if cancel.is_cancelled() {
                             break;
                         }
-                        _ => {}
+                        let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) else {
+                            continue;
+                        };
+                        match msg.view() {
+                            gst::MessageView::Eos(_) | gst::MessageView::Error(_) => {
+                                if let gst::MessageView::Error(err) = msg.view() {
+                                    let err_str = format!(
+                                        "{} — {}",
+                                        err.error(),
+                                        err.debug().unwrap_or_default()
+                                    );
+                                    if err_str.contains("context") && err_str.contains("lost")
+                                        || err_str.contains("hard recovery")
+                                        || err_str.contains("context is lost")
+                                        || err_str.contains("GPU")
+                                        || err_str.contains("vaapi")
+                                        || err_str.contains("amf")
+                                    {
+                                        log::error!("GPU context loss detected: {err_str}");
+                                        let _ = pipeline_restart.send(Some("GPU context lost"));
+                                    }
+                                }
+                                let _ = pipeline_ref.set_state(gst::State::Null);
+                                break;
+                            }
+                            _ => {}
+                        }
                     }
+                }));
+            }
+
+            pipeline.set_state(gst::State::Playing).map_err(|e| {
+                let bus_msg = pipeline
+                    .bus()
+                    .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
+                    .and_then(|msg| {
+                        if let gst::MessageView::Error(err) = msg.view() {
+                            Some(format!(
+                                "{} — {}",
+                                err.error(),
+                                err.debug().unwrap_or_default()
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| format!("{e:?}"));
+                let _ = pipeline.set_state(gst::State::Null);
+                anyhow!("Pipeline failed to enter Playing state: {bus_msg}")
+            })?;
+            // Once PLAYING, and therefore once caps have actually been negotiated
+            // from the live stream rather than from what the elements advertise.
+            log_negotiated_formats(&pipeline);
+
+            // Connect to the EIS implementation for touch injection. This
+            // replaces the NotifyTouch* portal calls which are a no-op on KDE
+            // and many wlroots-based compositors.
+            let eis_fd = match cancel
+                .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
+                .await
+            {
+                Ok(fd) => fd,
+                Err(e) => {
+                    println!("[video] connect_to_eis: {e:#}, retrying in 500ms");
+                    sleep(Duration::from_millis(500)).await;
+                    cancel
+                        .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
+                        .await?
                 }
-            });
+            };
+
+            input_tasks = Some(eis_task(
+                eis_fd,
+                stream_pos,
+                (width, height),
+                client_id,
+                pipeline_restart.clone(),
+                client_rx,
+                &server_msg_tx,
+                cursor_rx,
+                &iteration_cancel,
+            )?);
+
+            // Wait for the next resize (or cancellation or GPU loss) before tearing
+            // down.  virtual_monitor must stay alive here — dropping it kills krfb.
+            let next_dims = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break None,
+                    _ = pipeline_restart_watcher.changed() => {
+                        log::warn!(
+                            "{}; restarting capture pipeline",
+                            pipeline_restart_watcher
+                                .borrow_and_update()
+                                .unwrap_or("restart requested")
+                        );
+                        break Some((width, height, index));
+                    },
+                    msg = client_rx.recv() => match msg {
+                        Ok(ClientDatagram::DisplayParameters { width, height, .. }) => {
+                            log::info!("resize: rebuilding capture at {width}x{height}");
+                            break Some((width, height, index));
+                        }
+                        Ok(ClientDatagram::Keyboard { keycode: _, modifiers: _ }) => {
+                            // Handled by the EIS input task in touch.rs
+                        }
+                        Ok(_) => continue,
+                        // A stalled consumer is not a lost session: keep the
+                        // pipeline up and wait for the next resize, as above.
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break None,
+                    },
+                }
+            };
+
+            Ok(next_dims)
         }
+        .await;
 
-        pipeline.set_state(gst::State::Playing).map_err(|e| {
-            let bus_msg = pipeline
-                .bus()
-                .and_then(|bus| bus.pop_filtered(&[gst::MessageType::Error]))
-                .and_then(|msg| {
-                    if let gst::MessageView::Error(err) = msg.view() {
-                        Some(format!(
-                            "{} — {}",
-                            err.error(),
-                            err.debug().unwrap_or_default()
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| format!("{e:?}"));
-            let _ = pipeline.set_state(gst::State::Null);
-            anyhow!("Pipeline failed to enter Playing state: {bus_msg}")
-        })?;
-        // Once PLAYING, and therefore once caps have actually been negotiated
-        // from the live stream rather than from what the elements advertise.
-        log_negotiated_formats(&pipeline);
-
-        // Connect to the EIS implementation for touch injection. This
-        // replaces the NotifyTouch* portal calls which are a no-op on KDE
-        // and many wlroots-based compositors.
-        let eis_fd = match cancel
-            .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
+        iteration_cancel.cancel();
+        if let Some(tasks) = input_tasks {
+            tasks.stop().await;
+        }
+        if let Some(task) = keyframe_task {
+            let _ = task.await;
+        }
+        if let Some(task) = bitrate_task {
+            let _ = task.await;
+        }
+        if let Some(task) = rate_task {
+            let _ = task.await;
+        }
+        if let Some(pipeline) = pipeline_to_stop
+            && let Err(e) = tokio::task::spawn_blocking(move || {
+                let _ = pipeline.set_state(gst::State::Null);
+            })
             .await
         {
-            Ok(fd) => fd,
-            Err(e) => {
-                println!("[video] connect_to_eis: {e:#}, retrying in 500ms");
-                sleep(Duration::from_millis(500)).await;
-                cancel
-                    .r(remote_desktop.connect_to_eis(&session, ConnectToEISOptions::default()))
-                    .await?
-            }
-        };
-
-        let touch_task = eis_task(
-            eis_fd,
-            stream_pos,
-            (width, height),
-            client_id,
-            pipeline_restart.clone(),
-            client_rx,
-            &server_msg_tx,
-            cursor_rx,
-            cancel,
-        );
-
-        // Wait for the next resize (or cancellation or GPU loss) before tearing
-        // down.  virtual_monitor must stay alive here — dropping it kills krfb.
-        *last_dims = loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break None,
-                _ = pipeline_restart_watcher.changed() => {
-                    log::warn!(
-                        "{}; restarting capture pipeline",
-                        pipeline_restart_watcher
-                            .borrow_and_update()
-                            .unwrap_or("restart requested")
-                    );
-                    break Some((width, height, index));
-                },
-                msg = client_rx.recv() => match msg {
-                    Ok(ClientDatagram::DisplayParameters { width, height, .. }) => {
-                        log::info!("resize: rebuilding capture at {width}x{height}");
-                        break Some((width, height, index));
-                    }
-                    Ok(ClientDatagram::Keyboard { keycode: _, modifiers: _ }) => {
-                        // Handled by the EIS input task in touch.rs
-                    }
-                    Ok(_) => continue,
-                    // A stalled consumer is not a lost session: keep the
-                    // pipeline up and wait for the next resize, as above.
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => break None,
-                },
-            }
-        };
-
-        touch_task.abort();
-        tokio::task::spawn_blocking({
-            let pipeline = pipeline.clone();
-            move || {
-                let _ = pipeline.set_state(gst::State::Null);
-            }
-        })
-        .await?;
-        // Explicitly close the portal session so the compositor releases
-        // the capture/input grants.  Drop alone does not call the D-Bus
-        // Session.Close method.
-        if let Err(e) = session.close().await {
-            println!("[video] failed to close portal session: {e:#}");
+            log::warn!("pipeline stop task failed: {e}");
         }
-        // virtual_monitor, remote_desktop, screencast, pw_fd, eis_fd
-        // dropped here.  Next loop iteration creates fresh ones.
-
+        if let Some(task) = bus_task {
+            let _ = task.await;
+        }
+        // Drop does not send Session.Close. Bound the D-Bus round trip so a
+        // stalled portal cannot keep an otherwise cancelled session alive.
+        match timeout(Duration::from_secs(2), session.close()).await {
+            Ok(Err(e)) => log::warn!("failed to close portal session: {e:#}"),
+            Err(_) => log::warn!("timed out closing portal session"),
+            Ok(Ok(())) => {}
+        }
+        // Keep the virtual monitor alive through pipeline and portal teardown.
+        drop(virtual_monitor);
+        *last_dims = result?;
         if last_dims.is_none() {
             return Ok(());
         }

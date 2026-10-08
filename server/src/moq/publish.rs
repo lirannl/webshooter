@@ -55,6 +55,7 @@ use shared::codec::Codec;
 use shared::server_datagram::ServerDatagram;
 use shared::track_names::{AUDIO_TRACK, BROADCAST, video_track};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::transport::WtSession;
 
@@ -276,14 +277,17 @@ pub(crate) struct Publisher {
     /// never read, rather than being dropped straight after the handshake.
     _origin: origin::Producer,
     tracks: Tracks,
+    /// Taken by the media pump; aborted on drop if it was never taken.
+    driver: Option<JoinHandle<()>>,
 }
 
 impl Publisher {
     /// Run the MoQ handshake on `session` and prepare to publish into it.
     ///
-    /// The returned publisher owns the origin and the tracks; the handshake's driver
-    /// is already running. If the handshake fails the session is closed by
-    /// `moq-net` before this returns, so there is nothing to clean up but the error.
+    /// The returned publisher owns the origin, tracks, and running driver. The
+    /// caller should take the driver handle for session supervision. If the
+    /// handshake fails the session is closed by `moq-net` before this returns,
+    /// so there is nothing to clean up but the error.
     pub(crate) async fn start(
         session: WtSession,
         control_tx: mpsc::Sender<ServerDatagram>,
@@ -299,7 +303,7 @@ impl Publisher {
 
         // Both drivers are polled by one loop: the session driver moves bytes and
         // the origin driver moves content, and neither makes the other progress.
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let outcome = moq_net::time::run(Both {
                 session: session_driver,
                 origin: origin_driver,
@@ -315,7 +319,22 @@ impl Publisher {
         Ok(Self {
             _origin: origin,
             tracks,
+            driver: Some(driver),
         })
+    }
+
+    /// Give the running MoQ driver to the session supervisor for tracking.
+    /// If not taken, dropping the publisher aborts the driver instead of detaching it.
+    pub(crate) fn take_driver(&mut self) -> Option<JoinHandle<()>> {
+        self.driver.take()
+    }
+}
+
+impl Drop for Publisher {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+        }
     }
 }
 

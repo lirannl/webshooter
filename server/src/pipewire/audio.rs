@@ -30,27 +30,41 @@ pub struct AudioSink {
     thread: Option<JoinHandle<()>>,
     #[allow(dead_code)]
     pipeline: gst::Pipeline,
-    /// Handle to the sink's PipeWire main loop, used to wake/quit it from
-    /// `Drop` (which runs on a different thread than the one driving it).
-    mainloop_ptr: MainLoopPtr,
 }
 
-/// Wrapper around the raw PipeWire main-loop pointer. The pointer is only ever
-/// passed to the thread-safe `pw_main_loop_quit`, so it is safe to send between
-/// threads (the raw pointer type itself is `!Send`).
-struct MainLoopPtr(*mut pw::sys::pw_main_loop);
-unsafe impl Send for MainLoopPtr {}
+/// Covers the interval before an AudioSink exists. In particular, the caller
+/// can drop the startup future on session teardown while PipeWire is still
+/// registering the sink; dropping a bare JoinHandle would detach that thread.
+struct SinkStartup {
+    cancel: CancellationToken,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for SinkStartup {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.cancel.cancel();
+        // A future can be dropped by its owner without returning from
+        // start_audio_sink. Hand off the join to the blocking pool so we don't
+        // stall the async executor; the reaper owns the OS thread to completion.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = thread.join();
+            });
+        } else {
+            let _ = thread.join();
+        }
+    }
+}
 
 impl Drop for AudioSink {
     fn drop(&mut self) {
-        // Stop the GStreamer pipeline and wake the sink's main loop so the
-        // background thread returns and its PipeWire connection (and the
-        // application-owned sink node) is torn down.
-        let _ = self.pipeline.set_state(gst::State::Null);
-        unsafe {
-            pw::sys::pw_main_loop_quit(self.mainloop_ptr.0);
-        }
+        // Stop the GStreamer pipeline; the thread-local PipeWire timer notices
+        // cancellation and quits its loop, releasing the sink node.
         self.cancel.cancel();
+        let _ = self.pipeline.set_state(gst::State::Null);
         // Wait for the sink's background thread to actually return so its
         // PipeWire connection (and the `object.linger=false` sink node) is
         // removed from the graph.  Without this, the thread is merely detached
@@ -193,14 +207,11 @@ pub async fn start_audio_sink(
     // cancel the surrounding session — only this audio subtree.
     let audio_cancel = cancel.child_token();
     let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(256);
-    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<(u32, MainLoopPtr)>();
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<u32>();
 
-    // The background thread is told to quit by watching the *parent* `cancel`
-    // token (not the child one): if this call bails out on cancellation before
-    // an `AudioSink` is ever constructed, there is no handle to wake the loop,
-    // so the thread would otherwise leak its PipeWire connection (and the
-    // `object.linger=false` sink node) forever.
-    let cancel_thread = cancel.clone();
+    // The same child token is cancelled on every startup failure, so the
+    // thread can always be reaped even before an AudioSink exists.
+    let cancel_thread = audio_cancel.clone();
     let name_thread = name.clone();
     let channels_thread = channels;
     let thread = std::thread::spawn(move || {
@@ -208,83 +219,101 @@ pub async fn start_audio_sink(
             eprintln!("[audio] sink error: {e:#}");
         }
     });
-
-    // Wait for the sink node to be created (or cancellation).
-    let (_sink_id, mainloop_ptr) = tokio::select! {
-        _ = cancel.cancelled() => {
-            // Cancelled before the sink was ready.  The sink thread watches the
-            // same parent token and will quit its loop (removing the node) on
-            // its own; reap the thread on a helper so returning doesn't block
-            // the tokio worker, and leave it a moment to wind down.
-            std::thread::spawn(move || { let _ = thread.join(); });
-            return Err(anyhow!("audio cancelled before sink was ready"));
-        }
-        id = id_rx => id.map_err(|_| anyhow!("audio sink thread terminated"))?,
+    let mut startup = SinkStartup {
+        cancel: audio_cancel.clone(),
+        thread: Some(thread),
     };
 
-    gst::init()?;
-    let monitor_source = format!("{name}.monitor");
-    // Capture the monitored audio at the client's negotiated rate and channel
-    // count, converting to S16LE for `opusenc` (Opus's native integer input
-    // format). `audioconvert ! audioresample` normalise whatever the monitor
-    // produces (typically F32LE, PulseAudio's native format) into that caps.
-    let caps = format!("audio/x-raw,format=S16LE,rate={rate},channels={channels}");
-    let pipeline = gst::parse::launch(&format!(
-        "pulsesrc device={monitor_source} client-name={name} \
+    // Keep ownership of the OS thread through *all* startup steps. An error
+    // after the sink appears (GStreamer setup included) must close its node.
+    let setup: Result<(gst::Pipeline, mpsc::Receiver<AudioPacket>)> = async {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err(anyhow!("audio cancelled before sink was ready")),
+            id = id_rx => { id.map_err(|_| anyhow!("audio sink thread terminated"))?; }
+        }
+
+        gst::init()?;
+        let monitor_source = format!("{name}.monitor");
+        // Capture the monitored audio at the client's negotiated rate and channel
+        // count, converting to S16LE for `opusenc` (Opus's native integer input
+        // format). `audioconvert ! audioresample` normalise whatever the monitor
+        // produces (typically F32LE, PulseAudio's native format) into that caps.
+        let caps = format!("audio/x-raw,format=S16LE,rate={rate},channels={channels}");
+        let pipeline = gst::parse::launch(&format!(
+            "pulsesrc device={monitor_source} client-name={name} \
          ! audioconvert ! audioresample \
          ! capsfilter caps=\"{caps}\" \
          ! opusenc bitrate=128000 \
          ! appsink name=sink sync=false",
-    ))?
-    .downcast::<gst::Pipeline>()
-    .map_err(|_| anyhow!("audio pipeline is not a pipeline"))?;
+        ))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("audio pipeline is not a pipeline"))?;
 
-    let appsink = pipeline
-        .by_name("sink")
-        .ok_or(anyhow!("audio pipeline has no appsink"))?
-        .downcast::<gst_app::AppSink>()
-        .map_err(|_| anyhow!("audio sink element is not an appsink"))?;
+        let appsink = pipeline
+            .by_name("sink")
+            .ok_or(anyhow!("audio pipeline has no appsink"))?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| anyhow!("audio sink element is not an appsink"))?;
 
-    let tx = audio_tx.clone();
-    appsink.set_callbacks(
-        gst_app::AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                if tx.try_send(AudioPacket { data: map.to_vec() }).is_err() {
-                    return Err(gst::FlowError::Error);
-                }
-                Ok(gst::FlowSuccess::Ok)
-            })
-            .build(),
-    );
+        let tx = audio_tx.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    if tx.try_send(AudioPacket { data: map.to_vec() }).is_err() {
+                        return Err(gst::FlowError::Error);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
 
-    pipeline.set_state(gst::State::Playing).map_err(|e| {
-        let _ = pipeline.set_state(gst::State::Null);
-        anyhow!("audio pipeline failed to start: {e}")
-    })?;
+        pipeline.set_state(gst::State::Playing).map_err(|e| {
+            let _ = pipeline.set_state(gst::State::Null);
+            anyhow!("audio pipeline failed to start: {e}")
+        })?;
 
-    Ok((
-        AudioSink {
-            cancel: audio_cancel,
-            thread: Some(thread),
-            pipeline,
-            mainloop_ptr,
-        },
-        audio_rx,
-    ))
+        Ok((pipeline, audio_rx))
+    }
+    .await;
+
+    match setup {
+        Ok((pipeline, audio_rx)) => Ok((
+            AudioSink {
+                cancel: audio_cancel,
+                thread: startup.thread.take(),
+                pipeline,
+            },
+            audio_rx,
+        )),
+        Err(error) => {
+            audio_cancel.cancel();
+            // Reap off the executor: the PipeWire loop needs up to one timer
+            // tick to notice cancellation and release the application sink.
+            // Taking the handle out of `startup` prevents its drop from
+            // spawning a second reaper for the same thread.
+            if let Some(thread) = startup.thread.take() {
+                tokio::task::spawn_blocking(move || {
+                    let _ = thread.join();
+                })
+                .await?;
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Background thread: create the application-owned sink on its own PipeWire
 /// connection and keep that connection alive until cancelled. Sends the sink's
-/// node id and main-loop handle back so `Drop` can wake the loop. The mixed
+/// node id back once it has been created. The mixed
 /// audio we stream is captured by the GStreamer pipeline from the sink's
 /// PulseAudio `.monitor` source (`<name>.monitor`), which PipeWire's PulseAudio
 /// emulation exposes for every sink. Volume changes on this sink are forwarded
 /// to `volume` from a listener on the sink node itself.
 fn sink_thread(
-    id_tx: tokio::sync::oneshot::Sender<(u32, MainLoopPtr)>,
+    id_tx: tokio::sync::oneshot::Sender<u32>,
     cancel: CancellationToken,
     name: String,
     channels: u8,
@@ -327,13 +356,10 @@ fn sink_thread(
             if id == pw::spa::param::ParamType::Props
                 && let Some(level) = level_from_props(props)
             {
-                // Blocking rather than dropping on a full queue: a drag
-                // produces a value per step, and the step the user *stopped*
-                // on is the one the client has to end up with. The queue is
-                // bounded and each slot is a byte, so the loop can only wait
-                // as long as it takes the consumer to drain it — and it stops
-                // waiting at all once the session's receiver is dropped.
-                let _ = volume.blocking_send(level);
+                // Never park the PipeWire loop on a full async channel: Drop
+                // joins this thread, and the consumer may have stopped reading.
+                // Volume is a setting, not a sequence of required samples.
+                let _ = volume.try_send(level);
             }
         })
         .register();
@@ -342,15 +368,16 @@ fn sink_thread(
     // Give PipeWire/PulseAudio a moment to register the sink's `.monitor`
     // source before the GStreamer capture pipeline tries to open it by name.
     std::thread::sleep(Duration::from_millis(400));
-    let _ = id_tx.send((sink_id, MainLoopPtr(mainloop_ptr)));
+    let _ = id_tx.send(sink_id);
 
     // Keep the connection alive until cancellation.
     let cancel_timer = cancel.clone();
-    let quit_ptr = MainLoopPtr(mainloop_ptr);
+    // This pointer never leaves the owning OS thread and remains valid until
+    // mainloop.run() returns. No other thread may call quit after it is freed.
     let _timer = mainloop.loop_().add_timer(move |_| {
         if cancel_timer.is_cancelled() {
             unsafe {
-                pw::sys::pw_main_loop_quit(quit_ptr.0);
+                pw::sys::pw_main_loop_quit(mainloop_ptr);
             }
         }
     });

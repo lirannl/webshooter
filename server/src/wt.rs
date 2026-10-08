@@ -24,8 +24,7 @@ use std::{
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 use tokio::{
-    spawn,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
     time::{self},
 };
 use tokio_util::sync::CancellationToken;
@@ -62,6 +61,62 @@ const INPUT_FLOOD_RATE_PER_SEC: u32 = 4000;
 /// are forwarded untouched.
 const INPUT_FLOOD_BURST: u32 = 32;
 
+/// Input refusals tolerated inside [`INPUT_FLOOD_KICK_WINDOW`] before the
+/// session is dropped instead of merely throttled.
+///
+/// [`InputFloodGuard`] admits [`INPUT_FLOOD_RATE_PER_SEC`] datagrams a second,
+/// so a refusal can only be produced by a client sending *more* than that. The
+/// client caps itself at [`shared::throttle::INPUT_MIN_INTERVAL_MS`] — 250
+/// datagrams a second — and so never accumulates a single one. Reaching this
+/// many refusals inside one window means attempting at least 5,000 input
+/// datagrams a second, twenty times the client's own cap: no burst arrives
+/// there by accident, while a client that ignores the cap is gone within a
+/// second of starting instead of holding a core for as long as it pleases.
+const INPUT_FLOOD_KICK_REFUSALS: u32 = 1_000;
+
+/// The window [`INPUT_FLOOD_KICK_REFUSALS`] is counted over. A second is long
+/// enough that refusals from an honest client — which the client cap makes
+/// impossible in the first place — would have to arrive at the flood's own rate
+/// to matter, and short enough that a flooder is gone within a second of
+/// starting rather than holding a core for as long as it cares to.
+const INPUT_FLOOD_KICK_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long the pump stays open after queueing the disconnect notice. The
+/// notice rides `control_sender`, a *peer* future in `run_session`'s
+/// `select!`: it is only polled while this future is pending, so breaking out
+/// immediately would tear the session down with the notice still sitting in
+/// the channel and leave the user with a silent disconnect. One sleep is
+/// enough to drain it, and a quarter second is invisible on the way out — even
+/// under the load that caused the kick.
+const KICK_NOTICE_DRAIN: Duration = Duration::from_millis(250);
+
+/// Tokio detaches a JoinHandle on drop. These transport children must instead
+/// stop whenever the inline future that owns them is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl std::future::Future for AbortOnDrop {
+    type Output = Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A token bucket bounding the rate at which *input* datagrams are accepted
 /// from the network. One token is consumed per input datagram; tokens refill
 /// at [`INPUT_FLOOD_RATE_PER_SEC`] and accumulate up to [`INPUT_FLOOD_BURST`].
@@ -93,6 +148,43 @@ impl InputFloodGuard {
         } else {
             false
         }
+    }
+}
+
+/// Windowed refusal counter: the difference between "a burst the bucket could
+/// not cover" and "a client that is flooding", and so the thing that decides
+/// when a session is dropped rather than merely throttled.
+///
+/// [`InputFloodGuard`] answers "may this one datagram through"; this answers
+/// "is this client still trying to flood" — and only over a window, because
+/// one bad second must not condemn a client whose next ten are quiet. A
+/// throttled client never records anything here at all: it is capped well
+/// below the guard's refill rate, which is what makes a non-zero count
+/// unambiguous.
+struct FloodKick {
+    refusals: u32,
+    window_start: std::time::Instant,
+}
+
+impl FloodKick {
+    fn new() -> Self {
+        Self {
+            refusals: 0,
+            window_start: std::time::Instant::now(),
+        }
+    }
+
+    /// Record one refused input datagram at `now`. Returns `true` when enough
+    /// have accumulated inside one window to call the session a flood.
+    fn record(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.window_start) >= INPUT_FLOOD_KICK_WINDOW {
+            // The window expired before the threshold: this refusal starts a
+            // fresh count rather than carrying an old one forward forever.
+            self.window_start = now;
+            self.refusals = 0;
+        }
+        self.refusals += 1;
+        self.refusals >= INPUT_FLOOD_KICK_REFUSALS
     }
 }
 
@@ -128,32 +220,9 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
             .unwrap_or_default();
         let client_id = ipc::next_client_id();
 
-        // Session-scoped channels and state, handed to the tasks below.
         let (control_tx, control_rx) = mpsc::channel::<ServerDatagram>(8);
-        let disconnect = CancellationToken::new();
-        let (client_tx, client_rx) = broadcast::channel::<ClientDatagram>(256);
-        let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> =
-            Arc::new(Mutex::new(None));
-        let audio_sink: Arc<Mutex<Option<AudioSink>>> = Arc::new(Mutex::new(None));
-        // The sink's volume setting, reported by the sink node itself. The
-        // channel is session-scoped but the producer does not exist until the
-        // client's AudioContext starts, so `monitor_host_volume` has to be
-        // armed before there is anything to report.
-        let (volume_tx, volume_rx) = mpsc::channel::<u8>(8);
-        // Encoded audio, from the capture pipeline to the MoQ publisher.
-        //
-        // Created here, before the producer exists, for the same reason as the
-        // volume channel: the audio task only starts once the client says its
-        // AudioContext is up, and by then the media pump that drains this must
-        // already be running. `audio_ready_task` gets the sender and hands over
-        // the packets when the sink comes up.
-        let (session_audio_tx, session_audio_rx) = mpsc::channel::<AudioPacket>(256);
-
-        // Render this session's resource names once, up front. A template that
-        // fails here was already validated when the config was parsed, so this
-        // is the defensive path — and it is handled per session rather than
-        // with `?`, because one unrenderable name must not take the whole
-        // WebTransport endpoint down with it.
+        // Render names before registering; an invalid template must not take
+        // the whole WebTransport endpoint down with one session.
         let config = get_config().await;
         let (virtual_display, virtual_speaker) =
             match render_session_names(&config, &display_name, client_id) {
@@ -164,99 +233,32 @@ pub async fn setup_wt(config: Config, identity: Identity) -> Result<()> {
                 }
             };
 
-        // MoQ is attached to the connection *before* anything reads from it: the
-        // mux pump this spawns becomes the session's only reader, and both halves
-        // of what it finds — MoQ's and webshooter's — come out of it. Nothing else
-        // may read from the connection again.
-        //
-        // Sending needs no such rule. The mux is one-way because only MoQ writes
-        // MoQ bytes and only webshooter writes webshooter's, so webshooter's own
-        // outgoing streams and datagrams stay unambiguous — they lead with a
-        // discriminant the client routes on, and the peer does the routing.
-        let (moq, app_side) = moq::attach(connection.clone());
-        let audio_tx = mpsc::Sender::clone(&session_audio_tx);
-        let mut client_pump = client_pump(app_side, client_tx.clone());
-        let mut client_events = client_events_task(client_rx.resubscribe(), decoder_caps.clone());
-        // Forward the host's volume setting to the client. Not a supervisor arm:
-        // it ends only when the session does.
-        tokio::spawn({
-            let wt = connection.clone();
-            let cancel = disconnect.clone();
-            async move { monitor_host_volume(wt, volume_rx, cancel).await }
-        });
-        // Not a supervisor arm — see `audio_ready_task`.
-        audio_ready_task(
-            client_rx.resubscribe(),
-            virtual_speaker.clone(),
-            audio_tx,
-            disconnect.clone(),
-            audio_sink.clone(),
-            volume_tx,
-        );
-
-        // Capture negotiation, the frame forwarder and the run loop run in a
-        // driver task.  The driver owns the transport and closes it, drops the
-        // audio sink and deregisters as its *last* acts.  Pre-clone the values
-        // `register_session` also needs: spawning the driver moves the
-        // originals into its future.
-        let registered_name = display_name.clone();
-        let registered_control = control_tx.clone();
-        let registered_disconnect = disconnect.clone();
-        let driver_token = disconnect.clone();
-        let mut driver = tokio::spawn(async move {
-            if let Err(err) = run_session(
-                client_id,
-                virtual_display,
-                control_tx,
-                control_rx,
-                connection,
-                moq,
-                session_audio_rx,
-                driver_token,
-                audio_sink,
-                client_rx,
-                decoder_caps,
-                max_log_level,
-            )
-            .await
-            {
-                log::error!("{err:#?}");
-            }
-        });
-
-        // One supervisor per session: a race over every task that must keep
-        // running.  Whichever ends first has ended the session, so the
-        // supervisor cancels the session token — waking the driver into its
-        // teardown — and deregisters.  The removal is idempotent (the driver
-        // removes itself too), so it also covers a driver handle completing
-        // without a clean teardown.  `Session` stores only this handle: the
-        // session lives exactly as long as its supervisor.
-        let supervisor = tokio::spawn(async move {
-            // Name the arm that ended the session. Which task finished first is
-            // the whole diagnosis of an unexpected disconnect — "the client went
-            // away" and "the server gave up on the client" look identical from
-            // the outside otherwise. Every arm here ends only because something
-            // genuinely failed, so the name is trustworthy; the audio arm is
-            // absent for exactly that reason (see `audio_ready_task`).
-            let ended = tokio::select! {
-                _ = &mut client_pump => "client pump",
-                _ = &mut client_events => "client event pump",
-                _ = &mut driver => "driver",
-            };
-            log::info!("session {client_id} ended: {ended} finished first");
-            disconnect.cancel();
-            ipc::remove_session(client_id);
-        });
-
-        // Only once the session struct exists (holding the supervisor) and is
-        // registered do we loop back to accept a new connection.
-        ipc::register_session(
+        let session = ipc::Session::new(
             client_id,
-            registered_name,
-            registered_control,
-            registered_disconnect,
-            supervisor,
+            display_name,
+            control_tx.clone(),
+            connection.clone(),
         );
+        // The transport cannot finish (or call remove_session) until it has been
+        // installed in the registry. No awaits between registration and release.
+        let (start_tx, start_rx) = oneshot::channel();
+        let worker = session.clone();
+        session.set_transport(tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                run_session(
+                    worker,
+                    connection,
+                    virtual_display,
+                    virtual_speaker,
+                    control_tx,
+                    control_rx,
+                    max_log_level,
+                )
+                .await;
+            }
+        }));
+        ipc::register_session(session);
+        let _ = start_tx.send(());
     }
 }
 
@@ -335,27 +337,26 @@ fn name_for(
 // Connection handler
 // ---------------------------------------------------------------------------
 
-// Each argument is a distinct session resource with its own owner; the
-// alternative to this many arguments is attributing state someone else owns.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_session(
-    client_id: ipc::ClientId,
+async fn run_session(
+    session: Arc<ipc::Session>,
+    connection: Arc<Connection>,
     virtual_display: String,
+    virtual_speaker: String,
     server_msg_tx: mpsc::Sender<ServerDatagram>,
     control_rx: mpsc::Receiver<ServerDatagram>,
-    connection: Arc<Connection>,
-    moq: WtSession,
-    audio_rx: mpsc::Receiver<AudioPacket>,
-    cancel: CancellationToken,
-    audio_sink: Arc<Mutex<Option<AudioSink>>>,
-    client_rx: broadcast::Receiver<ClientDatagram>,
-    decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>>,
     max_log_level: LevelFilter,
-) -> Result<()> {
-    // Tell the client how verbose we are so it stops generating records we
-    // would discard anyway. Best effort: a session that has already gone is a
-    // session whose next message cannot be delivered either, and the pumps below
-    // report its end.
+) {
+    let client_id = session.id;
+    let cancel = session.token();
+    // The mux is the only reader of the transport. Its spawned task and the
+    // MoQ driver below are owned by this ancestor, never detached on teardown.
+    let (moq, app, mux) = moq::attach(connection.clone());
+    let mut mux = AbortOnDrop::new(mux);
+    let (client_tx, client_rx) = broadcast::channel::<ClientDatagram>(256);
+    let decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>> = Arc::new(Mutex::new(None));
+    let (volume_tx, volume_rx) = mpsc::channel::<u8>(8);
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(256);
+
     let notice = ServerDatagram::LogLevel {
         level: max_log_level,
     }
@@ -364,30 +365,11 @@ pub async fn run_session(
         log::debug!("could not send the log level notice: {err:#?}");
     }
 
-    // Own the application audio sink at the *session* level (not inside the
-    // video capture), so video context resets / display resizes never disturb
-    // it.  It is created lazily by session startup's audio task once the
-    // client's AudioContext starts, named by the `virtual_speaker_name`
-    // template (e.g. `alice-webshooter`), and torn down when the session ends
-    // via the session's disconnect token.
-
-    // Encoded video, from the capture pipeline to the MoQ publisher. Created here
-    // rather than inside `capture` so the media pump — which owns the publisher
-    // and must be running before anything can be appended to a track — is started
-    // once, in front of capture, instead of being built around whatever receiver
-    // capture happens to hand back.
-    //
-    // Eight slots is deliberate: the publisher copies each frame into a group
-    // immediately, so the only thing a longer wait buys is memory pinned on
-    // encoder output, and a frame that has been waiting that long is a frame the
-    // client could not use anyway.
+    // The media and control pumps and the event consumer are inline futures: a
+    // single platform-agnostic transport task polls and owns them all.
     let (frame_tx, frame_rx) = mpsc::channel::<video::EncodedFrame>(8);
-    // One verdict on the link, shared: the media pump samples the path and
-    // publishes what it finds, and the encoder subscribes. `Clear` until the
-    // first sample lands, which is also the right starting bitrate — the
-    // configured ceiling.
     let (pressure_tx, pressure_rx) = watch::channel(LinkPressure::Clear);
-    let mut media = media_pump(
+    let media = media_pump(
         moq,
         server_msg_tx.clone(),
         connection.clone(),
@@ -396,172 +378,182 @@ pub async fn run_session(
         audio_rx,
         cancel.clone(),
     );
-    let mut control_sender = control_sender(control_rx, connection.clone());
+    let control = control_sender(control_rx, connection.clone());
+    let input = client_pump(app, client_tx.clone(), server_msg_tx.clone());
+    let events = client_events_task(client_rx.resubscribe(), decoder_caps.clone());
+    tokio::pin!(media, control, input, events);
 
-    // Race start_capture against session cancellation so a
-    // refresh/disconnect while waiting for the initial resize doesn't leave a
-    // zombie capture; a peer closure reaches this via the supervisor (a pump
-    // ends, which cancels the session token).  A capture error is logged
-    // rather than bailed: every exit still flows through the teardown below.
-    let mut capture = tokio::spawn(video::capture(
-        client_rx,
-        decoder_caps.clone(),
-        virtual_display,
-        client_id,
-        pressure_rx,
+    // PipeWire audio and capture are Linux-only tasks. Their handles live on the
+    // session in `#[cfg]` fields, never inside the platform-agnostic transport
+    // task above. Audio is optional: ending it degrades the session, never ends
+    // it, so it is not one of the race arms below.
+    session.set_audio(tokio::spawn(audio_ready_task(
+        client_rx.resubscribe(),
+        virtual_speaker,
+        audio_tx,
         cancel.clone(),
-        server_msg_tx,
-        frame_tx,
-    ));
-    tokio::select! {
-        _ = cancel.cancelled() => { log::info!("Disconnect requested"); }
-        _ = &mut media => { log::info!("media pipeline stopped"); }
-        _ = &mut control_sender => { log::info!("control sender stopped"); }
-        started = &mut capture => {
-            match started {
+        session.audio_sink.clone(),
+        volume_tx,
+        volume_rx,
+        connection.clone(),
+    )));
+    // The oneshot reports capture completion without moving its handle out of
+    // the session.
+    let (video_done_tx, mut video_done_rx) = oneshot::channel();
+    session.set_video(tokio::spawn(async move {
+        let result = video::capture(
+            client_rx,
+            decoder_caps,
+            virtual_display,
+            client_id,
+            pressure_rx,
+            cancel.clone(),
+            server_msg_tx,
+            frame_tx,
+        )
+        .await;
+        let _ = video_done_tx.send(result);
+    }));
+    let cancel = session.token();
+    // Fair selection matters: an input flood must not starve media or control
+    // merely because the input future is listed earlier here.
+    let ended = tokio::select! {
+        _ = cancel.cancelled() => "disconnect requested",
+        outcome = &mut mux => {
+            if let Err(err) = outcome { log::warn!("mux pump failed: {err}"); }
+            "mux pump"
+        }
+        _ = &mut input => "client pump",
+        _ = &mut events => "client event pump",
+        _ = &mut media => "media pipeline",
+        _ = &mut control => "control sender",
+        outcome = &mut video_done_rx => {
+            match outcome {
                 Ok(Ok(())) => log::info!("capture pipeline stopped"),
                 Ok(Err(err)) => log::error!("capture failed: {err:#?}"),
-                Err(err) => log::error!("capture task panicked: {err}"),
+                Err(err) => log::error!("capture task ended without a result: {err}"),
             }
+            "capture pipeline"
         }
-    }
-
-    // The single teardown every exit path funnels through: tell the whole
-    // session to wind down, close the transport so the pumps error out, drop
-    // the application-owned audio sink (unregistering its PipeWire node rather
-    // than letting it outlive the session), and only then deregister.  The
-    // registry's drop of `Session` is a tripwire, not the mechanism — the
-    // cancellation happens first, so `Session::drop` can assert it instead of
-    // remediating from the destructor.
+    };
+    let ended = if cancel.is_cancelled() {
+        "disconnect requested"
+    } else {
+        ended
+    };
+    log::info!("session {client_id} ended: {ended}");
+    // Cancel before removal so every future (and the MoQ driver it owns) winds
+    // down. Registry removal closes the connection and tears the stored Linux
+    // tasks down, including this transport task. Nothing is awaited after it.
     cancel.cancel();
-    connection.close(wtransport::VarInt::from_u32(0), b"done");
-    *audio_sink.lock().unwrap() = None;
-    ipc::remove_session(client_id);
-    Ok(())
+    drop(mux);
+    // By identity, not by `client_id`: this task may be finishing long after
+    // its id was freed and handed to a new session, and that session must not
+    // be torn down by this one's remains.
+    ipc::remove_session(&session);
 }
 
 /// Subscribe to the client-message bus: forward client log records into the
 /// server log and stash decode caps for the capture pipeline.
-fn client_events_task(
+async fn client_events_task(
     mut client_rx: broadcast::Receiver<ClientDatagram>,
     decoder_caps: Arc<Mutex<Option<Vec<shared::codec::Codec>>>>,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        loop {
-            match client_rx.recv().await {
-                Ok(ClientDatagram::Error { level, message }) => {
-                    log::log!(target: "webshooter::client", level, "{message}");
-                }
-                Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
-                    *decoder_caps.lock().unwrap() = Some(decoders);
-                }
-                Ok(_) => {}
-                // `Lagged` only means this consumer fell behind the bus, which
-                // is expected whenever a capture path is parked on a portal
-                // dialog: the dropped records are superseded by the next state
-                // message, so it must not end the session. `Closed` means the
-                // connection's broadcaster is gone; recv() then returns
-                // immediately, so without this break the task would spin at
-                // 100% of a core forever (one leaked task per session).
-                Err(RecvError::Lagged(skipped)) => {
-                    log::debug!("client event pump lagged, skipped {skipped} records");
-                }
-                Err(RecvError::Closed) => break,
+) {
+    loop {
+        match client_rx.recv().await {
+            Ok(ClientDatagram::Error { level, message }) => {
+                log::log!(target: "webshooter::client", level, "{message}");
             }
+            Ok(ClientDatagram::DecoderCapabilities { decoders }) => {
+                *decoder_caps.lock().unwrap() = Some(decoders);
+            }
+            Ok(_) => {}
+            // `Lagged` only means this consumer fell behind the bus, which
+            // is expected whenever a capture path is parked on a portal
+            // dialog: the dropped records are superseded by the next state
+            // message, so it must not end the session. `Closed` means the
+            // connection's broadcaster is gone; recv() then returns
+            // immediately, so without this break the task would spin at
+            // 100% of a core forever (one leaked task per session).
+            Err(RecvError::Lagged(skipped)) => {
+                log::debug!("client event pump lagged, skipped {skipped} records");
+            }
+            Err(RecvError::Closed) => break,
         }
-    })
+    }
 }
 
-/// Wait for the client's AudioReady signal (with its channel/rate caps), then
-/// create the PipeWire audio sink and hand its packets to the media pump.
-///
-/// Deliberately *not* one of the session supervisor's race arms. It is a one-shot
-/// initialisation: create the sink, hand the forwarder its own spawned task, then
-/// park until the session token is cancelled. Parking on that token means the task
-/// ends precisely *because* the session ended, so as a race arm it became ready in
-/// the same instant as the driver whose teardown cancelled it — and `select!`,
-/// which polls in a randomised order, named one of the two at random. That made the
-/// "which arm ended the session" line actively misleading: a teardown cascade
-/// reports the audio arm even when the transport was what died.
-///
-/// Not racing it loses nothing: `run_session` always cancels the token on its way
-/// out, so the task cannot outlive the session, and a missing or failing audio
-/// device must degrade the session rather than end it.
-fn audio_ready_task(
+/// Audio is optional and Linux-only: failing to start it degrades the session
+/// but does not disconnect video. One task covers the whole audio subtree —
+/// waiting for `AudioReady`, creating the sink, and forwarding both packets and
+/// volume updates — so no second packet-forwarding or volume-monitor task is
+/// needed. The session owns this task's handle, not the transport runner.
+#[allow(clippy::too_many_arguments)]
+async fn audio_ready_task(
     mut audio_rx: broadcast::Receiver<ClientDatagram>,
     session_name: String,
     media_tx: mpsc::Sender<AudioPacket>,
-    audio_cancel: CancellationToken,
+    cancel: CancellationToken,
     audio_sink: Arc<Mutex<Option<AudioSink>>>,
     volume_tx: mpsc::Sender<u8>,
+    mut levels: mpsc::Receiver<u8>,
+    connection: Arc<Connection>,
 ) {
-    spawn(async move {
-        // Wait for the client's AudioReady signal (with its channel/rate
-        // caps), or for cancellation.
-        let recv = async {
-            loop {
-                match audio_rx.recv().await {
-                    Ok(ClientDatagram::AudioReady { channels, rate }) => {
-                        return Some((channels, rate));
-                    }
-                    Ok(_) => continue,
-                    // Falling behind the bus is not a reason to give up on the
-                    // client's audio; the next AudioReady still arrives.
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => return None,
+    let ready = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            msg = audio_rx.recv() => match msg {
+                Ok(ClientDatagram::AudioReady { channels, rate }) => break (channels, rate),
+                Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            }
+        }
+    };
+    // `start_audio_sink` watches the token while it waits for PipeWire. If
+    // registration is revoked mid-start, its thread sees the same cancellation.
+    let (sink, mut packets) =
+        match start_audio_sink(cancel.clone(), session_name, ready.0, ready.1, volume_tx).await {
+            Ok(started) => started,
+            Err(err) => {
+                log::warn!("audio sink unavailable: {err:#}");
+                cancel.cancelled().await;
+                return;
+            }
+        };
+    *audio_sink.lock().unwrap() = Some(sink);
+    let mut last_level = None;
+    let mut packets_open = true;
+    let mut levels_open = true;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            packet = packets.recv(), if packets_open => match packet {
+                Some(packet) => {
+                    if media_tx.send(packet).await.is_err() { break; }
                 }
-            }
-        };
-        let cancel_fut = audio_cancel.cancelled();
-        tokio::pin!(recv);
-        tokio::pin!(cancel_fut);
-        let ready = tokio::select! {
-            r = &mut recv => r,
-            _ = &mut cancel_fut => None,
-        };
-        let Some((channels, rate)) = ready else {
-            return;
-        };
-        if audio_cancel.is_cancelled() {
-            return;
-        }
-        match start_audio_sink(
-            audio_cancel.clone(),
-            session_name,
-            channels,
-            rate,
-            volume_tx,
-        )
-        .await
-        {
-            Ok((sink, mut rx)) => {
-                println!("[audio] client ready — created PipeWire audio sink");
-                // Packets go to the media pump as they are: the encoder already
-                // produced a self-contained Opus packet, so there is nothing to
-                // frame, split or stamp on this side any more — MoQ's group is the
-                // only framing left. Forwarding rather than sharing the sender is
-                // what keeps `start_audio_sink` independent of where media ends up.
-                spawn(async move {
-                    while let Some(packet) = rx.recv().await {
-                        if media_tx.send(packet).await.is_err() {
-                            // The media pump is gone, so is the session.
-                            return;
-                        }
+                None => packets_open = false,
+            },
+            level = levels.recv(), if levels_open => match level {
+                Some(level) if last_level != Some(level) => {
+                    last_level = Some(level);
+                    if let Err(err) = send_audio_level(&connection, level).await {
+                        log::debug!("audio: failed to send AudioLevel: {err}");
+                        levels_open = false;
                     }
-                });
-                *audio_sink.lock().unwrap() = Some(sink);
-                // Park until the session winds down; see why this task is not
-                // one of the supervisor's arms.
-                audio_cancel.cancelled().await;
-            }
-            Err(e) => {
-                println!("[audio] audio sink unavailable: {e:#}");
-                // Same contract as the success arm: a silent session is a
-                // degraded one, not a broken one.
-                audio_cancel.cancelled().await;
-            }
+                }
+                Some(_) => {},
+                None => levels_open = false,
+            },
         }
-    });
+        // A closed encoder or monitor does not close the video session.
+        if !packets_open && !levels_open {
+            break;
+        }
+    }
+    // Never return early just because audio failed: avoid racing cancellation
+    // with a second, misleading transport-end reason.
+    cancel.cancelled().await;
 }
 
 /// Forward everything the client sends that is *ours* to the message bus.
@@ -577,103 +569,128 @@ fn audio_ready_task(
 /// stream carries a whole message by construction — the end of the stream *is*
 /// the delimiter — which is why the messages that must not be lost travel this
 /// way rather than as datagrams, and why no framing is needed on top.
-fn client_pump(
+async fn client_pump(
     app: AppSide,
     client_tx: broadcast::Sender<ClientDatagram>,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        // Input datagrams are flood-limited before the full parse + broadcast;
-        // control datagrams (keepalive, resize, keyframe, decoder caps, …)
-        // are always parsed and forwarded.
-        let mut flood = InputFloodGuard::new();
-        let mut received: u64 = 0;
-        // Armed before the first message and rearmed by each one. A silent client
-        // ends the session; see `KEEPALIVE_TIMEOUT` for why this is generous
-        // rather than tight.
-        // Pinned because `Sleep` is `!Unpin` and `select!` re-polls it by
-        // reference; re-arming it goes through `as_mut().reset(..)`.
-        let quiet = tokio::time::sleep(KEEPALIVE_TIMEOUT);
-        tokio::pin!(quiet);
-        let mut quiet = quiet.as_mut();
-        loop {
-            tokio::select! {
-                biased;
-                _ = &mut quiet => {
-                    log::info!(
-                        "client pump ended after {received} datagrams: \
-                         nothing from the client for {KEEPALIVE_TIMEOUT:?}"
-                    );
-                    break;
-                }
-                datagram = app.recv_datagram() => {
-                    // `None` is the mux pump saying the connection is finished.
-                    // It is not a slow connection — that is `Pending`, and it never
-                    // arrives here.
-                    let Some(datagram) = datagram else { break };
-                    received += 1;
-                    quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
-                    // Cheap byte pre-filter: skip floods without paying for the
-                    // full `from_bytes` parse. Extra datagrams simply linger in
-                    // the (bounded) QUIC receive buffer until dropped.
-                    if datagram.first().is_some_and(|&b| is_input_byte(b)) && !flood.allow_input() {
-                        continue;
+    server_msg_tx: mpsc::Sender<ServerDatagram>,
+) {
+    // Input datagrams are flood-limited before the full parse + broadcast;
+    // control datagrams (keepalive, resize, keyframe, decoder caps, …)
+    // are always parsed and forwarded.
+    let mut flood = InputFloodGuard::new();
+    // Refusing forever is not a solution: a client that keeps flooding keeps
+    // costing the pump the wake-up and the byte test, and the session is one
+    // the user is not getting back anyway. Sustained refusals end it instead.
+    let mut kick = FloodKick::new();
+    let mut received: u64 = 0;
+    // Armed before the first message and rearmed by each one. A silent client
+    // ends the session; see `KEEPALIVE_TIMEOUT` for why this is generous
+    // rather than tight.
+    // Pinned because `Sleep` is `!Unpin` and `select!` re-polls it by
+    // reference; re-arming it goes through `as_mut().reset(..)`.
+    let quiet = tokio::time::sleep(KEEPALIVE_TIMEOUT);
+    tokio::pin!(quiet);
+    let mut quiet = quiet.as_mut();
+    loop {
+        tokio::select! {
+            _ = &mut quiet => {
+                log::info!(
+                    "client pump ended after {received} datagrams: \
+                     nothing from the client for {KEEPALIVE_TIMEOUT:?}"
+                );
+                break;
+            }
+            datagram = app.recv_datagram() => {
+                // `None` is the mux pump saying the connection is finished.
+                // It is not a slow connection — that is `Pending`, and it never
+                // arrives here.
+                let Some(datagram) = datagram else { break };
+                received += 1;
+                quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
+                // Cheap byte pre-filter: skip floods without paying for the
+                // full `from_bytes` parse. Extra datagrams simply linger in
+                // the (bounded) QUIC receive buffer until dropped — up to the
+                // point where dropping them is not enough.
+                if datagram.first().is_some_and(|&b| is_input_byte(b)) && !flood.allow_input() {
+                    if kick.record(std::time::Instant::now()) {
+                        log::warn!(
+                            "dropping session: input flood, {INPUT_FLOOD_KICK_REFUSALS} \
+                             datagrams refused in {INPUT_FLOOD_KICK_WINDOW:?} (the pump \
+                             admits {INPUT_FLOOD_RATE_PER_SEC}/s)"
+                        );
+                        // Tell the client why before the session goes; see
+                        // KICK_NOTICE_DRAIN for why this sleeps instead of
+                        // breaking straight out. `try_send` rather than
+                        // `send().await`: a full channel is the notice's
+                        // problem, not the teardown's, and awaiting here could
+                        // hold the pump open on a peer that is no longer
+                        // draining.
+                        let _ = server_msg_tx.try_send(ServerDatagram::Error {
+                            level: log::Level::Warn,
+                            message: format!(
+                                "input flood: this session was closed because the client \
+                                 sent input faster than the server's {INPUT_FLOOD_RATE_PER_SEC} \
+                                 datagrams per second limit"
+                            ),
+                        });
+                        time::sleep(KICK_NOTICE_DRAIN).await;
+                        break;
                     }
-                    if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
-                        let _ = client_tx.send(datagram);
-                    }
+                    continue;
                 }
-                stream = app.recv_unistream() => {
-                    let Some(stream) = stream else { break };
-                    quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
-                    // The mux pump has already read the stream's first byte — that
-                    // is how it decided the stream was ours — and handed it back, so
-                    // the message parses as if nothing had touched it.
-                    //
-                    // Bounded because the read is the one place this task awaits
-                    // something the peer controls: the pump only guarantees a *first*
-                    // byte, so a client that sends one and then stops would otherwise
-                    // wedge the whole session's input behind it.
-                    match time::timeout(KEEPALIVE_TIMEOUT, stream.read_to_end()).await {
-                        Ok(Ok(bytes)) => {
-                            if let Ok(datagram) = ClientDatagram::from_bytes(&bytes) {
-                                let _ = client_tx.send(datagram);
-                            }
+                if let Ok(datagram) = ClientDatagram::from_bytes(&datagram) {
+                    let _ = client_tx.send(datagram);
+                }
+            }
+            stream = app.recv_unistream() => {
+                let Some(stream) = stream else { break };
+                quiet.as_mut().reset(tokio::time::Instant::now() + KEEPALIVE_TIMEOUT);
+                // The mux pump has already read the stream's first byte — that
+                // is how it decided the stream was ours — and handed it back, so
+                // the message parses as if nothing had touched it.
+                //
+                // Bounded because the read is the one place this task awaits
+                // something the peer controls: the pump only guarantees a *first*
+                // byte, so a client that sends one and then stops would otherwise
+                // wedge the whole session's input behind it.
+                match time::timeout(KEEPALIVE_TIMEOUT, stream.read_to_end()).await {
+                    Ok(Ok(bytes)) => {
+                        if let Ok(datagram) = ClientDatagram::from_bytes(&bytes) {
+                            let _ = client_tx.send(datagram);
                         }
-                        Ok(Err(err)) => log::debug!("client unistream failed: {err}"),
-                        Err(_) => log::debug!("client unistream sent a byte and then nothing"),
                     }
+                    Ok(Err(err)) => log::debug!("client unistream failed: {err}"),
+                    Err(_) => log::debug!("client unistream sent a byte and then nothing"),
                 }
             }
         }
-        log::info!("client pump ended after {received} datagrams");
-    })
+    }
+    log::info!("client pump ended after {received} datagrams");
 }
 
 /// Put control messages on the wire.
 ///
 /// Control messages stay on their own datagrams and their own streams. They used
-/// to share the video forwarder's send loop, which made the throttle that protects
-/// the session apply to the messages the session needs to keep working — the
-/// opposite of what a throttle is for. Giving them a task of their own means a
-/// saturated media path cannot delay a `Throttle`, and it means a media path that
-/// dies entirely takes nothing else with it.
-fn control_sender(
+/// to share the video forwarder's send loop, which made backpressure on the
+/// media path apply to the messages the session needs to keep working — the
+/// opposite of what throttling input is for. Giving them a separate inline
+/// future means a saturated media path cannot delay a control message; neither
+/// future performs a blocking send on the other's channel.
+async fn control_sender(
     mut control_rx: mpsc::Receiver<ServerDatagram>,
     connection: Arc<Connection>,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        while let Some(msg) = control_rx.recv().await {
-            let bytes = msg.to_bytes();
-            // A datagram is the right carrier here and not merely the convenient
-            // one: every control message is small, latency-sensitive, and worthless
-            // if it arrives late. The reliable alternative is reserved for
-            // `AudioLevel`, which is not.
-            if connection.send_datagram(&bytes).is_err() {
-                log::warn!("send_datagram (control) failed: connection closed");
-                break;
-            }
+) {
+    while let Some(msg) = control_rx.recv().await {
+        let bytes = msg.to_bytes();
+        // A datagram is the right carrier here and not merely the convenient
+        // one: every control message is small, latency-sensitive, and worthless
+        // if it arrives late. The reliable alternative is reserved for
+        // `AudioLevel`, which is not.
+        if connection.send_datagram(&bytes).is_err() {
+            log::warn!("send_datagram (control) failed: connection closed");
+            break;
         }
-    })
+    }
 }
 
 /// Drain encoded video and audio into the MoQ publisher.
@@ -683,7 +700,7 @@ fn control_sender(
 /// than by whoever won a race for it. Nothing here writes to the transport: the
 /// publisher hands frames to the model and moq-net decides what that costs on the
 /// wire, including dropping whatever has fallen behind the live edge.
-fn media_pump(
+async fn media_pump(
     moq: WtSession,
     control_tx: mpsc::Sender<ServerDatagram>,
     connection: Arc<Connection>,
@@ -691,84 +708,91 @@ fn media_pump(
     mut frame_rx: mpsc::Receiver<video::EncodedFrame>,
     mut audio_rx: mpsc::Receiver<AudioPacket>,
     cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    spawn(async move {
-        // The handshake waits for the client's SETUP, which it sends as soon as the
-        // session is up. It is raced against cancellation because it is the one
-        // await in this task that waits on the peer rather than on the pipeline: a
-        // peer that connects and never says anything must not hold the task (and
-        // with it the media pumps behind it) open until QUIC's idle timeout.
-        let mut publisher = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                log::info!("media pipeline stopped before the MoQ handshake");
+) {
+    // The handshake waits for the client's SETUP, which it sends as soon as the
+    // session is up. It is raced against cancellation because it is the one
+    // await in this task that waits on the peer rather than on the pipeline: a
+    // peer that connects and never says anything must not hold the task (and
+    // with it the media pumps behind it) open until QUIC's idle timeout.
+    let mut publisher = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            log::info!("media pipeline stopped before the MoQ handshake");
+            return;
+        }
+        started = Publisher::start(moq, control_tx) => match started {
+            Ok(publisher) => publisher,
+            Err(err) => {
+                log::warn!("MoQ handshake failed, no media will flow: {err:#}");
                 return;
             }
-            started = Publisher::start(moq, control_tx) => match started {
-                Ok(publisher) => publisher,
-                Err(err) => {
-                    log::warn!("MoQ handshake failed, no media will flow: {err:#}");
-                    return;
-                }
-            },
-        };
+        },
+    };
 
-        let mut link = LinkReport::default();
-        let mut report = tokio::time::interval(Duration::from_secs(5));
-        report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tokio::pin!(report);
-        loop {
-            tokio::select! {
-                biased;
-                // Ahead of the media arms deliberately: with `biased` the first ready
-                // arm wins, and while frames are always available this one would
-                // never be polled at all — exactly when the report matters most.
-                _ = report.tick() => report_link(&connection, &mut link, &pressure),
-                frame = frame_rx.recv() => {
-                    // `None` is the capture pipeline ending, which ends the session:
-                    // there is no video left to publish.
-                    let Some(frame) = frame else { break };
-                    // The buffer is mapped rather than copied: the publisher takes
-                    // the bytes synchronously, so the mapping never outlives this
-                    // arm and never pins encoder memory across an await.
-                    let Ok(mapped) = frame.data.map_readable() else {
-                        // A frame that cannot be read is dropped, and the group
-                        // keeps going: cutting it here would make the *next* group
-                        // start on a delta, which is the one thing a group must
-                        // never do. The GOP ends at its next keyframe either way,
-                        // and that keyframe is what the client decodes from.
-                        log::debug!("encoded frame unreadable, cutting the video group");
-                        continue;
-                    };
-                    if let Err(err) = publisher.push_video(VideoFrame {
-                        payload: mapped.as_slice(),
-                        codec: frame.codec,
-                        is_keyframe: frame.is_keyframe,
-                    }) {
-                        // A track that has rejected a frame cannot be appended to
-                        // again without producing a stream the client cannot decode,
-                        // so this ends the media path rather than the frames' worth.
-                        log::warn!("MoQ video track failed: {err:#}");
-                        break;
-                    }
+    // The driver is polled as a peer of the frame queues. A transport
+    // failure ends media immediately; dropping this future aborts the driver.
+    let mut driver = AbortOnDrop::new(
+        publisher
+            .take_driver()
+            .expect("Publisher::start supplies a driver"),
+    );
+    let mut link = LinkReport::default();
+    let mut report = tokio::time::interval(Duration::from_secs(5));
+    report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(report);
+    loop {
+        tokio::select! {
+            outcome = &mut driver => {
+                if let Err(err) = outcome { log::warn!("MoQ driver failed: {err}"); }
+                break;
+            }
+            // Randomized selection gives audio and link reports a turn even
+            // when the video queue has frames ready continuously.
+            _ = report.tick() => report_link(&connection, &mut link, &pressure),
+            frame = frame_rx.recv() => {
+                // `None` is the capture pipeline ending, which ends the session:
+                // there is no video left to publish.
+                let Some(frame) = frame else { break };
+                // The buffer is mapped rather than copied: the publisher takes
+                // the bytes synchronously, so the mapping never outlives this
+                // arm and never pins encoder memory across an await.
+                let Ok(mapped) = frame.data.map_readable() else {
+                    // A frame that cannot be read is dropped, and the group
+                    // keeps going: cutting it here would make the *next* group
+                    // start on a delta, which is the one thing a group must
+                    // never do. The GOP ends at its next keyframe either way,
+                    // and that keyframe is what the client decodes from.
+                    log::debug!("encoded frame unreadable, cutting the video group");
+                    continue;
+                };
+                if let Err(err) = publisher.push_video(VideoFrame {
+                    payload: mapped.as_slice(),
+                    codec: frame.codec,
+                    is_keyframe: frame.is_keyframe,
+                }) {
+                    // A track that has rejected a frame cannot be appended to
+                    // again without producing a stream the client cannot decode,
+                    // so this ends the media path rather than the frames' worth.
+                    log::warn!("MoQ video track failed: {err:#}");
+                    break;
                 }
-                packet = audio_rx.recv() => {
-                    // The audio capture is created only once the client's
-                    // AudioContext reports itself, and it may never be, so this
-                    // receiver simply never yields. That is not an error.
-                    let Some(packet) = packet else { break };
-                    if packet.data.is_empty() {
-                        continue;
-                    }
-                    if let Err(err) = publisher.push_audio(AudioFrame { payload: &packet.data }) {
-                        log::warn!("MoQ audio track failed: {err:#}");
-                        break;
-                    }
+            }
+            packet = audio_rx.recv() => {
+                // The audio capture is created only once the client's
+                // AudioContext reports itself, and it may never be, so this
+                // receiver simply never yields. That is not an error.
+                let Some(packet) = packet else { break };
+                if packet.data.is_empty() {
+                    continue;
+                }
+                if let Err(err) = publisher.push_audio(AudioFrame { payload: &packet.data }) {
+                    log::warn!("MoQ audio track failed: {err:#}");
+                    break;
                 }
             }
         }
-        log::info!("media pipeline stopped");
-    })
+    }
+    log::info!("media pipeline stopped");
 }
 
 /// What the last link report counted from, so the next one can report deltas.
@@ -849,40 +873,6 @@ async fn send_audio_level(wt: &Connection, level: u8) -> Result<()> {
     Ok(())
 }
 
-/// Forward the host's volume setting for this session's virtual sink to the
-/// client as [`ServerDatagram::AudioLevel`] on a reliable stream.
-///
-/// `levels` is fed by a PipeWire listener on the sink node, so it starts
-/// reporting the sink's actual value as soon as the sink exists and then every
-/// time the user changes it. Deduplicating here rather than at the source means
-/// a value repeated by PipeWire (a re-enumeration, an unrelated param change)
-/// does not become a stream per repetition.
-async fn monitor_host_volume(
-    wt: Arc<Connection>,
-    mut levels: mpsc::Receiver<u8>,
-    cancel: CancellationToken,
-) {
-    let mut last_level: Option<u8> = None;
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            level = levels.recv() => {
-                // A closed channel means the sink is gone, which ends the
-                // session that owned it; there is nothing left to report.
-                let Some(level) = level else { break };
-                if last_level == Some(level) {
-                    continue;
-                }
-                last_level = Some(level);
-                if let Err(e) = send_audio_level(&wt, level).await {
-                    log::debug!("audio: failed to send AudioLevel: {e}");
-                    break;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,7 +898,7 @@ mod tests {
         for _ in 0..8 {
             let _ = tx.send(ClientDatagram::KeepAlive);
         }
-        let task = client_events_task(rx, decoder_caps.clone());
+        let task = tokio::spawn(client_events_task(rx, decoder_caps.clone()));
 
         let _ = tx.send(ClientDatagram::DecoderCapabilities {
             decoders: vec![shared::codec::Codec::Av1],
@@ -980,6 +970,87 @@ mod tests {
         assert!(
             allowed >= expected - 8,
             "must track the refill rate under load: allowed {allowed}, expected ~{expected}"
+        );
+    }
+
+    /// The contract the two halves of the input policy make with each other.
+    /// The client caps itself at [`shared::throttle::INPUT_MIN_INTERVAL_MS`]
+    /// and the guard admits [`INPUT_FLOOD_RATE_PER_SEC`], so the honest case is
+    /// twenty times below the line at which a datagram is refused — and a
+    /// refusal is the only thing [`FloodKick`] ever counts. This is what makes
+    /// "the client is capped, so its own flood attempt cannot kick it off" a
+    /// property of the code rather than of timing.
+    #[test]
+    fn a_client_at_the_shared_rate_is_never_refused() {
+        let mut guard = InputFloodGuard::new();
+        // Five simulated seconds of the fastest honest client there is: one
+        // datagram every floor interval, which is exactly what the client
+        // throttle allows.
+        let interval = Duration::from_millis(u64::from(
+            shared::throttle::INPUT_MIN_INTERVAL_MS,
+        ));
+        let mut refusals = 0;
+        for _ in 0..5_000 / u64::from(shared::throttle::INPUT_MIN_INTERVAL_MS) {
+            guard.last_refill -= interval;
+            if !guard.allow_input() {
+                refusals += 1;
+            }
+        }
+        assert_eq!(
+            refusals, 0,
+            "a throttled client must never see a datagram refused"
+        );
+    }
+
+    /// A burst short of the threshold inside one window is not a flood: the
+    /// session stays up.
+    #[test]
+    fn refusals_below_the_threshold_are_tolerated() {
+        let mut kick = FloodKick::new();
+        let start = kick.window_start;
+        for i in 0..INPUT_FLOOD_KICK_REFUSALS - 1 {
+            let now = start + Duration::from_millis(u64::from(i));
+            assert!(
+                !kick.record(now),
+                "refusal {i} must not end the session on its own"
+            );
+        }
+    }
+
+    /// A sustained flood does end it, and it does so inside the first window:
+    /// the flood is cut off at the threshold rather than at some later point.
+    #[test]
+    fn a_sustained_flood_ends_the_session() {
+        let mut kick = FloodKick::new();
+        let start = kick.window_start;
+        let mut fired = false;
+        for i in 0..INPUT_FLOOD_KICK_REFUSALS {
+            fired = kick.record(start + Duration::from_millis(u64::from(i)));
+        }
+        assert!(
+            fired,
+            "a whole window of refusals must be treated as a flood"
+        );
+    }
+
+    /// The count lives in a window, not forever: a client that refuses a
+    /// thousand datagrams and then goes quiet starts over, so the session is
+    /// not one refusal away from being dropped for the rest of its life.
+    #[test]
+    fn refusals_do_not_accumulate_across_windows() {
+        let mut kick = FloodKick::new();
+        let start = kick.window_start;
+        for i in 0..INPUT_FLOOD_KICK_REFUSALS - 1 {
+            let _ = kick.record(start + Duration::from_millis(u64::from(i)));
+        }
+        let later = start + INPUT_FLOOD_KICK_WINDOW + Duration::from_secs(5);
+        assert!(
+            !kick.record(later),
+            "an expired window must not inherit its predecessor's count"
+        );
+        assert_eq!(
+            kick.refusals, 1,
+            "the refusal that opened the new window is its only member"
         );
     }
 

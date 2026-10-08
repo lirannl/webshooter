@@ -23,16 +23,16 @@ use anyhow::Result;
 use auth::negotiate_wt;
 use config::{Config, ConfigWithPath};
 use error::WebshooterError;
-use log::Level;
-use serde::Deserialize;
 use ipc::setup_ipc;
+use log::Level;
+use poem::http::StatusCode;
 use poem::{
     EndpointExt, IntoResponse, Response, Route, Server, get, handler,
     listener::{Listener, TcpListener},
     post,
     web::Json,
 };
-use poem::http::StatusCode;
+use serde::Deserialize;
 use ssl_controller::{AsyncFilesystem, CertificateManager};
 use std::{
     env,
@@ -76,12 +76,9 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(run());
-    // Sessions are torn down by explicit async cancellation; the registry is
-    // dropped for real at process exit, so drive that cancellation here or the
-    // tripwired `Session::drop` would fire against sessions we never signalled.
-    for (id, _) in ipc::list_clients() {
-        ipc::disconnect_client(id);
-    }
+    // Disconnect through the same removal path used by the tray and transport,
+    // allowing Linux capture resources to close while the runtime still runs.
+    runtime.block_on(ipc::shutdown_sessions());
     // Bound shutdown: a wedged blocking-pool task (e.g. stalled DNS during a
     // failed certificate renewal) must not keep the process alive forever.
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
