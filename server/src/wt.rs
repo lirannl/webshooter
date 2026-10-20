@@ -742,6 +742,11 @@ async fn media_pump(
     tokio::pin!(report);
     loop {
         tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                log::info!("media pipeline stopped before receiving frames");
+                break;
+            }
             outcome = &mut driver => {
                 if let Err(err) = outcome { log::warn!("MoQ driver failed: {err}"); }
                 break;

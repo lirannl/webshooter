@@ -156,18 +156,19 @@ pub struct EncodedFrame {
 /// [`bitrate`] for the policy.
 const BITRATE_CEILING_KBPS: u32 = 4000;
 
-/// The frame rate the capture pipeline conforms to: the display's refresh
-/// rate, a 60 Hz mode on this output.
+/// The most frames per second the capture pipeline lets through: the display's
+/// refresh rate, a 60 Hz mode on this output.
 ///
-/// A latency bound as much as a picture preference: a frame above refresh
+/// A latency bound rather than a picture preference: a frame above refresh
 /// does not smooth anything, it lines up in the decoder's queue where each
 /// is shown later than the last. The virtual output is paced by no CRTC, so
 /// during a drag it re-renders on every damage at ~110 frames/s through the
 /// 60 Hz mode while a client decodes 60–90 — the queue grew for as long as
-/// the drag continued. Conforming the stream to refresh instead feeds the
-/// client exactly what the display would produce: a steady 60 frames/s
-/// whether the screen moves or not, and a decoder queue a frame deep. See
-/// [`build_pipeline`] for where this sits and why it costs nothing.
+/// the drag continued. Capping the stream at the display's refresh rate
+/// instead keeps the client fed at most what its display would show while
+/// never inventing frames: the cap is drop-only, so a static desktop stays
+/// damage-driven and costs its idle ~4 frames/s. See [`build_pipeline`] for
+/// where the cap sits and why it costs nothing.
 const SOURCE_FPS_CAP: u16 = 60;
 
 /// The capture pipeline.
@@ -222,23 +223,49 @@ fn build_pipeline(raw_fd: i32, node_id: u32, codec: Codec) -> Option<gst::Pipeli
     };
     log::info!("convert={convert} ({why})");
 
-    // Conform the stream to [`SOURCE_FPS_CAP`] — the display's refresh rate —
-    // as a `videorate` with a fixed-framerate caps filter in front of the
-    // converter. The decisions are made from the timestamps `do-timestamp`
-    // puts on the source's buffers (see the launch string below): excess
-    // frames during motion are dropped *here*, before conversion, on the
+    // The [`SOURCE_FPS_CAP`] cap, as `videorate` constrained to a fixed output
+    // framerate, in front of the converter. Dropping *here* is what makes it
+    // cheap: an excess frame is discarded before it is ever converted, on the
     // streaming thread, and a DMA-BUF passes through by reference — the
-    // zero-copy path is untouched. When the screen is static, videorate
-    // repeats the held frame instead, which is what matching the refresh
-    // rate means — the client sees the display's cadence either way, and
-    // repeating a buffered DMA-BUF costs a reference, not a conversion.
+    // zero-copy path is untouched.
+    //
+    // The fixed `framerate=60/1` caps filter is what makes the drop decision
+    // possible at all: videorate only drops when it has a concrete output rate
+    // to compare buffer timestamps against (its `to_rate`). With output caps
+    // left unfixed (0/1), videorate instead *guesses* the rate from the first
+    // two buffer timestamps — and `do-timestamp` below can stamp equal PTS on
+    // frames pushed in the same instant, whose 0-difference guess divides by a
+    // zero framerate: `_gst_util_uint64_scale_int` CRITICALs and a dead
+    // pipeline (`GST_FLOW_ERROR`). A fixed output caps filter never takes that
+    // path. `drop-only=true` is the other half: it forbids videorate from ever
+    // *padding* — fabricating duplicates when the source drops below 60 — so a
+    // damage-driven idle desktop keeps costing ~4 frames/s and choppiness from
+    // re-stamped copies cannot reappear.
+    //
+    // The caps filter carries the `(memory:DMABuf)` feature *by design*: a
+    // plain `video/x-raw,framerate=60/1` filter negotiates SystemMemory, which
+    // is how a previous fix attempt silently dragged the whole path off the
+    // DMA-BUFs and into a ~587 MB/s software copy. The `memory:DMABuf` variant
+    // keeps zero-copy; the trailing plain `video/x-raw` variant is the
+    // portability fallback for a compositor that cannot hand over DMA-BUFs.
+    //
+    // The drop decision is made from buffer timestamps, which the source only
+    // supplies because of the `do-timestamp` below; without them videorate
+    // cannot tell an excess frame from an on-time one and passes every one
+    // through (the fixated caps still report 60/1, it just never drops).
     //
     // Without the element the pipeline still runs; it is merely the
     // growing-latency bug again, which is why this is a warning and not a
     // hard dependency.
     let rate = if gst::ElementFactory::find("videorate").is_some() {
-        log::info!("rate: conforming stream to display refresh {SOURCE_FPS_CAP} fps");
-        format!("videorate ! video/x-raw,framerate={SOURCE_FPS_CAP}/1 ! ")
+        log::info!(
+            "rate cap: videorate drop-only=true framerate={SOURCE_FPS_CAP} (display refresh)"
+        );
+        format!(
+            "videorate drop-only=true \
+             ! video/x-raw(memory:DMABuf),framerate={cap}/1; video/x-raw,framerate={cap}/1 ! ",
+            cap = SOURCE_FPS_CAP,
+        )
     } else {
         log::warn!(
             "videorate not installed; source rate uncapped — clients queue \

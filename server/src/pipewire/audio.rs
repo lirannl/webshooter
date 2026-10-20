@@ -61,10 +61,13 @@ impl Drop for SinkStartup {
 
 impl Drop for AudioSink {
     fn drop(&mut self) {
+        log::debug!("[audio-sink] drop: cancelling");
         // Stop the GStreamer pipeline; the thread-local PipeWire timer notices
         // cancellation and quits its loop, releasing the sink node.
         self.cancel.cancel();
+        log::debug!("[audio-sink] drop: stopping pipeline");
         let _ = self.pipeline.set_state(gst::State::Null);
+        log::debug!("[audio-sink] drop: joining pipe wire thread");
         // Wait for the sink's background thread to actually return so its
         // PipeWire connection (and the `object.linger=false` sink node) is
         // removed from the graph.  Without this, the thread is merely detached
@@ -72,6 +75,7 @@ impl Drop for AudioSink {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        log::debug!("[audio-sink] drop: done");
     }
 }
 
@@ -319,11 +323,13 @@ fn sink_thread(
     channels: u8,
     volume: mpsc::Sender<u8>,
 ) -> Result<()> {
+    log::debug!("[sink-thread {name}] start");
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
+    log::debug!("[sink-thread {name}] connected");
 
     let mainloop_ptr = mainloop.as_raw_ptr();
 
@@ -343,6 +349,7 @@ fn sink_thread(
         .create_object::<pw::node::Node>("adapter", &sink_props)
         .map_err(|e| anyhow!("failed to create audio sink: {e}"))?;
     let sink_id = _sink.upcast_ref().id();
+    log::debug!("[sink-thread {name}] node {sink_id} created");
 
     // Watch this node's own volume. `_sink` is the object the volume lives on,
     // so nothing has to be looked up by name and no second PipeWire connection
@@ -364,6 +371,7 @@ fn sink_thread(
         })
         .register();
     _sink.enum_params(0, Some(pw::spa::param::ParamType::Props), 0, u32::MAX);
+    log::debug!("[sink-thread {name}] params enumerated, sleeping for monitor registration");
 
     // Give PipeWire/PulseAudio a moment to register the sink's `.monitor`
     // source before the GStreamer capture pipeline tries to open it by name.
@@ -374,18 +382,33 @@ fn sink_thread(
     let cancel_timer = cancel.clone();
     // This pointer never leaves the owning OS thread and remains valid until
     // mainloop.run() returns. No other thread may call quit after it is freed.
+    let ticked = std::sync::atomic::AtomicBool::new(false);
     let _timer = mainloop.loop_().add_timer(move |_| {
+        if !ticked.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::debug!("[sink-thread] timer first tick");
+        }
         if cancel_timer.is_cancelled() {
+            log::debug!("[sink-thread] timer noticed cancellation, quitting loop");
             unsafe {
                 pw::sys::pw_main_loop_quit(mainloop_ptr);
             }
         }
     });
-    let _ = _timer.update_timer(Some(Duration::ZERO), Some(Duration::from_millis(200)));
+    // Arm the timer with a non-zero `value`: pipewire-rs disables the timer
+    // entirely when `value` is `None` or zero, which would leave this loop
+    // unable to ever observe cancellation — and `AudioSink::drop` would then
+    // hang forever in `join()`, leaking the sink node past its session.
+    let _ = _timer.update_timer(
+        Some(Duration::from_millis(200)),
+        Some(Duration::from_millis(200)),
+    );
+    log::debug!("[sink-thread {name}] entering mainloop (cancel={})", cancel.is_cancelled());
 
     mainloop.run();
+    log::debug!("[sink-thread {name}] mainloop exited");
 
     // `_sink` and `core` are dropped here, removing the sink from the graph.
+    log::debug!("[sink-thread {name}] done");
     Ok(())
 }
 
@@ -484,5 +507,121 @@ mod tests {
     fn a_gain_above_unity_clamps_to_full_scale() {
         assert_eq!(level_of(&[4.0, 4.0], None), Some(255));
         assert_eq!(level_of(&[-1.0, -1.0], None), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Teardown regression tests: a sink that outlives its session.
+    // -----------------------------------------------------------------------
+
+    /// Every node (by `media.class`) carrying exactly this `node.name`.
+    fn nodes_matching(name: &str) -> Vec<String> {
+        let Ok(out) = std::process::Command::new("pw-dump").output() else {
+            return Vec::new();
+        };
+        let Ok(objects) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+            return Vec::new();
+        };
+        objects
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Node"))
+            .filter(|o| {
+                o.pointer("/info/props/node.name").and_then(|v| v.as_str()) == Some(name)
+            })
+            .map(|o| {
+                o.pointer("/info/props/media.class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Whether the null-sink node itself (media.class `Audio/Sink`) is present.
+    /// The GStreamer `pulsesrc` side adds its own same-named stream node, which
+    /// only disappears when the pipeline stops — not on token cancellation.
+    fn sink_node_present(name: &str) -> bool {
+        nodes_matching(name).iter().any(|c| c == "Audio/Sink")
+    }
+
+    async fn wait_for_node(name: &str, present: bool, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if sink_node_present(name) == present {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn start_test_sink(
+        token: &CancellationToken,
+        name: &'static str,
+    ) -> (AudioSink, mpsc::Receiver<AudioPacket>) {
+        gst::init().unwrap();
+        let (volume_tx, _volume_rx) = mpsc::channel(8);
+        start_audio_sink(token.clone(), name.into(), 2, 48_000, volume_tx)
+            .await
+            .expect("audio sink starts")
+    }
+
+    /// The first thing `Session::stop` does is cancel the session token; the
+    /// `AudioSink` itself is only dropped later, after the video/audio tasks
+    /// wind down. The sink's loop polls cancellation every 200 ms, so the node
+    /// must disappear on the token alone — before anyone drops the sink.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_the_session_token_removes_the_sink_node() {
+        const NAME: &str = "Phone-Teardown-Cancel-Test";
+        let token = CancellationToken::new();
+        let (sink, _packets) = start_test_sink(&token, NAME).await;
+        assert!(
+            wait_for_node(NAME, true, Duration::from_secs(10)).await,
+            "sink node should appear after start"
+        );
+
+        token.cancel();
+        assert!(
+            wait_for_node(NAME, false, Duration::from_secs(5)).await,
+            "sink node should be removed by cancellation alone, without a drop; \
+             leftover nodes: {:?}",
+            nodes_matching(NAME)
+        );
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || drop(sink)),
+        )
+        .await;
+    }
+
+    /// The path the cleanup task takes once it reaches the sink: dropping it
+    /// cancels its child token, stops the GStreamer pipeline and joins the
+    /// PipeWire thread. That must be bounded work, not a hang.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_sink_removes_the_node_promptly() {
+        const NAME: &str = "Phone-Teardown-Drop-Test";
+        let token = CancellationToken::new();
+        let (sink, _packets) = start_test_sink(&token, NAME).await;
+        assert!(
+            wait_for_node(NAME, true, Duration::from_secs(10)).await,
+            "sink node should appear after start"
+        );
+
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || drop(sink)),
+        )
+        .await;
+        assert!(dropped.is_ok(), "dropping the sink must not hang");
+
+        token.cancel();
+        assert!(
+            wait_for_node(NAME, false, Duration::from_secs(5)).await,
+            "sink node should be gone after the drop; leftover nodes: {:?}",
+            nodes_matching(NAME)
+        );
     }
 }
